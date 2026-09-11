@@ -147,6 +147,7 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
         content.setBackgroundColor(getThemedColor(Theme.key_windowBackgroundWhite));
         content.addView(editText, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.MATCH_PARENT));
         progressView = new RadialProgressView(context, getResourceProvider());
+        progressView.setSize(AndroidUtilities.dp(24));
         content.addView(progressView, LayoutHelper.createFrame(32, 32, Gravity.CENTER));
         fragmentView = content;
         applyControllerState(false);
@@ -161,10 +162,11 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
         doneButton.setEnabled(!loading && !saving);
     }
 
-    private void applyControllerState(boolean updateText) {
+    private void applyControllerState(boolean replaceText) {
         SyncedLyricsController controller = SyncedLyricsController.getInstance(currentAccount);
         SyncedLyricsController.State state = controller.getState(messageObject);
         if (state == SyncedLyricsController.State.NOT_LOADED || state == SyncedLyricsController.State.LOADING) {
+            readErrorShown = false;
             setEditorLoading(true);
             return;
         }
@@ -173,18 +175,34 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
             progressView.setVisibility(View.GONE);
             if (!readErrorShown) {
                 readErrorShown = true;
-                showError(R.string.LyricsImportFailed);
+                showReadError();
             }
             return;
         }
-        if (updateText) {
-            initialSource = controller.getLyrics(messageObject).source;
+        readErrorShown = false;
+        String loadedSource = controller.getLyrics(messageObject).source;
+        initialSource = loadedSource;
+        if (replaceText) {
             editText.setText(initialSource);
             editText.setSelection(editText.length());
             changedByUser = false;
-            updateOtherMenu();
         }
+        updateOtherMenu();
         setEditorLoading(false);
+    }
+
+    private void showReadError() {
+        AlertDialog dialog = new AlertDialog.Builder(getParentActivity(), getResourceProvider())
+                .setTitle(LocaleController.getString(R.string.AppName))
+                .setMessage(LocaleController.getString(R.string.LyricsImportFailed))
+                .setNegativeButton(LocaleController.getString(R.string.Cancel), (ignored, which) -> finishFragment())
+                .setPositiveButton(LocaleController.getString(R.string.Retry), (ignored, which) -> {
+                    readErrorShown = false;
+                    SyncedLyricsController.getInstance(currentAccount).retryIfFailed(messageObject);
+                    applyControllerState(false);
+                })
+                .create();
+        showDialog(dialog);
     }
 
     private void updateOtherMenu() {
@@ -199,8 +217,8 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
 
     @Override
     public void didReceivedNotification(int id, int account, Object... args) {
-        if (id == NotificationCenter.syncedLyricsChanged && editText != null && !changedByUser && !saving && !importing) {
-            applyControllerState(true);
+        if (id == NotificationCenter.syncedLyricsChanged && editText != null && !saving && !importing) {
+            applyControllerState(!changedByUser);
         }
     }
 

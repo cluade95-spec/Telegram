@@ -150,6 +150,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
     private boolean showingLyrics;
     private boolean lyricsModeRequested;
     private boolean lyricsUserScrolling;
+    private boolean lyricsUserDragging;
     private boolean showLyricsWhenAvailable;
     private SyncedLyricsController.Lyrics currentLyrics;
     private LinearLayout emptyView;
@@ -355,9 +356,11 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 LayoutParams layoutParams = (LayoutParams) listView.getLayoutParams();
                 layoutParams.topMargin = ActionBar.getCurrentActionBarHeight() + AndroidUtilities.statusBarHeight;
 
-                layoutParams = (LayoutParams) lyricsListView.getLayoutParams();
-                layoutParams.topMargin = getLyricsContentTop();
-                layoutParams.bottomMargin = dp(179 + (!isMyList() && !noforwards ? 52 : 0));
+                if (isLyricsGeometryNeeded()) {
+                    layoutParams = (LayoutParams) lyricsListView.getLayoutParams();
+                    layoutParams.topMargin = getLyricsContentTop();
+                    layoutParams.bottomMargin = dp(179 + (!isMyList() && !noforwards ? 52 : 0));
+                }
 
                 layoutParams = (LayoutParams) actionBarShadow.getLayoutParams();
                 layoutParams.topMargin = ActionBar.getCurrentActionBarHeight() + AndroidUtilities.statusBarHeight;
@@ -1261,11 +1264,16 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         lyricsListView.addOnScrollListener(new RecyclerView.OnScrollListener() {
             @Override
             public void onScrollStateChanged(RecyclerView recyclerView, int newState) {
-                AndroidUtilities.cancelRunOnUIThread(resumeLyricsFollow);
-                if (newState == RecyclerView.SCROLL_STATE_IDLE) {
-                    AndroidUtilities.runOnUIThread(resumeLyricsFollow, 1200);
-                } else {
+                if (newState == RecyclerView.SCROLL_STATE_DRAGGING) {
+                    AndroidUtilities.cancelRunOnUIThread(resumeLyricsFollow);
+                    lyricsUserDragging = true;
                     lyricsUserScrolling = true;
+                } else if (newState == RecyclerView.SCROLL_STATE_IDLE && lyricsUserScrolling) {
+                    lyricsUserDragging = false;
+                    AndroidUtilities.runOnUIThread(resumeLyricsFollow, 1200);
+                } else if (newState == RecyclerView.SCROLL_STATE_SETTLING && !lyricsUserDragging) {
+                    // Programmatic smoothScrollBy() also settles; it must not suspend following.
+                    lyricsUserScrolling = false;
                 }
             }
         });
@@ -2103,11 +2111,29 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
 
     private int getLyricsContentTop() {
         int actionBarTop = ActionBar.getCurrentActionBarHeight() + AndroidUtilities.statusBarHeight;
-        return playlist != null && playlist.size() > 1 && scrollOffsetY != Integer.MAX_VALUE ? Math.max(actionBarTop, scrollOffsetY) : actionBarTop;
+        if (playlist == null || playlist.size() <= 1 || scrollOffsetY == Integer.MAX_VALUE) return actionBarTop;
+        int offset = dp(13);
+        int top = scrollOffsetY - backgroundPaddingTop - offset + (int) listView.getTranslationY();
+        if (isProfilePlaylist) {
+            top -= ActionBar.getCurrentActionBarHeight();
+            top += dp(10);
+        }
+        float moveProgress = 0;
+        if (!isProfilePlaylist && top + backgroundPaddingTop < ActionBar.getCurrentActionBarHeight()) {
+            float toMove = offset + dp(11 - 7);
+            moveProgress = Math.min(1.0f, (ActionBar.getCurrentActionBarHeight() - top - backgroundPaddingTop) / toMove);
+            top -= (int) ((ActionBar.getCurrentActionBarHeight() - toMove) * moveProgress);
+        }
+        top += (int) (AndroidUtilities.statusBarHeight * (1f - moveProgress));
+        return Math.max(actionBarTop, top + backgroundPaddingTop);
+    }
+
+    private boolean isLyricsGeometryNeeded() {
+        return showingLyrics || lyricsModeRequested || showLyricsWhenAvailable;
     }
 
     private void updateLyricsGeometry() {
-        if (lyricsListView == null) return;
+        if (lyricsListView == null || !isLyricsGeometryNeeded()) return;
         FrameLayout.LayoutParams params = (FrameLayout.LayoutParams) lyricsListView.getLayoutParams();
         int top = getLyricsContentTop();
         if (params.topMargin != top) {
@@ -2350,6 +2376,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
 
     private void setShowingLyrics(boolean show, boolean animated) {
         if (show && visibleLyrics.isEmpty()) return;
+        if (show) updateLyricsGeometry();
         showingLyrics = show;
         lyricsListView.setEnabled(show);
         listView.setEnabled(!show);
