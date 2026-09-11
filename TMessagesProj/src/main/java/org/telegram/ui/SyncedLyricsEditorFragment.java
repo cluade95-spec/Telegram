@@ -9,6 +9,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.database.Cursor;
 import android.graphics.Color;
+import android.net.Uri;
 import android.os.Bundle;
 import android.provider.OpenableColumns;
 import android.text.Editable;
@@ -16,8 +17,11 @@ import android.text.InputType;
 import android.text.TextWatcher;
 import android.view.Gravity;
 import android.view.View;
+import android.widget.FrameLayout;
+import android.widget.TextView;
 
 import org.telegram.messenger.AndroidUtilities;
+import org.telegram.messenger.ApplicationLoader;
 import org.telegram.messenger.FileLog;
 import org.telegram.messenger.LocaleController;
 import org.telegram.messenger.MediaController;
@@ -25,6 +29,7 @@ import org.telegram.messenger.MessageObject;
 import org.telegram.messenger.NotificationCenter;
 import org.telegram.messenger.R;
 import org.telegram.messenger.SyncedLyricsController;
+import org.telegram.messenger.Utilities;
 import org.telegram.ui.ActionBar.ActionBar;
 import org.telegram.ui.ActionBar.ActionBarMenu;
 import org.telegram.ui.ActionBar.ActionBarMenuItem;
@@ -35,10 +40,14 @@ import org.telegram.ui.ActionBar.Theme;
 import org.telegram.ui.ActionBar.ThemeDescription;
 import org.telegram.ui.Components.EditTextBoldCursor;
 import org.telegram.ui.Components.AudioPlayerAlert;
+import org.telegram.ui.Components.LayoutHelper;
+import org.telegram.ui.Components.RadialProgressView;
 
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.nio.ByteBuffer;
+import java.nio.charset.CodingErrorAction;
 import java.util.ArrayList;
 import java.util.Locale;
 
@@ -55,11 +64,15 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
     private EditTextBoldCursor editText;
     private ActionBarMenuItem doneButton;
     private ActionBarMenuItem otherButton;
+    private RadialProgressView progressView;
     private String initialSource = "";
     private String restoredSource;
     private int restoredSelection = -1;
     private boolean changedByUser;
     private boolean saving;
+    private boolean importing;
+    private boolean editorReady;
+    private boolean readErrorShown;
 
     public SyncedLyricsEditorFragment(MessageObject messageObject) {
         super(new Bundle());
@@ -130,9 +143,48 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
         });
         changedByUser = restoredSource != null && !initialSource.equals(restoredSource);
         updateOtherMenu();
-        fragmentView = editText;
-        fragmentView.setBackgroundColor(getThemedColor(Theme.key_windowBackgroundWhite));
+        FrameLayout content = new FrameLayout(context);
+        content.setBackgroundColor(getThemedColor(Theme.key_windowBackgroundWhite));
+        content.addView(editText, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.MATCH_PARENT));
+        progressView = new RadialProgressView(context, getResourceProvider());
+        content.addView(progressView, LayoutHelper.createFrame(32, 32, Gravity.CENTER));
+        fragmentView = content;
+        applyControllerState(false);
         return fragmentView;
+    }
+
+    private void setEditorLoading(boolean loading) {
+        editorReady = !loading;
+        editText.setEnabled(!loading);
+        editText.setVisibility(loading ? View.INVISIBLE : View.VISIBLE);
+        progressView.setVisibility(loading ? View.VISIBLE : View.GONE);
+        doneButton.setEnabled(!loading && !saving);
+    }
+
+    private void applyControllerState(boolean updateText) {
+        SyncedLyricsController controller = SyncedLyricsController.getInstance(currentAccount);
+        SyncedLyricsController.State state = controller.getState(messageObject);
+        if (state == SyncedLyricsController.State.NOT_LOADED || state == SyncedLyricsController.State.LOADING) {
+            setEditorLoading(true);
+            return;
+        }
+        if (state == SyncedLyricsController.State.READ_FAILED) {
+            setEditorLoading(true);
+            progressView.setVisibility(View.GONE);
+            if (!readErrorShown) {
+                readErrorShown = true;
+                showError(R.string.LyricsImportFailed);
+            }
+            return;
+        }
+        if (updateText) {
+            initialSource = controller.getLyrics(messageObject).source;
+            editText.setText(initialSource);
+            editText.setSelection(editText.length());
+            changedByUser = false;
+            updateOtherMenu();
+        }
+        setEditorLoading(false);
     }
 
     private void updateOtherMenu() {
@@ -147,17 +199,13 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
 
     @Override
     public void didReceivedNotification(int id, int account, Object... args) {
-        if (id == NotificationCenter.syncedLyricsChanged && editText != null && !changedByUser && !saving) {
-            initialSource = SyncedLyricsController.getInstance(currentAccount).getLyrics(messageObject).source;
-            editText.setText(initialSource);
-            editText.setSelection(editText.length());
-            changedByUser = false;
-            updateOtherMenu();
+        if (id == NotificationCenter.syncedLyricsChanged && editText != null && !changedByUser && !saving && !importing) {
+            applyControllerState(true);
         }
     }
 
     private void save() {
-        if (saving) return;
+        if (saving || !editorReady) return;
         saving = true;
         doneButton.setEnabled(false);
         String source = editText.getText().toString();
@@ -190,9 +238,15 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
     @Override
     public void onActivityResultFragment(int requestCode, int resultCode, Intent data) {
         if (requestCode != PICK_LRC || resultCode != Activity.RESULT_OK || data == null || data.getData() == null) return;
-        try (InputStream stream = getParentActivity().getContentResolver().openInputStream(data.getData());
-             ByteArrayOutputStream output = new ByteArrayOutputStream()) {
-            try (Cursor cursor = getParentActivity().getContentResolver().query(data.getData(), new String[]{OpenableColumns.DISPLAY_NAME}, null, null, null)) {
+        final Uri uri = data.getData();
+        final boolean editorWasReady = editorReady;
+        importing = true;
+        setEditorLoading(true);
+        Utilities.globalQueue.postRunnable(() -> {
+            String imported = null;
+            try (InputStream stream = ApplicationLoader.applicationContext.getContentResolver().openInputStream(uri);
+                 ByteArrayOutputStream output = new ByteArrayOutputStream()) {
+            try (Cursor cursor = ApplicationLoader.applicationContext.getContentResolver().query(uri, new String[]{OpenableColumns.DISPLAY_NAME}, null, null, null)) {
                 if (cursor != null && cursor.moveToFirst()) {
                     String name = cursor.getString(0);
                     if (name != null) {
@@ -208,16 +262,32 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
                 if (total > MAX_SIZE) throw new IllegalArgumentException("Lyrics file is too large");
                 output.write(buffer, 0, count);
             }
-            String source = new String(output.toByteArray(), StandardCharsets.UTF_8);
+            String source = StandardCharsets.UTF_8.newDecoder()
+                    .onMalformedInput(CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(CodingErrorAction.REPORT)
+                    .decode(ByteBuffer.wrap(output.toByteArray())).toString();
             if (source.length() > 0 && source.charAt(0) == '\ufeff') source = source.substring(1);
-            editText.setText(source);
-            editText.setSelection(editText.length());
-            changedByUser = true;
-            updateOtherMenu();
+            imported = source;
         } catch (Exception e) {
             FileLog.e(e);
-            showError(R.string.LyricsImportFailed);
         }
+            final String result = imported;
+            AndroidUtilities.runOnUIThread(() -> {
+                if (isFinished || getParentActivity() == null || editText == null) return;
+                importing = false;
+                if (result == null) {
+                    if (editorWasReady) setEditorLoading(false);
+                    else applyControllerState(true);
+                    showError(R.string.LyricsImportFailed);
+                } else {
+                    setEditorLoading(false);
+                    editText.setText(result);
+                    editText.setSelection(editText.length());
+                    changedByUser = true;
+                    updateOtherMenu();
+                }
+            });
+        });
     }
 
     private void confirmDelete() {
@@ -226,9 +296,10 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
                 .setMessage(LocaleController.getString(R.string.DeleteLyricsConfirm))
                 .setNegativeButton(LocaleController.getString(R.string.Cancel), null)
                 .setPositiveButton(LocaleController.getString(R.string.Delete), (ignored, which) -> delete())
-                .makeRed(AlertDialog.BUTTON_POSITIVE)
                 .create();
         showDialog(dialog);
+        TextView deleteButton = (TextView) dialog.getButton(AlertDialog.BUTTON_POSITIVE);
+        if (deleteButton != null) deleteButton.setTextColor(getThemedColor(Theme.key_text_RedBold));
     }
 
     private void delete() {
@@ -272,13 +343,15 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
     public boolean onBackPressed(boolean invoked) {
         if (!saving && editText != null && !initialSource.equals(editText.getText().toString())) {
             if (invoked) {
-                showDialog(new AlertDialog.Builder(getParentActivity(), getResourceProvider())
+                AlertDialog dialog = new AlertDialog.Builder(getParentActivity(), getResourceProvider())
                         .setTitle(LocaleController.getString(R.string.UnsavedChanges))
                         .setMessage(LocaleController.getString(R.string.DiscardLyricsChanges))
                         .setPositiveButton(LocaleController.getString(R.string.Cancel), null)
-                        .setNegativeButton(LocaleController.getString(R.string.Discard), (dialog, which) -> finishFragment())
-                        .makeRed(AlertDialog.BUTTON_NEGATIVE)
-                        .create());
+                        .setNegativeButton(LocaleController.getString(R.string.Discard), (d, which) -> finishFragment())
+                        .create();
+                showDialog(dialog);
+                TextView discardButton = (TextView) dialog.getButton(AlertDialog.BUTTON_NEGATIVE);
+                if (discardButton != null) discardButton.setTextColor(getThemedColor(Theme.key_text_RedBold));
             }
             return false;
         }

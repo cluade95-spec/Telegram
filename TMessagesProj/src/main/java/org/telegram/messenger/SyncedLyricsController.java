@@ -16,13 +16,16 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
-import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /** Local, client-only storage and parsing for timestamped music lyrics. */
 public final class SyncedLyricsController {
     private static final Pattern TIMESTAMP = Pattern.compile("\\[(\\d{1,3}):(\\d{1,2})(?:[\\.:](\\d{1,3}))?\\]");
+    private static final Pattern OFFSET = Pattern.compile("(?i)\\[offset\\s*:\\s*([+-]?\\d+)\\s*\\]");
+    private static final Pattern WORD_TIMESTAMP = Pattern.compile("<\\d{1,3}:\\d{1,2}(?:[\\.:]\\d{1,3})?>");
     private static final SyncedLyricsController[] instances = new SyncedLyricsController[UserConfig.MAX_ACCOUNT_COUNT];
     private static final Lyrics EMPTY = new Lyrics(Collections.emptyList(), "");
 
@@ -95,7 +98,12 @@ public final class SyncedLyricsController {
     }
 
     private final int account;
-    private final HashMap<String, Entry> cache = new HashMap<>();
+    private final LinkedHashMap<String, Entry> cache = new LinkedHashMap<String, Entry>(16, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<String, Entry> eldest) {
+            return size() > 64 && eldest.getValue().state != State.LOADING;
+        }
+    };
 
     private SyncedLyricsController(int account) {
         this.account = account;
@@ -105,6 +113,15 @@ public final class SyncedLyricsController {
         if (source == null) return EMPTY;
         ArrayList<ParsedLine> parsed = new ArrayList<>();
         String[] sourceLines = source.replace("\r\n", "\n").replace('\r', '\n').split("\n", -1);
+        long offset = 0;
+        for (String sourceLine : sourceLines) {
+            Matcher offsetMatcher = OFFSET.matcher(sourceLine.trim());
+            if (offsetMatcher.matches()) {
+                try {
+                    offset = Long.parseLong(offsetMatcher.group(1));
+                } catch (RuntimeException ignore) {}
+            }
+        }
         int order = 0;
         for (String sourceLine : sourceLines) {
             Matcher matcher = TIMESTAMP.matcher(sourceLine);
@@ -120,7 +137,7 @@ public final class SyncedLyricsController {
                     }
                     String fraction = matcher.group(3);
                     long millis = fraction == null ? 0 : Long.parseLong(fraction) * (fraction.length() == 1 ? 100 : fraction.length() == 2 ? 10 : 1);
-                    times.add((minutes * 60 + seconds) * 1000 + millis);
+                    times.add(Math.max(0, (minutes * 60 + seconds) * 1000 + millis + offset));
                     end = matcher.end();
                 } catch (RuntimeException ignore) {
                     times.clear();
@@ -128,7 +145,7 @@ public final class SyncedLyricsController {
                 }
             }
             if (times.isEmpty()) continue;
-            String text = sourceLine.substring(end).trim();
+            String text = WORD_TIMESTAMP.matcher(sourceLine.substring(end)).replaceAll("").trim();
             for (Long time : times) parsed.add(new ParsedLine(time, text, order++));
         }
         parsed.sort(Comparator.comparingLong((ParsedLine line) -> line.timeMs).thenComparingInt(line -> line.order));
@@ -337,6 +354,23 @@ public final class SyncedLyricsController {
         NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.syncedLyricsChanged, key);
     }
 
+    public void clear() {
+        synchronized (cache) {
+            cache.clear();
+        }
+        Utilities.globalQueue.postRunnable(() -> deleteRecursively(new File(ApplicationLoader.applicationContext.getFilesDir(), "lyrics/" + account)));
+    }
+
+    private static void deleteRecursively(File file) {
+        if (file.isDirectory()) {
+            File[] children = file.listFiles();
+            if (children != null) {
+                for (File child : children) deleteRecursively(child);
+            }
+        }
+        file.delete();
+    }
+
     private static Lyrics read(File file) throws Exception {
         try (FileInputStream input = new FileInputStream(file); ByteArrayOutputStream output = new ByteArrayOutputStream()) {
             byte[] buffer = new byte[8192];
@@ -347,7 +381,9 @@ public final class SyncedLyricsController {
     }
 
     public static long positionMs(MessageObject message) {
-        return message == null ? 0 : (long) (message.audioProgress * message.getDuration() * 1000L);
+        if (message == null) return 0;
+        long progress = MediaController.getInstance().getProgressMs(message);
+        return progress >= 0 ? progress : (long) (message.audioProgress * message.getDuration() * 1000L);
     }
 
     private String key(MessageObject message) {
