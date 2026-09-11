@@ -71,6 +71,7 @@ import org.telegram.messenger.MessagesController;
 import org.telegram.messenger.NotificationCenter;
 import org.telegram.messenger.R;
 import org.telegram.messenger.SendMessagesHelper;
+import org.telegram.messenger.SyncedLyricsController;
 import org.telegram.messenger.UserConfig;
 import org.telegram.messenger.UserObject;
 import org.telegram.messenger.voip.GroupCallMessage;
@@ -163,6 +164,8 @@ public class FragmentContextView extends FrameLayout implements NotificationCent
     @Style
     private int currentStyle = STYLE_NOT_SET;
     private String lastString;
+    private CharSequence normalMusicTitle;
+    private String activeLyric;
     private boolean isMusic;
     private boolean supportsCalls = true;
     private AvatarsImageView avatars;
@@ -1259,7 +1262,8 @@ public class FragmentContextView extends FrameLayout implements NotificationCent
                 if (textView == null) {
                     continue;
                 }
-                textView.setGravity(Gravity.CENTER_VERTICAL | Gravity.LEFT);
+                textView.setGravity(Gravity.CENTER_VERTICAL | Gravity.START);
+                textView.setTextDirection(View.TEXT_DIRECTION_FIRST_STRONG);
                 textView.setTextColor(getThemedColor(Theme.key_inappPlayerTitle));
                 textView.setTypeface(Typeface.DEFAULT);
                 textView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15);
@@ -1408,6 +1412,7 @@ public class FragmentContextView extends FrameLayout implements NotificationCent
                 NotificationCenter.getInstance(a).removeObserver(this, NotificationCenter.historyImportProgressChanged);
                 NotificationCenter.getInstance(a).removeObserver(this, NotificationCenter.liveStoryUpdated);
                 NotificationCenter.getInstance(a).removeObserver(this, NotificationCenter.messagePlayingProgressDidChanged);
+                NotificationCenter.getInstance(a).removeObserver(this, NotificationCenter.syncedLyricsChanged);
                 GroupCallMessagesController.getInstance(a).unsubscribeFromCallMessages(0, this);
             }
             NotificationCenter.getGlobalInstance().removeObserver(this, NotificationCenter.messagePlayingSpeedChanged);
@@ -1445,6 +1450,7 @@ public class FragmentContextView extends FrameLayout implements NotificationCent
                 NotificationCenter.getInstance(a).addObserver(this, NotificationCenter.historyImportProgressChanged);
                 NotificationCenter.getInstance(a).addObserver(this, NotificationCenter.liveStoryUpdated);
                 NotificationCenter.getInstance(a).addObserver(this, NotificationCenter.messagePlayingProgressDidChanged);
+                NotificationCenter.getInstance(a).addObserver(this, NotificationCenter.syncedLyricsChanged);
                 GroupCallMessagesController.getInstance(a).subscribeToCallMessages(0, this);
             }
             NotificationCenter.getGlobalInstance().addObserver(this, NotificationCenter.messagePlayingSpeedChanged);
@@ -1588,8 +1594,11 @@ public class FragmentContextView extends FrameLayout implements NotificationCent
             avatars.invalidate();
         } else if (id == NotificationCenter.messagePlayingProgressDidChanged) {
             if (currentStyle == STYLE_AUDIO_PLAYER) {
+                updateMusicLyrics(true);
                 invalidate();
             }
+        } else if (id == NotificationCenter.syncedLyricsChanged) {
+            updateMusicLyrics(true);
         }
     }
 
@@ -1996,9 +2005,22 @@ public class FragmentContextView extends FrameLayout implements NotificationCent
                 }
                 TypefaceSpan span = new TypefaceSpan(AndroidUtilities.bold(), 0, getThemedColor(Theme.key_inappPlayerPerformer));
                 stringBuilder.setSpan(span, 0, messageObject.getMusicAuthor().length(), Spanned.SPAN_INCLUSIVE_INCLUSIVE);
+                normalMusicTitle = stringBuilder;
+                activeLyric = null;
                 titleTextView.setText(stringBuilder, !create && wasVisible && isMusic);
+                updateMusicLyrics(false);
             }
         }
+    }
+
+    private void updateMusicLyrics(boolean animated) {
+        if (!isMusic || lastMessageObject == null || normalMusicTitle == null || titleTextView == null) return;
+        String lyric = SyncedLyricsController.getInstance(lastMessageObject.currentAccount)
+                .getLyrics(lastMessageObject).textAt(SyncedLyricsController.positionMs(lastMessageObject));
+        if (TextUtils.isEmpty(lyric)) lyric = null;
+        if (TextUtils.equals(activeLyric, lyric)) return;
+        activeLyric = lyric;
+        titleTextView.setText(lyric == null ? normalMusicTitle : lyric, animated && visible);
     }
 
     public void checkImport(boolean create) {

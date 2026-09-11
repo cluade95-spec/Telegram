@@ -11194,6 +11194,19 @@
     <string name="ArticleAICreate">Create With AI</string>
     <string name="ArticleAIPrompt">Write a prompt...</string>
     <string name="ArticleAIGenerate">Generate</string>
+    <string name="SyncedLyrics">Synced Lyrics</string>
+    <string name="AddLyrics">Add Lyrics</string>
+    <string name="EditLyrics">Edit Lyrics</string>
+    <string name="ImportLyrics">Import or replace lyrics</string>
+    <string name="DeleteLyrics">Delete lyrics</string>
+    <string name="DeleteLyricsConfirm">Delete the synced lyrics saved for this track?</string>
+    <string name="LyricsImportFailed">The lyrics file could not be read.</string>
+    <string name="SyncedLyricsHint">[00:12.40] Lyric line</string>
+    <string name="ShowLyrics">Show lyrics</string>
+    <string name="ShowPlaylist">Show playlist</string>
+    <string name="LyricsSaveFailed">Lyrics could not be saved.</string>
+    <string name="LyricsDeleteFailed">Lyrics could not be deleted.</string>
+    <string name="DiscardLyricsChanges">Discard your changes to these lyrics?</string>
     <string name="ArticleAIAddToPage">Add to Page</string>
 
     <string name="WelcomeMessage">Welcome Message</string>
