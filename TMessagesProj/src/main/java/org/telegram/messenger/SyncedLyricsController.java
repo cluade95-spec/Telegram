@@ -27,15 +27,16 @@ public final class SyncedLyricsController {
     private static final Pattern OFFSET = Pattern.compile("(?i)\\[offset\\s*:\\s*([+-]?\\d+)\\s*\\]");
     private static final Pattern WORD_TIMESTAMP = Pattern.compile("<\\d{1,3}:\\d{1,2}(?:[\\.:]\\d{1,3})?>");
     private static final Pattern METADATA = Pattern.compile("(?i)^\\[(?:ar|al|ti|au|by|re|ve|length|offset)\\s*:.*]$");
+    private static final Pattern LOOKS_TIMED = Pattern.compile("^\\s*(?:\\[\\d{1,3}:|<\\d{1,3}:).*");
     private static final SyncedLyricsController[] instances = new SyncedLyricsController[UserConfig.MAX_ACCOUNT_COUNT];
     private static final Lyrics EMPTY = new Lyrics(Collections.emptyList(), "", Kind.MISSING);
 
     public enum Kind {
-        MISSING, SYNCED, PLAIN
+        MISSING, SYNCED, PLAIN, MALFORMED
     }
 
     public enum State {
-        NOT_LOADED, LOADING, LOADED, MISSING, READ_FAILED, WRITE_FAILED
+        NOT_LOADED, LOADING, LOADED, MISSING, MALFORMED, READ_FAILED, WRITE_FAILED
     }
 
     public interface Completion {
@@ -135,6 +136,8 @@ public final class SyncedLyricsController {
     public static Lyrics parse(String source) {
         if (source == null) return EMPTY;
         ArrayList<ParsedLine> parsed = new ArrayList<>();
+        boolean hasMalformedTiming = false;
+        boolean hasUntimedContent = false;
         String[] sourceLines = source.replace("\r\n", "\n").replace('\r', '\n').split("\n", -1);
         long offset = 0;
         for (String sourceLine : sourceLines) {
@@ -171,6 +174,16 @@ public final class SyncedLyricsController {
             String text = WORD_TIMESTAMP.matcher(sourceLine.substring(end)).replaceAll("").trim();
             for (Long time : times) parsed.add(new ParsedLine(time, text, order++));
         }
+        for (String sourceLine : sourceLines) {
+            String text = sourceLine.trim();
+            if (text.isEmpty() || METADATA.matcher(text).matches()) continue;
+            Matcher timestamp = TIMESTAMP.matcher(sourceLine);
+            boolean validTimedLine = timestamp.find() && timestamp.start() == 0;
+            if (!validTimedLine) {
+                hasUntimedContent = true;
+                hasMalformedTiming |= LOOKS_TIMED.matcher(sourceLine).matches();
+            }
+        }
         parsed.sort(Comparator.comparingLong((ParsedLine line) -> line.timeMs).thenComparingInt(line -> line.order));
         ArrayList<Line> result = new ArrayList<>();
         for (int i = 0; i < parsed.size();) {
@@ -189,15 +202,24 @@ public final class SyncedLyricsController {
             result.add(new Line(parsed.get(i).timeMs, combined.toString(), true));
             i = j;
         }
-        if (!result.isEmpty()) {
+        if (!result.isEmpty() && !hasUntimedContent) {
             return new Lyrics(result, source, Kind.SYNCED);
         }
+        if (!result.isEmpty() || hasMalformedTiming) {
+            return new Lyrics(Collections.emptyList(), source, Kind.MALFORMED);
+        }
         ArrayList<Line> plain = new ArrayList<>();
+        boolean pendingBlank = false;
         for (String sourceLine : sourceLines) {
             String text = sourceLine.trim();
-            if (!text.isEmpty() && !METADATA.matcher(text).matches()) {
-                plain.add(new Line(-1, text, false));
+            if (METADATA.matcher(text).matches()) continue;
+            if (text.isEmpty()) {
+                pendingBlank = !plain.isEmpty();
+                continue;
             }
+            if (pendingBlank) plain.add(new Line(-1, "", false));
+            plain.add(new Line(-1, text, false));
+            pendingBlank = false;
         }
         return plain.isEmpty() ? new Lyrics(Collections.emptyList(), source, Kind.MISSING) : new Lyrics(plain, source, Kind.PLAIN);
     }
@@ -262,7 +284,7 @@ public final class SyncedLyricsController {
                 File file = file(key);
                 if (file.exists()) {
                     lyrics = read(file);
-                    state = lyrics.lines.isEmpty() ? State.MISSING : State.LOADED;
+                    state = lyrics.kind == Kind.MALFORMED ? State.MALFORMED : lyrics.lines.isEmpty() ? State.MISSING : State.LOADED;
                 }
             } catch (Exception e) {
                 FileLog.e(e);
@@ -334,7 +356,7 @@ public final class SyncedLyricsController {
                     Entry entry = cache.get(key);
                     if (entry != null && entry.generation == generation) {
                         entry.lyrics = result ? parsed : finalFallback;
-                        entry.state = result ? (parsed.lines.isEmpty() ? State.MISSING : State.LOADED) : State.WRITE_FAILED;
+                        entry.state = result ? (parsed.kind == Kind.MALFORMED ? State.MALFORMED : parsed.lines.isEmpty() ? State.MISSING : State.LOADED) : State.WRITE_FAILED;
                     }
                 }
                 notifyChanged(key);
@@ -390,6 +412,7 @@ public final class SyncedLyricsController {
     public void clear() {
         synchronized (cache) {
             cache.clear();
+            lyricsModePreferred = false;
         }
         Utilities.globalQueue.postRunnable(() -> deleteRecursively(new File(ApplicationLoader.applicationContext.getFilesDir(), "lyrics/" + account)));
     }

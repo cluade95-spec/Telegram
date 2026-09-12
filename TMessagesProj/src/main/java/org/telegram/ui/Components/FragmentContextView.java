@@ -166,6 +166,7 @@ public class FragmentContextView extends FrameLayout implements NotificationCent
     private String lastString;
     private CharSequence normalMusicTitle;
     private String activeLyric;
+    private String logicalActiveLyric;
     private boolean isMusic;
     private boolean supportsCalls = true;
     private AvatarsImageView avatars;
@@ -769,7 +770,7 @@ public class FragmentContextView extends FrameLayout implements NotificationCent
                 if (fragment != null && messageObject != null) {
                     if (messageObject.isMusic()) {
                         final Activity activity = AndroidUtilities.findActivity(getContext());
-                        boolean openLyrics = !TextUtils.isEmpty(activeLyric);
+                        boolean openLyrics = !TextUtils.isEmpty(logicalActiveLyric);
                         if (activity instanceof LaunchActivity) {
                             AudioPlayerAlert alert = new AudioPlayerAlert(activity, resourcesProvider);
                             if (openLyrics) alert.showLyricsWhenAvailable();
@@ -1394,6 +1395,7 @@ public class FragmentContextView extends FrameLayout implements NotificationCent
     @Override
     protected void onDetachedFromWindow() {
         super.onDetachedFromWindow();
+        AndroidUtilities.cancelRunOnUIThread(advanceLyric);
         if (animatorSet != null) {
             animatorSet.cancel();
             animatorSet = null;
@@ -1532,6 +1534,7 @@ public class FragmentContextView extends FrameLayout implements NotificationCent
                 checkCall(false);
             }
             checkPlayer(false);
+            if (id == NotificationCenter.messagePlayingPlayStateChanged) updateMusicLyrics(true);
         } else if (id == NotificationCenter.didStartedCall || id == NotificationCenter.groupCallUpdated || id == NotificationCenter.groupCallVisibilityChanged) {
             checkCall(false);
             if (currentStyle == STYLE_ACTIVE_GROUP_CALL) {
@@ -2013,6 +2016,7 @@ public class FragmentContextView extends FrameLayout implements NotificationCent
                 stringBuilder.setSpan(span, 0, messageObject.getMusicAuthor().length(), Spanned.SPAN_INCLUSIVE_INCLUSIVE);
                 normalMusicTitle = stringBuilder;
                 activeLyric = null;
+                logicalActiveLyric = null;
                 titleTextView.setText(stringBuilder, !create && wasVisible && isMusic);
                 updateMusicLyrics(false);
             }
@@ -2026,18 +2030,25 @@ public class FragmentContextView extends FrameLayout implements NotificationCent
         long position = SyncedLyricsController.positionMs(lastMessageObject);
         int line = lyrics.lineAt(position);
         String lyric = line < 0 ? null : lyrics.lines.get(line).text;
+        logicalActiveLyric = TextUtils.isEmpty(lyric) ? null : lyric;
+        int transitionDuration = MediaController.getInstance().isMessagePaused() ? 180 : 440;
         if (lyrics.isSynced() && !MediaController.getInstance().isMessagePaused() && line + 1 < lyrics.lines.size()) {
             long untilNext = lyrics.lines.get(line + 1).timeMs - position;
-            if (untilNext <= LYRIC_ROLL_DURATION) {
+            long previousTime = line < 0 ? 0 : lyrics.lines.get(line).timeMs;
+            long gap = Math.max(1, lyrics.lines.get(line + 1).timeMs - previousTime);
+            long lead = Math.min(LYRIC_ROLL_DURATION, Math.max(80, gap / 2));
+            transitionDuration = (int) lead;
+            if (untilNext <= lead) {
                 lyric = lyrics.lines.get(line + 1).text;
+                transitionDuration = (int) Math.max(80, Math.min(lead, untilNext));
             } else {
-                AndroidUtilities.runOnUIThread(advanceLyric, untilNext - LYRIC_ROLL_DURATION);
+                AndroidUtilities.runOnUIThread(advanceLyric, untilNext - lead);
             }
         }
         if (TextUtils.isEmpty(lyric)) lyric = null;
         if (TextUtils.equals(activeLyric, lyric)) return;
         activeLyric = lyric;
-        titleTextView.setText(lyric == null ? normalMusicTitle : lyric, animated && visible);
+        titleTextView.setText(lyric == null ? normalMusicTitle : lyric, animated && visible, transitionDuration);
     }
 
     private static final long LYRIC_ROLL_DURATION = 440;
