@@ -98,9 +98,9 @@ public final class SyncedLyricsController {
     }
 
     private final int account;
-    private final LinkedHashMap<String, Entry> cache = new LinkedHashMap<String, Entry>(16, 0.75f, true) {
+    private final LinkedHashMap<String, SyncedLyricsController.Entry> cache = new LinkedHashMap<String, SyncedLyricsController.Entry>(16, 0.75f, true) {
         @Override
-        protected boolean removeEldestEntry(Map.Entry<String, Entry> eldest) {
+        protected boolean removeEldestEntry(Map.Entry<String, SyncedLyricsController.Entry> eldest) {
             return size() > 64 && eldest.getValue().state != State.LOADING;
         }
     };
