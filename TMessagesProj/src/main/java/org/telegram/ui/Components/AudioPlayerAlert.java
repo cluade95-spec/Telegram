@@ -2207,32 +2207,57 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
     }
 
     /**
-     * Canonical normal-mode lyrics viewport top. Deliberately independent of the playlist scroll
-     * offset and of {@link #isProfilePlaylist}: chat, downloaded and profile music must all present
-     * lyrics in the same shell. The expression reproduces the resting sheet top of the ordinary
-     * chat/download player - the geometry device QA confirmed as correct - by evaluating the same
-     * rule {@code onMeasure} uses for the playlist sheet padding, against the canonical player
-     * height rather than the current one, so every source resolves to the identical top. The old
-     * scroll-derived formula resolved to {@code padding + actionBarTop - dp(24)} and this keeps it.
+     * Resting playlist-sheet padding, exactly as {@code onMeasure} computes it but without the
+     * {@code padWithItem} override. That override pins the profile playlist list to the very top,
+     * which is playlist chrome - it must not define where the lyrics viewport starts.
      */
-    private static final int CANONICAL_PLAYER_HEIGHT = 179 + 52;
-
-    private int getNormalLyricsTop() {
-        final int actionBarTop = ActionBar.getCurrentActionBarHeight() + AndroidUtilities.statusBarHeight;
-        int totalHeight = containerMeasuredHeight;
-        if (totalHeight <= 0 && containerView != null) totalHeight = containerView.getMeasuredHeight();
-        if (totalHeight <= 0) return actionBarTop;
-        final int availableHeight = totalHeight - (containerView == null ? 0 : containerView.getPaddingTop());
-        int padding = availableHeight - (int) (availableHeight / 5f * 3.5f) + dp(8);
-        final int maxPadding = availableHeight - dp(CANONICAL_PLAYER_HEIGHT + 150);
+    private int computeLyricsShellPadding(int availableHeight) {
+        final int playerHeight = dp(getNormalPlayerHeight());
+        int contentSize = playerHeight;
+        if (playlist != null && playlist.size() > 1) {
+            contentSize += backgroundPaddingTop + playlist.size() * dp(56);
+        }
+        int padding = (contentSize < availableHeight ? availableHeight - contentSize : availableHeight - (int) (availableHeight / 5 * 3.5f)) + dp(8);
+        final int maxPadding = availableHeight - playerHeight - dp(150);
         if (padding > maxPadding) padding = maxPadding;
         if (padding < 0) padding = 0;
-        return Math.max(actionBarTop, padding + actionBarTop - dp(24));
+        return padding;
+    }
+
+    /**
+     * The sheet offset the lyrics viewport is measured from. The ordinary chat/download player uses
+     * its own {@link #scrollOffsetY} unchanged - that geometry is approved and must not move. The
+     * profile playlist has no comparable offset because {@code padWithItem} zeroes its padding, so
+     * the same structural rule is resolved for it instead of inheriting playlist-pinned geometry.
+     */
+    private int getLyricsShellScrollOffset() {
+        if (!isProfilePlaylist) return scrollOffsetY;
+        int totalHeight = containerMeasuredHeight;
+        if (totalHeight <= 0 && containerView != null) totalHeight = containerView.getMeasuredHeight();
+        if (totalHeight <= 0) return scrollOffsetY;
+        final int availableHeight = totalHeight - (containerView == null ? 0 : containerView.getPaddingTop());
+        // Mirrors updateLayout(): scrollOffsetY = newOffset + listTopMargin - statusBarHeight - dp(11),
+        // with newOffset the resting first-child top, floored at dp(7) exactly as updateLayout() does.
+        final int restingOffset = Math.max(dp(7), computeLyricsShellPadding(availableHeight));
+        return restingOffset + ActionBar.getCurrentActionBarHeight() - dp(11);
     }
 
     private int getLyricsContentTop() {
-        if (fullscreenLyrics) return ActionBar.getCurrentActionBarHeight() + AndroidUtilities.statusBarHeight;
-        return getNormalLyricsTop();
+        int actionBarTop = ActionBar.getCurrentActionBarHeight() + AndroidUtilities.statusBarHeight;
+        if (fullscreenLyrics) return actionBarTop;
+        if (playlist == null || playlist.size() <= 1) return actionBarTop;
+        int shellOffset = getLyricsShellScrollOffset();
+        if (shellOffset == Integer.MAX_VALUE) return actionBarTop;
+        int offset = dp(13);
+        int top = shellOffset - backgroundPaddingTop - offset + (int) listView.getTranslationY();
+        float moveProgress = 0;
+        if (top + backgroundPaddingTop < ActionBar.getCurrentActionBarHeight()) {
+            float toMove = offset + dp(11 - 7);
+            moveProgress = Math.min(1.0f, (ActionBar.getCurrentActionBarHeight() - top - backgroundPaddingTop) / toMove);
+            top -= (int) ((ActionBar.getCurrentActionBarHeight() - toMove) * moveProgress);
+        }
+        top += (int) (AndroidUtilities.statusBarHeight * (1f - moveProgress));
+        return Math.max(actionBarTop, top + backgroundPaddingTop);
     }
 
     private boolean isLyricsGeometryNeeded() {
@@ -2284,7 +2309,9 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         lyricsChromeState = state;
         if (lyricsChrome) {
             if (playlistChromeTitle == null) playlistChromeTitle = actionBar.getTitle();
-            actionBar.setTitle(getString(R.string.SyncedLyrics));
+            // No header label in lyrics mode: the player itself says what this is, so fullscreen
+            // top chrome is Back and nothing else.
+            actionBar.setTitle(null);
             // The profile playlist floats its action bar with the sheet; pin it back so it can never
             // cut through the lyric stream (normal) or split the viewport (fullscreen).
             actionBar.setTranslationY(0);
