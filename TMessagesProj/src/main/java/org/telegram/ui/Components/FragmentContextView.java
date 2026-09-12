@@ -460,6 +460,7 @@ public class FragmentContextView extends FrameLayout implements NotificationCent
                 return textView;
             }
         };
+        titleTextView.setVerticalTransition(true);
         addView(titleTextView, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, 36, Gravity.LEFT | Gravity.TOP, 35, 0, 36 + (isSideMenued ? 64 : 0), 0));
 
         subtitleTextView = new AudioPlayerAlert.ClippingTextViewSwitcher(context) {
@@ -768,10 +769,15 @@ public class FragmentContextView extends FrameLayout implements NotificationCent
                 if (fragment != null && messageObject != null) {
                     if (messageObject.isMusic()) {
                         final Activity activity = AndroidUtilities.findActivity(getContext());
+                        boolean openLyrics = !TextUtils.isEmpty(activeLyric);
                         if (activity instanceof LaunchActivity) {
-                            new AudioPlayerAlert(activity, resourcesProvider).show();
+                            AudioPlayerAlert alert = new AudioPlayerAlert(activity, resourcesProvider);
+                            if (openLyrics) alert.showLyricsWhenAvailable();
+                            alert.show();
                         } else if (AndroidUtilities.isContextSafe(LaunchActivity.instance)) {
-                            new AudioPlayerAlert(LaunchActivity.instance, resourcesProvider).show();
+                            AudioPlayerAlert alert = new AudioPlayerAlert(LaunchActivity.instance, resourcesProvider);
+                            if (openLyrics) alert.showLyricsWhenAvailable();
+                            alert.show();
                         }
                     } else {
                         long dialogId = 0;
@@ -2015,13 +2021,27 @@ public class FragmentContextView extends FrameLayout implements NotificationCent
 
     private void updateMusicLyrics(boolean animated) {
         if (!isMusic || lastMessageObject == null || normalMusicTitle == null || titleTextView == null) return;
-        String lyric = SyncedLyricsController.getInstance(lastMessageObject.currentAccount)
-                .getLyrics(lastMessageObject).textAt(SyncedLyricsController.positionMs(lastMessageObject));
+        AndroidUtilities.cancelRunOnUIThread(advanceLyric);
+        SyncedLyricsController.Lyrics lyrics = SyncedLyricsController.getInstance(lastMessageObject.currentAccount).getLyrics(lastMessageObject);
+        long position = SyncedLyricsController.positionMs(lastMessageObject);
+        int line = lyrics.lineAt(position);
+        String lyric = line < 0 ? null : lyrics.lines.get(line).text;
+        if (lyrics.isSynced() && !MediaController.getInstance().isMessagePaused() && line + 1 < lyrics.lines.size()) {
+            long untilNext = lyrics.lines.get(line + 1).timeMs - position;
+            if (untilNext <= LYRIC_ROLL_DURATION) {
+                lyric = lyrics.lines.get(line + 1).text;
+            } else {
+                AndroidUtilities.runOnUIThread(advanceLyric, untilNext - LYRIC_ROLL_DURATION);
+            }
+        }
         if (TextUtils.isEmpty(lyric)) lyric = null;
         if (TextUtils.equals(activeLyric, lyric)) return;
         activeLyric = lyric;
         titleTextView.setText(lyric == null ? normalMusicTitle : lyric, animated && visible);
     }
+
+    private static final long LYRIC_ROLL_DURATION = 440;
+    private final Runnable advanceLyric = () -> updateMusicLyrics(true);
 
     public void checkImport(boolean create) {
         if (chatActivity == null || visible && (currentStyle == STYLE_CONNECTING_GROUP_CALL || currentStyle == STYLE_ACTIVE_GROUP_CALL)) {

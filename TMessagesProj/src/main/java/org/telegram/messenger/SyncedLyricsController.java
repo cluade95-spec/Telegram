@@ -21,13 +21,18 @@ import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-/** Local, client-only storage and parsing for timestamped music lyrics. */
+/** Local, client-only storage and parsing for synced LRC and plain music lyrics. */
 public final class SyncedLyricsController {
     private static final Pattern TIMESTAMP = Pattern.compile("\\[(\\d{1,3}):(\\d{1,2})(?:[\\.:](\\d{1,3}))?\\]");
     private static final Pattern OFFSET = Pattern.compile("(?i)\\[offset\\s*:\\s*([+-]?\\d+)\\s*\\]");
     private static final Pattern WORD_TIMESTAMP = Pattern.compile("<\\d{1,3}:\\d{1,2}(?:[\\.:]\\d{1,3})?>");
+    private static final Pattern METADATA = Pattern.compile("(?i)^\\[(?:ar|al|ti|au|by|re|ve|length|offset)\\s*:.*]$");
     private static final SyncedLyricsController[] instances = new SyncedLyricsController[UserConfig.MAX_ACCOUNT_COUNT];
-    private static final Lyrics EMPTY = new Lyrics(Collections.emptyList(), "");
+    private static final Lyrics EMPTY = new Lyrics(Collections.emptyList(), "", Kind.MISSING);
+
+    public enum Kind {
+        MISSING, SYNCED, PLAIN
+    }
 
     public enum State {
         NOT_LOADED, LOADING, LOADED, MISSING, READ_FAILED, WRITE_FAILED
@@ -61,23 +66,32 @@ public final class SyncedLyricsController {
     public static final class Line {
         public final long timeMs;
         public final String text;
+        public final boolean timed;
 
-        private Line(long timeMs, String text) {
+        private Line(long timeMs, String text, boolean timed) {
             this.timeMs = timeMs;
             this.text = text;
+            this.timed = timed;
         }
     }
 
     public static final class Lyrics {
         public final ArrayList<Line> lines;
         public final String source;
+        public final Kind kind;
 
-        private Lyrics(java.util.List<Line> lines, String source) {
+        private Lyrics(java.util.List<Line> lines, String source, Kind kind) {
             this.lines = new ArrayList<>(lines);
             this.source = source;
+            this.kind = kind;
+        }
+
+        public boolean isSynced() {
+            return kind == Kind.SYNCED;
         }
 
         public int lineAt(long positionMs) {
+            if (!isSynced()) return -1;
             int low = 0, high = lines.size() - 1, result = -1;
             while (low <= high) {
                 int middle = (low + high) >>> 1;
@@ -98,6 +112,7 @@ public final class SyncedLyricsController {
     }
 
     private final int account;
+    private boolean lyricsModePreferred;
     private final LinkedHashMap<String, SyncedLyricsController.Entry> cache = new LinkedHashMap<String, SyncedLyricsController.Entry>(16, 0.75f, true) {
         @Override
         protected boolean removeEldestEntry(Map.Entry<String, SyncedLyricsController.Entry> eldest) {
@@ -107,6 +122,14 @@ public final class SyncedLyricsController {
 
     private SyncedLyricsController(int account) {
         this.account = account;
+    }
+
+    public boolean isLyricsModePreferred() {
+        return lyricsModePreferred;
+    }
+
+    public void setLyricsModePreferred(boolean preferred) {
+        lyricsModePreferred = preferred;
     }
 
     public static Lyrics parse(String source) {
@@ -163,10 +186,20 @@ public final class SyncedLyricsController {
                     combined.append(text);
                 }
             }
-            result.add(new Line(parsed.get(i).timeMs, combined.toString()));
+            result.add(new Line(parsed.get(i).timeMs, combined.toString(), true));
             i = j;
         }
-        return new Lyrics(result, source);
+        if (!result.isEmpty()) {
+            return new Lyrics(result, source, Kind.SYNCED);
+        }
+        ArrayList<Line> plain = new ArrayList<>();
+        for (String sourceLine : sourceLines) {
+            String text = sourceLine.trim();
+            if (!text.isEmpty() && !METADATA.matcher(text).matches()) {
+                plain.add(new Line(-1, text, false));
+            }
+        }
+        return plain.isEmpty() ? new Lyrics(Collections.emptyList(), source, Kind.MISSING) : new Lyrics(plain, source, Kind.PLAIN);
     }
 
     private static final class ParsedLine {

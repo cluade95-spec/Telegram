@@ -46,6 +46,7 @@ import android.text.TextUtils;
 import android.util.FloatProperty;
 import android.util.Property;
 import android.util.TypedValue;
+import android.util.DisplayMetrics;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
@@ -66,6 +67,7 @@ import androidx.dynamicanimation.animation.SpringAnimation;
 import androidx.dynamicanimation.animation.SpringForce;
 import androidx.recyclerview.widget.ItemTouchHelper;
 import androidx.recyclerview.widget.LinearLayoutManager;
+import androidx.recyclerview.widget.LinearSmoothScroller;
 import androidx.recyclerview.widget.RecyclerView;
 
 import com.google.android.exoplayer2.C;
@@ -170,6 +172,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
     private int activeLyricsLine = Integer.MIN_VALUE;
     private int activeLyricsRow = RecyclerView.NO_POSITION;
     private ActionBarMenuItem optionsButton;
+    private ActionBarMenuItem lyricsFullscreenButton;
+    private boolean fullscreenLyrics;
     private ChooseQualityLayout.QualityIcon optionsIcon;
     private ActionBarMenuSubItem castItem;
     private CastMediaRouteButton castItemButton;
@@ -309,6 +313,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         } else {
             currentAccount = UserConfig.selectedAccount;
         }
+        lyricsModeRequested = SyncedLyricsController.getInstance(currentAccount).isLyricsModePreferred();
 
         parentActivity = (LaunchActivity) context;
 
@@ -538,6 +543,9 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
 
         final ActionBarMenu menu = actionBar.createMenu();
         menu.setLayoutParams(LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.MATCH_PARENT, Gravity.FILL));
+        lyricsFullscreenButton = menu.addItem(20, R.drawable.ic_gofullscreen);
+        lyricsFullscreenButton.setContentDescription(getString(R.string.AccSwitchToFullscreen));
+        lyricsFullscreenButton.setVisibility(View.GONE);
         actionBarBackground = new View(context);
         actionBarBackground.setBackgroundColor(getThemedColor(Theme.key_dialogBackground));
         actionBar.addView(actionBarBackground, 0, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.MATCH_PARENT, Gravity.FILL));
@@ -548,7 +556,10 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             @Override
             public void onItemClick(int id) {
                 if (id == -1) {
-                    dismiss();
+                    if (fullscreenLyrics) setFullscreenLyrics(false);
+                    else dismiss();
+                } else if (id == 20) {
+                    setFullscreenLyrics(!fullscreenLyrics);
                 } else {
                     onSubItemClick(id);
                 }
@@ -1252,7 +1263,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             MessageObject playing = MediaController.getInstance().getPlayingMessageObject();
             SyncedLyricsController.Lyrics lyrics = SyncedLyricsController.getInstance(currentAccount).getLyrics(playing);
             int line = visibleLyrics.get(position);
-            if (playing != null && line >= 0 && line < lyrics.lines.size()) {
+            if (playing != null && line >= 0 && line < lyrics.lines.size() && lyrics.lines.get(line).timed) {
                 MediaController.getInstance().seekToProgressMs(playing, lyrics.lines.get(line).timeMs);
                 updateLyrics(false);
             }
@@ -1275,6 +1286,11 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                     // Programmatic smoothScrollBy() also settles; it must not suspend following.
                     lyricsUserScrolling = false;
                 }
+            }
+
+            @Override
+            public void onScrolled(RecyclerView recyclerView, int dx, int dy) {
+                updateLyricsDepth();
             }
         });
 
@@ -2111,6 +2127,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
 
     private int getLyricsContentTop() {
         int actionBarTop = ActionBar.getCurrentActionBarHeight() + AndroidUtilities.statusBarHeight;
+        if (fullscreenLyrics) return actionBarTop;
         if (playlist == null || playlist.size() <= 1 || scrollOffsetY == Integer.MAX_VALUE) return actionBarTop;
         int offset = dp(13);
         int top = scrollOffsetY - backgroundPaddingTop - offset + (int) listView.getTranslationY();
@@ -2346,7 +2363,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         if (visibleLyrics.isEmpty()) {
             if (state == SyncedLyricsController.State.LOADING || state == SyncedLyricsController.State.NOT_LOADED) return;
             if (showingLyrics) setShowingLyrics(false, animated);
-            lyricsModeRequested = false;
+            lyricsModeRequested = SyncedLyricsController.getInstance(currentAccount).isLyricsModePreferred();
             return;
         }
         if (showLyricsWhenAvailable) {
@@ -2378,6 +2395,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         if (show && visibleLyrics.isEmpty()) return;
         if (show) updateLyricsGeometry();
         showingLyrics = show;
+        lyricsFullscreenButton.setVisibility(show ? View.VISIBLE : View.GONE);
+        if (!show && fullscreenLyrics) setFullscreenLyrics(false);
         lyricsListView.setEnabled(show);
         listView.setEnabled(!show);
         if (show) {
@@ -2392,24 +2411,70 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         if (show && activeLyricsRow != RecyclerView.NO_POSITION) centerLyricsRow(activeLyricsRow, false);
     }
 
+    private void setFullscreenLyrics(boolean fullscreen) {
+        if (fullscreenLyrics == fullscreen || fullscreen && !showingLyrics) return;
+        fullscreenLyrics = fullscreen;
+        setCanDismissWithSwipe(!fullscreen);
+        lyricsFullscreenButton.setIcon(fullscreen ? R.drawable.ic_outfullscreen : R.drawable.ic_gofullscreen);
+        lyricsFullscreenButton.setContentDescription(getString(fullscreen ? R.string.AccExitFullscreen : R.string.AccSwitchToFullscreen));
+        actionBar.animate().cancel();
+        actionBarBackground.animate().cancel();
+        actionBar.animate().alpha(fullscreen ? 1f : actionBarSlide).setDuration(220).setInterpolator(CubicBezierInterpolator.EASE_OUT_QUINT).start();
+        actionBarBackground.animate().alpha(fullscreen ? 1f : actionBarSlide).setDuration(220).setInterpolator(CubicBezierInterpolator.EASE_OUT_QUINT).start();
+        updateLyricsGeometry();
+        if (activeLyricsRow != RecyclerView.NO_POSITION) centerLyricsRow(activeLyricsRow, true);
+    }
+
     private void centerLyricsRow(int row, boolean animated) {
         lyricsListView.post(() -> {
             if (!showingLyrics || row != activeLyricsRow || row < 0 || row >= visibleLyrics.size() || lyricsListView.getHeight() == 0) return;
+            if (animated) {
+                lyricsListView.stopScroll();
+                LinearSmoothScroller scroller = new LinearSmoothScroller(getContext()) {
+                    @Override protected int getVerticalSnapPreference() { return SNAP_TO_START; }
+                    @Override protected int calculateDyToMakeVisible(View view, int snapPreference) {
+                        return (view.getTop() + view.getBottom()) / 2 - lyricsListView.getHeight() / 2;
+                    }
+                    @Override protected float calculateSpeedPerPixel(DisplayMetrics metrics) {
+                        return 90f / metrics.densityDpi;
+                    }
+                    @Override protected int calculateTimeForDeceleration(int dx) {
+                        return Math.min(700, Math.max(280, super.calculateTimeForDeceleration(dx)));
+                    }
+                };
+                scroller.setTargetPosition(row);
+                lyricsLayoutManager.startSmoothScroll(scroller);
+                return;
+            }
             View child = lyricsLayoutManager.findViewByPosition(row);
             if (child == null) {
                 lyricsLayoutManager.scrollToPositionWithOffset(row, Math.max(0, lyricsListView.getHeight() / 2 - dp(32)));
-                lyricsListView.post(() -> centerLyricsRow(row, animated));
                 return;
             }
             int distance = (child.getTop() + child.getBottom()) / 2 - lyricsListView.getHeight() / 2;
-            if (animated) lyricsListView.smoothScrollBy(0, distance);
-            else lyricsListView.scrollBy(0, distance);
+            lyricsListView.scrollBy(0, distance);
+            updateLyricsDepth();
         });
+    }
+
+    private void updateLyricsDepth() {
+        if (lyricsListView == null || lyricsListView.getHeight() == 0) return;
+        final float center = lyricsListView.getHeight() / 2f;
+        for (int i = 0; i < lyricsListView.getChildCount(); i++) {
+            View child = lyricsListView.getChildAt(i);
+            float distance = Math.abs((child.getTop() + child.getBottom()) / 2f - center) / Math.max(1f, center);
+            float depth = Math.min(1f, distance);
+            child.setAlpha(1f - depth * .55f);
+            float scale = 1f - depth * .035f;
+            child.setScaleX(scale);
+            child.setScaleY(scale);
+        }
     }
 
     public AudioPlayerAlert showLyricsWhenAvailable() {
         showLyricsWhenAvailable = true;
         lyricsModeRequested = true;
+        SyncedLyricsController.getInstance(currentAccount).setLyricsModePreferred(true);
         return this;
     }
 
@@ -2650,13 +2715,16 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         public void onBindViewHolder(RecyclerView.ViewHolder holder, int position) {
             TextView textView = (TextView) holder.itemView;
             int line = visibleLyrics.get(position);
-            boolean active = line == activeLyricsLine;
+            boolean active = currentLyrics.isSynced() && line == activeLyricsLine;
             textView.setText(currentLyrics.lines.get(line).text);
             textView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16);
             textView.setTypeface(active ? AndroidUtilities.bold() : Typeface.DEFAULT);
             textView.setTextColor(getThemedColor(active ? Theme.key_player_actionBarTitle : Theme.key_player_time));
             textView.setAlpha(1f);
+            textView.setScaleX(1f);
+            textView.setScaleY(1f);
             textView.setBackground(Theme.createSelectorDrawable(getThemedColor(Theme.key_listSelector), 2));
+            lyricsListView.post(AudioPlayerAlert.this::updateLyricsDepth);
         }
     }
 
@@ -3165,6 +3233,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         o.addIf(hasLyrics, R.drawable.outline_caption_24, getString(showingLyrics ? R.string.ShowPlaylist : R.string.ShowLyrics), () -> {
             o.dismiss();
             lyricsModeRequested = !showingLyrics;
+            lyricsController.setLyricsModePreferred(lyricsModeRequested);
             setShowingLyrics(lyricsModeRequested, true);
         });
         o.add(R.drawable.msg_edit, getString(!menuLyrics.source.isEmpty() || lyricsState == SyncedLyricsController.State.LOADING || lyricsState == SyncedLyricsController.State.NOT_LOADED ? R.string.EditLyrics : R.string.AddLyrics), () -> {
@@ -3637,6 +3706,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         private int stableOffest = -1;
         private final RectF rectF = new RectF();
         private int rightPadding;
+        private boolean verticalTransition;
 
         public ClippingTextViewSwitcher(@NonNull Context context) {
             super(context);
@@ -3666,6 +3736,10 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
 
         public void setIsCenter() {
             isCenter = true;
+        }
+
+        public void setVerticalTransition(boolean verticalTransition) {
+            this.verticalTransition = verticalTransition;
         }
 
         @Override
@@ -3789,7 +3863,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             textViews[index].bringToFront();
             textViews[index].setVisibility(VISIBLE);
 
-            final int duration = 300;
+            final int duration = verticalTransition ? 440 : 300;
 
             final ValueAnimator collapseAnimator = ValueAnimator.ofFloat(clipProgress[prevIndex], 0.75f);
             collapseAnimator.setDuration(duration / 3 * 2); // 0.66
@@ -3814,7 +3888,18 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             fadeInAnimator.setStartDelay(duration / 4); // 0.25
             fadeInAnimator.setDuration(duration / 2); // 0.5
 
-            animatorSet.playTogether(collapseAnimator, expandAnimator, fadeOutAnimator, fadeInAnimator);
+            if (verticalTransition) {
+                textViews[prevIndex].setTranslationY(0);
+                textViews[index].setTranslationY(dp(10));
+                ObjectAnimator moveOut = ObjectAnimator.ofFloat(textViews[prevIndex], View.TRANSLATION_Y, -dp(10));
+                ObjectAnimator moveIn = ObjectAnimator.ofFloat(textViews[index], View.TRANSLATION_Y, 0);
+                moveOut.setDuration(duration);
+                moveIn.setDuration(duration);
+                animatorSet.playTogether(fadeOutAnimator, fadeInAnimator, moveOut, moveIn);
+                animatorSet.setInterpolator(CubicBezierInterpolator.EASE_OUT_QUINT);
+            } else {
+                animatorSet.playTogether(collapseAnimator, expandAnimator, fadeOutAnimator, fadeInAnimator);
+            }
             animatorSet.start();
         }
 

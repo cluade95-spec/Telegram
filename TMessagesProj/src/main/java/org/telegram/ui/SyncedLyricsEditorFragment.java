@@ -11,7 +11,9 @@ import android.database.Cursor;
 import android.graphics.Color;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.Build;
 import android.provider.OpenableColumns;
+import android.text.Layout;
 import android.text.Editable;
 import android.text.InputType;
 import android.text.TextWatcher;
@@ -51,7 +53,7 @@ import java.nio.charset.CodingErrorAction;
 import java.util.ArrayList;
 import java.util.Locale;
 
-/** A single raw-text editing surface for the current track's local LRC source. */
+/** A single raw-text editing surface for the current track's local lyrics source. */
 public class SyncedLyricsEditorFragment extends BaseFragment implements NotificationCenter.NotificationCenterDelegate {
     private static final int DONE = 1;
     private static final int OTHER = 2;
@@ -131,6 +133,13 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
         editText.setTextDirection(View.TEXT_DIRECTION_FIRST_STRONG);
         editText.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
         editText.setSingleLine(false);
+        editText.setHorizontallyScrolling(false);
+        editText.setOverScrollMode(View.OVER_SCROLL_IF_CONTENT_SCROLLS);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            // Long LRC documents do not benefit from expensive balanced line breaking.
+            editText.setBreakStrategy(Layout.BREAK_STRATEGY_SIMPLE);
+            editText.setHyphenationFrequency(Layout.HYPHENATION_FREQUENCY_NONE);
+        }
         editText.setBackgroundColor(Color.TRANSPARENT);
         editText.setPadding(AndroidUtilities.dp(20), AndroidUtilities.dp(16), AndroidUtilities.dp(20), AndroidUtilities.dp(16));
         initialSource = controller.getLyrics(messageObject).source;
