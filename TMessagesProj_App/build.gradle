@@ -71,7 +71,6 @@ android {
         }
 
         standalone {
-            matchingFallbacks = ['release']
             debuggable false
             jniDebuggable false
             signingConfig signingConfigs.release
