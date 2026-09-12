@@ -33,6 +33,7 @@ import android.graphics.PorterDuffColorFilter;
 import android.graphics.PorterDuffXfermode;
 import android.graphics.RectF;
 import android.graphics.Shader;
+import android.graphics.Typeface;
 import android.graphics.drawable.BitmapDrawable;
 import android.graphics.drawable.Drawable;
 import android.net.Uri;
@@ -91,6 +92,7 @@ import org.telegram.messenger.NotificationCenter;
 import org.telegram.messenger.R;
 import org.telegram.messenger.SendMessagesHelper;
 import org.telegram.messenger.SharedConfig;
+import org.telegram.messenger.SyncedLyricsController;
 import org.telegram.messenger.UserConfig;
 import org.telegram.messenger.UserObject;
 import org.telegram.messenger.Utilities;
@@ -121,6 +123,7 @@ import org.telegram.ui.DialogsActivity;
 import org.telegram.ui.LaunchActivity;
 import org.telegram.ui.Stories.recorder.ButtonWithCounterView;
 import org.telegram.ui.Stories.recorder.SelectAudioAlert;
+import org.telegram.ui.SyncedLyricsEditorFragment;
 
 import java.io.File;
 import java.util.ArrayList;
@@ -140,6 +143,16 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
     private RecyclerListView listView;
     private LinearLayoutManager layoutManager;
     private ListAdapter listAdapter;
+    private RecyclerListView lyricsListView;
+    private LinearLayoutManager lyricsLayoutManager;
+    private LyricsAdapter lyricsAdapter;
+    private final ArrayList<Integer> visibleLyrics = new ArrayList<>();
+    private boolean showingLyrics;
+    private boolean lyricsModeRequested;
+    private boolean lyricsUserScrolling;
+    private boolean lyricsUserDragging;
+    private boolean showLyricsWhenAvailable;
+    private SyncedLyricsController.Lyrics currentLyrics;
     private LinearLayout emptyView;
     private ImageView emptyImageView;
     private TextView emptyTitleTextView;
@@ -154,6 +167,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
     private RLottieImageView prevButton;
     private RLottieImageView nextButton;
     private ClippingTextViewSwitcher authorTextView;
+    private int activeLyricsLine = Integer.MIN_VALUE;
+    private int activeLyricsRow = RecyclerView.NO_POSITION;
     private ActionBarMenuItem optionsButton;
     private ChooseQualityLayout.QualityIcon optionsIcon;
     private ActionBarMenuSubItem castItem;
@@ -228,6 +243,10 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
     long lastUpdateRewindingPlayerTime;
 
     private boolean wasLight;
+    private final Runnable resumeLyricsFollow = () -> {
+        lyricsUserScrolling = false;
+        if (showingLyrics && activeLyricsRow != RecyclerView.NO_POSITION) centerLyricsRow(activeLyricsRow, true);
+    };
 
     private final static float[] speeds = new float[] {
             .5f, 1f, 1.2f, 1.5f, 1.7f, 2f
@@ -303,6 +322,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         NotificationCenter.getInstance(currentAccount).addObserver(this, NotificationCenter.musicDidLoad);
         NotificationCenter.getInstance(currentAccount).addObserver(this, NotificationCenter.moreMusicDidLoad);
         NotificationCenter.getInstance(currentAccount).addObserver(this, NotificationCenter.musicIdsLoaded);
+        NotificationCenter.getInstance(currentAccount).addObserver(this, NotificationCenter.syncedLyricsChanged);
         NotificationCenter.getGlobalInstance().addObserver(this, NotificationCenter.messagePlayingSpeedChanged);
 
         containerView = new FrameLayout(context) {
@@ -335,6 +355,12 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
 
                 LayoutParams layoutParams = (LayoutParams) listView.getLayoutParams();
                 layoutParams.topMargin = ActionBar.getCurrentActionBarHeight() + AndroidUtilities.statusBarHeight;
+
+                if (isLyricsGeometryNeeded()) {
+                    layoutParams = (LayoutParams) lyricsListView.getLayoutParams();
+                    layoutParams.topMargin = getLyricsContentTop();
+                    layoutParams.bottomMargin = dp(179 + (!isMyList() && !noforwards ? 52 : 0));
+                }
 
                 layoutParams = (LayoutParams) actionBarShadow.getLayoutParams();
                 layoutParams.topMargin = ActionBar.getCurrentActionBarHeight() + AndroidUtilities.statusBarHeight;
@@ -381,6 +407,9 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
 
             @Override
             public boolean onInterceptTouchEvent(MotionEvent ev) {
+                if (showingLyrics) {
+                    return super.onInterceptTouchEvent(ev);
+                }
                 if (ev.getAction() == MotionEvent.ACTION_DOWN && scrollOffsetY != 0 && actionBar.getAlpha() == 0.0f) {
                     boolean dismiss;
                     if (listAdapter.getItemCount() > 0) {
@@ -407,13 +436,14 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             @Override
             protected void onDraw(Canvas canvas) {
                 if (playlist.size() <= 1) {
-                    shadowDrawable.setBounds(0, getMeasuredHeight() - playerLayout.getMeasuredHeight() - backgroundPaddingTop, getMeasuredWidth(), getMeasuredHeight());
+                    int top = showingLyrics ? lyricsListView.getTop() - backgroundPaddingTop : getMeasuredHeight() - playerLayout.getMeasuredHeight() - backgroundPaddingTop;
+                    shadowDrawable.setBounds(0, top, getMeasuredWidth(), getMeasuredHeight());
                     shadowDrawable.draw(canvas);
                     if (isProfilePlaylist) {
                         actionBar.setVisibility(View.GONE);
                     }
                 } else {
-                    if (listView.getVisibility() != View.VISIBLE) return;
+                    if (listView.getVisibility() != View.VISIBLE && !showingLyrics) return;
 
                     int offset = dp(13);
                     int top = scrollOffsetY - backgroundPaddingTop - offset;
@@ -1197,6 +1227,57 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             }
             return false;
         });
+
+        lyricsListView = new RecyclerListView(context) {
+            @Override
+            protected void onSizeChanged(int w, int h, int oldw, int oldh) {
+                super.onSizeChanged(w, h, oldw, oldh);
+                int focusPadding = Math.max(0, h / 2 - dp(32));
+                setPadding(0, focusPadding, 0, focusPadding);
+                if (h > 0 && showingLyrics && activeLyricsRow != RecyclerView.NO_POSITION) {
+                    post(() -> centerLyricsRow(activeLyricsRow, false));
+                }
+            }
+        };
+        lyricsListView.setClipToPadding(false);
+        lyricsListView.setVerticalScrollBarEnabled(false);
+        lyricsListView.setGlowColor(getThemedColor(Theme.key_dialogScrollGlow));
+        lyricsListView.setBackgroundColor(Color.TRANSPARENT);
+        lyricsListView.setLayoutManager(lyricsLayoutManager = new LinearLayoutManager(context, LinearLayoutManager.VERTICAL, false));
+        lyricsListView.setAdapter(lyricsAdapter = new LyricsAdapter(context));
+        lyricsListView.setItemAnimator(null);
+        lyricsListView.setVisibility(View.GONE);
+        lyricsListView.setOnItemClickListener((view, position) -> {
+            if (position < 0 || position >= visibleLyrics.size()) return;
+            MessageObject playing = MediaController.getInstance().getPlayingMessageObject();
+            SyncedLyricsController.Lyrics lyrics = SyncedLyricsController.getInstance(currentAccount).getLyrics(playing);
+            int line = visibleLyrics.get(position);
+            if (playing != null && line >= 0 && line < lyrics.lines.size()) {
+                MediaController.getInstance().seekToProgressMs(playing, lyrics.lines.get(line).timeMs);
+                updateLyrics(false);
+            }
+        });
+        FrameLayout.LayoutParams lyricsParams = LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.MATCH_PARENT, Gravity.TOP | Gravity.LEFT);
+        lyricsParams.topMargin = ActionBar.getCurrentActionBarHeight() + AndroidUtilities.statusBarHeight;
+        lyricsParams.bottomMargin = dp(179 + (!isMyList() && !noforwards ? 52 : 0));
+        containerView.addView(lyricsListView, lyricsParams);
+        lyricsListView.addOnScrollListener(new RecyclerView.OnScrollListener() {
+            @Override
+            public void onScrollStateChanged(RecyclerView recyclerView, int newState) {
+                if (newState == RecyclerView.SCROLL_STATE_DRAGGING) {
+                    AndroidUtilities.cancelRunOnUIThread(resumeLyricsFollow);
+                    lyricsUserDragging = true;
+                    lyricsUserScrolling = true;
+                } else if (newState == RecyclerView.SCROLL_STATE_IDLE && lyricsUserScrolling) {
+                    lyricsUserDragging = false;
+                    AndroidUtilities.runOnUIThread(resumeLyricsFollow, 1200);
+                } else if (newState == RecyclerView.SCROLL_STATE_SETTLING && !lyricsUserDragging) {
+                    // Programmatic smoothScrollBy() also settles; it must not suspend following.
+                    lyricsUserScrolling = false;
+                }
+            }
+        });
+
         listView.setOnScrollListener(new RecyclerView.OnScrollListener() {
             @Override
             public void onScrollStateChanged(RecyclerView recyclerView, int newState) {
@@ -1279,6 +1360,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         isProfilePlaylist = savedMusicList != null;
         actionBar.menuOccupyBack = isProfilePlaylist;
         padWithItem = isMyList();
+        ((FrameLayout.LayoutParams) lyricsListView.getLayoutParams()).bottomMargin = dp(179 + (!isMyList() && !noforwards ? 52 : 0));
         playlist = MediaController.getInstance().getPlaylist();
         if (isMyList()) {
             addItem = menu.addItem(8, R.drawable.msg_add);
@@ -1940,6 +2022,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             }
         } else if (id == NotificationCenter.musicIdsLoaded) {
             updateTitle(false);
+        } else if (id == NotificationCenter.syncedLyricsChanged) {
+            updateLyrics(true);
         }
     }
 
@@ -1951,6 +2035,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
     private void updateLayout() {
         if (listView.getChildCount() <= 0) {
             listView.setTopGlowOffset(scrollOffsetY = listView.getPaddingTop());
+            updateLyricsGeometry();
             containerView.invalidate();
             return;
         }
@@ -2002,6 +2087,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             listView.setTopGlowOffset((scrollOffsetY = newOffset) - layoutParams.topMargin - AndroidUtilities.statusBarHeight);
             containerView.invalidate();
         }
+        updateLyricsGeometry();
 
         int offset = dp(13);
         top = scrollOffsetY - backgroundPaddingTop - offset;
@@ -2020,6 +2106,39 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         boolean light = rad <= 0.5f && ColorUtils.calculateLuminance(getThemedColor(Theme.key_dialogBackground)) > 0.7f;
         if (light != wasLight) {
             AndroidUtilities.setLightStatusBar(this, wasLight = light);
+        }
+    }
+
+    private int getLyricsContentTop() {
+        int actionBarTop = ActionBar.getCurrentActionBarHeight() + AndroidUtilities.statusBarHeight;
+        if (playlist == null || playlist.size() <= 1 || scrollOffsetY == Integer.MAX_VALUE) return actionBarTop;
+        int offset = dp(13);
+        int top = scrollOffsetY - backgroundPaddingTop - offset + (int) listView.getTranslationY();
+        if (isProfilePlaylist) {
+            top -= ActionBar.getCurrentActionBarHeight();
+            top += dp(10);
+        }
+        float moveProgress = 0;
+        if (!isProfilePlaylist && top + backgroundPaddingTop < ActionBar.getCurrentActionBarHeight()) {
+            float toMove = offset + dp(11 - 7);
+            moveProgress = Math.min(1.0f, (ActionBar.getCurrentActionBarHeight() - top - backgroundPaddingTop) / toMove);
+            top -= (int) ((ActionBar.getCurrentActionBarHeight() - toMove) * moveProgress);
+        }
+        top += (int) (AndroidUtilities.statusBarHeight * (1f - moveProgress));
+        return Math.max(actionBarTop, top + backgroundPaddingTop);
+    }
+
+    private boolean isLyricsGeometryNeeded() {
+        return showingLyrics || lyricsModeRequested || showLyricsWhenAvailable;
+    }
+
+    private void updateLyricsGeometry() {
+        if (lyricsListView == null || !isLyricsGeometryNeeded()) return;
+        FrameLayout.LayoutParams params = (FrameLayout.LayoutParams) lyricsListView.getLayoutParams();
+        int top = getLyricsContentTop();
+        if (params.topMargin != top) {
+            params.topMargin = top;
+            lyricsListView.setLayoutParams(params);
         }
     }
 
@@ -2067,6 +2186,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         NotificationCenter.getInstance(currentAccount).removeObserver(this, NotificationCenter.musicDidLoad);
         NotificationCenter.getInstance(currentAccount).removeObserver(this, NotificationCenter.moreMusicDidLoad);
         NotificationCenter.getInstance(currentAccount).removeObserver(this, NotificationCenter.musicIdsLoaded);
+        NotificationCenter.getInstance(currentAccount).removeObserver(this, NotificationCenter.syncedLyricsChanged);
+        AndroidUtilities.cancelRunOnUIThread(resumeLyricsFollow);
         NotificationCenter.getGlobalInstance().removeObserver(this, NotificationCenter.messagePlayingSpeedChanged);
         DownloadController.getInstance(currentAccount).removeLoadingFileObserver(this);
         if (instance == this) {
@@ -2203,7 +2324,93 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 timeTextView.setText(AndroidUtilities.formatShortDuration(newTime));
             }
             seekBarView.updateTimestamps(messageObject, null);
+            updateLyrics(true);
         }
+    }
+
+    private void updateLyrics(boolean animated) {
+        if (lyricsListView == null) return;
+        MessageObject message = MediaController.getInstance().getPlayingMessageObject();
+        SyncedLyricsController.Lyrics lyrics = SyncedLyricsController.getInstance(currentAccount).getLyrics(message);
+        SyncedLyricsController.State state = SyncedLyricsController.getInstance(currentAccount).getState(message);
+        if (currentLyrics != lyrics) {
+            currentLyrics = lyrics;
+            visibleLyrics.clear();
+            for (int i = 0; i < lyrics.lines.size(); i++) {
+                if (!TextUtils.isEmpty(lyrics.lines.get(i).text)) visibleLyrics.add(i);
+            }
+            activeLyricsLine = Integer.MIN_VALUE;
+            activeLyricsRow = RecyclerView.NO_POSITION;
+            lyricsAdapter.notifyDataSetChanged();
+        }
+        if (visibleLyrics.isEmpty()) {
+            if (state == SyncedLyricsController.State.LOADING || state == SyncedLyricsController.State.NOT_LOADED) return;
+            if (showingLyrics) setShowingLyrics(false, animated);
+            lyricsModeRequested = false;
+            return;
+        }
+        if (showLyricsWhenAvailable) {
+            showLyricsWhenAvailable = false;
+            lyricsModeRequested = true;
+            setShowingLyrics(true, false);
+        } else if (lyricsModeRequested && !showingLyrics) {
+            setShowingLyrics(true, animated);
+        }
+        int index = lyrics.lineAt(SyncedLyricsController.positionMs(message));
+        if (index == activeLyricsLine) return;
+        int oldRow = activeLyricsRow;
+        activeLyricsLine = index;
+        activeLyricsRow = RecyclerView.NO_POSITION;
+        for (int i = 0; i < visibleLyrics.size(); i++) {
+            if (visibleLyrics.get(i) == index) {
+                activeLyricsRow = i;
+                break;
+            }
+        }
+        if (oldRow != RecyclerView.NO_POSITION) lyricsAdapter.notifyItemChanged(oldRow);
+        if (activeLyricsRow != RecyclerView.NO_POSITION) {
+            lyricsAdapter.notifyItemChanged(activeLyricsRow);
+            if (showingLyrics && !lyricsUserScrolling) centerLyricsRow(activeLyricsRow, animated);
+        }
+    }
+
+    private void setShowingLyrics(boolean show, boolean animated) {
+        if (show && visibleLyrics.isEmpty()) return;
+        if (show) updateLyricsGeometry();
+        showingLyrics = show;
+        lyricsListView.setEnabled(show);
+        listView.setEnabled(!show);
+        if (show) {
+            listView.animate().cancel();
+            listView.setTranslationY(0);
+            AndroidUtilities.updateViewShow(listView, false, false, false);
+            AndroidUtilities.updateViewShow(lyricsListView, true, false, animated);
+        } else {
+            AndroidUtilities.updateViewShow(lyricsListView, false, false, false);
+            AndroidUtilities.updateViewShow(listView, true, false, animated);
+        }
+        if (show && activeLyricsRow != RecyclerView.NO_POSITION) centerLyricsRow(activeLyricsRow, false);
+    }
+
+    private void centerLyricsRow(int row, boolean animated) {
+        lyricsListView.post(() -> {
+            if (!showingLyrics || row != activeLyricsRow || row < 0 || row >= visibleLyrics.size() || lyricsListView.getHeight() == 0) return;
+            View child = lyricsLayoutManager.findViewByPosition(row);
+            if (child == null) {
+                lyricsLayoutManager.scrollToPositionWithOffset(row, Math.max(0, lyricsListView.getHeight() / 2 - dp(32)));
+                lyricsListView.post(() -> centerLyricsRow(row, animated));
+                return;
+            }
+            int distance = (child.getTop() + child.getBottom()) / 2 - lyricsListView.getHeight() / 2;
+            if (animated) lyricsListView.smoothScrollBy(0, distance);
+            else lyricsListView.scrollBy(0, distance);
+        });
+    }
+
+    public AudioPlayerAlert showLyricsWhenAvailable() {
+        showLyricsWhenAvailable = true;
+        lyricsModeRequested = true;
+        return this;
     }
 
     private void checkIfMusicDownloaded(MessageObject messageObject) {
@@ -2267,6 +2474,9 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 layoutParams = (FrameLayout.LayoutParams) playerShadow.getLayoutParams();
                 layoutParams.bottomMargin = dp(179 + (!isMyList() && !noforwards ? 52 : 0));
                 playerShadow.setLayoutParams(layoutParams);
+                layoutParams = (FrameLayout.LayoutParams) lyricsListView.getLayoutParams();
+                layoutParams.bottomMargin = dp(179 + (!isMyList() && !noforwards ? 52 : 0));
+                lyricsListView.setLayoutParams(layoutParams);
             }
             if (noforwards) {
                 optionsButton.hideSubItem(1);
@@ -2296,6 +2506,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             String author = messageObject.getMusicAuthor();
             titleTextView.setText(title);
             authorTextView.setText(author);
+            activeLyricsLine = Integer.MIN_VALUE;
+            updateLyrics(!sameMessageObject);
 
             final MessagesController.SavedMusicIds musicIds = MessagesController.getInstance(currentAccount).getSavedMusicIds();
             saveToProfileButton.setLoading(musicIds.loading);
@@ -2405,6 +2617,49 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         }
     }
 
+    private class LyricsAdapter extends RecyclerListView.SelectionAdapter {
+        private final Context context;
+
+        LyricsAdapter(Context context) {
+            this.context = context;
+        }
+
+        @Override
+        public boolean isEnabled(RecyclerView.ViewHolder holder) {
+            return true;
+        }
+
+        @Override
+        public int getItemCount() {
+            return visibleLyrics.size();
+        }
+
+        @Override
+        public RecyclerView.ViewHolder onCreateViewHolder(ViewGroup parent, int viewType) {
+            TextView textView = new TextView(context);
+            textView.setLayoutParams(new RecyclerView.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+            textView.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
+            textView.setTextDirection(View.TEXT_DIRECTION_FIRST_STRONG);
+            textView.setPadding(dp(24), dp(12), dp(24), dp(12));
+            textView.setMinHeight(dp(56));
+            textView.setBackground(Theme.createSelectorDrawable(getThemedColor(Theme.key_listSelector), 2));
+            return new RecyclerListView.Holder(textView);
+        }
+
+        @Override
+        public void onBindViewHolder(RecyclerView.ViewHolder holder, int position) {
+            TextView textView = (TextView) holder.itemView;
+            int line = visibleLyrics.get(position);
+            boolean active = line == activeLyricsLine;
+            textView.setText(currentLyrics.lines.get(line).text);
+            textView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16);
+            textView.setTypeface(active ? AndroidUtilities.bold() : Typeface.DEFAULT);
+            textView.setTextColor(getThemedColor(active ? Theme.key_player_actionBarTitle : Theme.key_player_time));
+            textView.setAlpha(1f);
+            textView.setBackground(Theme.createSelectorDrawable(getThemedColor(Theme.key_listSelector), 2));
+        }
+    }
+
     private class ListAdapter extends RecyclerListView.SelectionAdapter {
 
         private Context context;
@@ -2460,6 +2715,12 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 playerLayout.setBackgroundColor(getThemedColor(Theme.key_player_background));
                 playerShadow.setVisibility(View.VISIBLE);
                 listView.setPadding(0, listView.getPaddingTop(), 0, 0);
+            }
+            if (showingLyrics) {
+                listView.animate().cancel();
+                listView.setTranslationY(0);
+                listView.setVisibility(View.GONE);
+                listView.setEnabled(false);
             }
             updateEmptyView();
         }
@@ -2667,6 +2928,9 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             optionsButton.setPopupItemsColor(getThemedColor(Theme.key_actionBarDefaultSubmenuItem), false);
             optionsButton.setPopupItemsColor(getThemedColor(Theme.key_actionBarDefaultSubmenuItem), true);
             optionsButton.redrawPopup(getThemedColor(Theme.key_actionBarDefaultSubmenuBackground));
+            if (lyricsAdapter != null) lyricsAdapter.notifyDataSetChanged();
+            activeLyricsLine = Integer.MIN_VALUE;
+            updateLyrics(false);
         };
 
 //        themeDescriptions.add(new ThemeDescription(actionBar, ThemeDescription.FLAG_BACKGROUND, null, null, null, null, Theme.key_dialogBackground));
@@ -2740,6 +3004,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         themeDescriptions.add(new ThemeDescription(timeTextView, ThemeDescription.FLAG_TEXTCOLOR, null, null, null, null, Theme.key_player_time));
         themeDescriptions.add(new ThemeDescription(titleTextView.getTextView(), ThemeDescription.FLAG_TEXTCOLOR, null, null, null, null, Theme.key_player_actionBarTitle));
         themeDescriptions.add(new ThemeDescription(titleTextView.getNextTextView(), ThemeDescription.FLAG_TEXTCOLOR, null, null, null, null, Theme.key_player_actionBarTitle));
+        themeDescriptions.add(new ThemeDescription(lyricsListView, ThemeDescription.FLAG_LISTGLOWCOLOR, null, null, null, null, Theme.key_dialogScrollGlow));
         themeDescriptions.add(new ThemeDescription(authorTextView.getTextView(), ThemeDescription.FLAG_TEXTCOLOR, null, null, null, null, Theme.key_player_time));
         themeDescriptions.add(new ThemeDescription(authorTextView.getNextTextView(), ThemeDescription.FLAG_TEXTCOLOR, null, null, null, null, Theme.key_player_time));
 
@@ -2892,6 +3157,20 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         o.addIf(messageObject.getId() > 0, R.drawable.msg_message, getString(R.string.ShowInChat), () -> {
             o.dismiss();
             onSubItemClick(4);
+        });
+        SyncedLyricsController lyricsController = SyncedLyricsController.getInstance(currentAccount);
+        SyncedLyricsController.Lyrics menuLyrics = lyricsController.getLyrics(messageObject);
+        SyncedLyricsController.State lyricsState = lyricsController.getState(messageObject);
+        boolean hasLyrics = !menuLyrics.lines.isEmpty();
+        o.addIf(hasLyrics, R.drawable.outline_caption_24, getString(showingLyrics ? R.string.ShowPlaylist : R.string.ShowLyrics), () -> {
+            o.dismiss();
+            lyricsModeRequested = !showingLyrics;
+            setShowingLyrics(lyricsModeRequested, true);
+        });
+        o.add(R.drawable.msg_edit, getString(!menuLyrics.source.isEmpty() || lyricsState == SyncedLyricsController.State.LOADING || lyricsState == SyncedLyricsController.State.NOT_LOADED ? R.string.EditLyrics : R.string.AddLyrics), () -> {
+            o.dismiss();
+            dismiss();
+            parentActivity.presentFragment(new SyncedLyricsEditorFragment(messageObject));
         });
         if (castAvailable) {
             castItem = o.add();
