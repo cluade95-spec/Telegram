@@ -13,13 +13,20 @@ import android.net.Uri;
 import android.os.Bundle;
 import android.os.Build;
 import android.provider.OpenableColumns;
-import android.text.Layout;
 import android.text.Editable;
 import android.text.InputType;
+import android.text.Layout;
+import android.text.Spanned;
+import android.text.TextPaint;
 import android.text.TextWatcher;
+import android.text.style.CharacterStyle;
+import android.text.style.UpdateAppearance;
+import android.view.GestureDetector;
 import android.view.Gravity;
+import android.view.MotionEvent;
 import android.view.View;
 import android.widget.FrameLayout;
+import android.widget.OverScroller;
 import android.widget.TextView;
 
 import org.telegram.messenger.AndroidUtilities;
@@ -53,6 +60,8 @@ import java.nio.charset.CodingErrorAction;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Locale;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /** A single raw-text editing surface for the current track's local lyrics source. */
 public class SyncedLyricsEditorFragment extends BaseFragment implements NotificationCenter.NotificationCenterDelegate {
@@ -118,10 +127,61 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
      * {@code RichEditorListView}.
      */
     private static class LyricsEditText extends EditTextBoldCursor {
+        private final OverScroller flingScroller;
+        private final GestureDetector flingDetector;
+
         LyricsEditText(Context context) {
             super(context);
             drawAnimatedEmojiDrawables = false;
             setShouldRevealSpoilersByTouch(false);
+            // A TextView scrolls through Touch.onTouchEvent, which drags but never flings - that is
+            // why the editor felt dry and stopped dead. Add momentum without changing the layout,
+            // the movement method, IME behaviour or the single-EditText structure.
+            flingScroller = new OverScroller(context);
+            flingDetector = new GestureDetector(context, new GestureDetector.SimpleOnGestureListener() {
+                @Override
+                public boolean onFling(MotionEvent e1, MotionEvent e2, float velocityX, float velocityY) {
+                    if (hasSelection()) return false;
+                    final int max = getMaxEditorScroll();
+                    if (max <= 0) return false;
+                    flingScroller.forceFinished(true);
+                    flingScroller.fling(0, getScrollY(), 0, -Math.round(velocityY), 0, 0, 0, max);
+                    postInvalidateOnAnimation();
+                    return true;
+                }
+            });
+            flingDetector.setIsLongpressEnabled(false);
+        }
+
+        private int getMaxEditorScroll() {
+            final Layout layout = getLayout();
+            if (layout == null) return 0;
+            return Math.max(0, layout.getHeight() + getPaddingTop() + getPaddingBottom() - getHeight());
+        }
+
+        @Override
+        public boolean onTouchEvent(MotionEvent event) {
+            if (event.getActionMasked() == MotionEvent.ACTION_DOWN) {
+                flingScroller.forceFinished(true);
+            }
+            // Selection, handles, cursor placement and the IME keep first claim on the event; the
+            // detector only ever reacts to a fling.
+            final boolean handled = super.onTouchEvent(event);
+            flingDetector.onTouchEvent(event);
+            return handled;
+        }
+
+        @Override
+        public void computeScroll() {
+            if (flingScroller.computeScrollOffset()) {
+                final int y = Math.max(0, Math.min(flingScroller.getCurrY(), getMaxEditorScroll()));
+                if (y != getScrollY()) {
+                    scrollTo(getScrollX(), y);
+                } else if (y == 0 || y == getMaxEditorScroll()) {
+                    flingScroller.forceFinished(true);
+                }
+                postInvalidateOnAnimation();
+            }
         }
 
         @Override
@@ -145,12 +205,86 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
         }
     }
 
+    /**
+     * Presentation-only timestamp colour. Deliberately NOT a ParcelableSpan, so it is dropped when
+     * the selection is copied or cut - the clipboard, the saved file, import and export all stay
+     * exactly the raw lyrics text.
+     */
+    private static final class TimestampSpan extends CharacterStyle implements UpdateAppearance {
+        private final int color;
+
+        TimestampSpan(int color) {
+            this.color = color;
+        }
+
+        @Override
+        public void updateDrawState(TextPaint paint) {
+            paint.setColor(color);
+        }
+    }
+
+    /** Leading LRC timestamps only, matching what the parser accepts. Metadata tags cannot match. */
+    private static final Pattern TIMESTAMP_TOKEN = Pattern.compile("\\[(\\d{1,3}):(\\d{1,2})(?:[\\.:]\\d{1,3})?]");
+
+    /**
+     * Re-colours only the lines the last edit touched. Typing re-spans one paragraph; a paste or an
+     * import re-spans just the inserted range. Nothing ever walks the whole document per keystroke
+     * or per frame.
+     */
+    private void restyleTimestamps(Editable text, int changeStart, int changeEnd) {
+        if (text == null) return;
+        final int length = text.length();
+        int start = Math.max(0, Math.min(changeStart, length));
+        int end = Math.max(start, Math.min(changeEnd, length));
+        while (start > 0 && text.charAt(start - 1) != '\n') start--;
+        while (end < length && text.charAt(end) != '\n') end++;
+        if (start >= end) {
+            if (length == 0) return;
+            if (start >= length) return;
+            end = Math.min(length, start + 1);
+        }
+        for (TimestampSpan span : text.getSpans(start, end, TimestampSpan.class)) {
+            text.removeSpan(span);
+        }
+        final int color = getThemedColor(Theme.key_windowBackgroundWhiteBlueText);
+        int lineStart = start;
+        while (lineStart <= end && lineStart < length) {
+            int lineEnd = lineStart;
+            while (lineEnd < length && text.charAt(lineEnd) != '\n') lineEnd++;
+            styleTimestampsInLine(text, lineStart, lineEnd, color);
+            lineStart = lineEnd + 1;
+        }
+    }
+
+    private void styleTimestampsInLine(Editable text, int lineStart, int lineEnd, int color) {
+        if (lineEnd <= lineStart) return;
+        final Matcher matcher = TIMESTAMP_TOKEN.matcher(text);
+        matcher.region(lineStart, lineEnd);
+        int cursor = lineStart;
+        while (matcher.find()) {
+            if (matcher.start() != cursor) break; // only a run of timestamps at the start of a line
+            try {
+                if (Long.parseLong(matcher.group(2)) >= 60) break;
+            } catch (RuntimeException ignore) {
+                break;
+            }
+            text.setSpan(new TimestampSpan(color), matcher.start(), matcher.end(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+            cursor = matcher.end();
+        }
+    }
+
+    private void restyleAllTimestamps() {
+        if (editText == null) return;
+        final Editable text = editText.getText();
+        if (text != null) restyleTimestamps(text, 0, text.length());
+    }
+
     @Override
     public View createView(Context context) {
         SyncedLyricsController controller = SyncedLyricsController.getInstance(currentAccount);
         controller.retryIfFailed(messageObject);
         actionBar.setBackButtonImage(R.drawable.ic_ab_back);
-        actionBar.setTitle(LocaleController.getString(R.string.SyncedLyrics));
+        actionBar.setTitle(LocaleController.getString(R.string.Lyrics));
         actionBar.setAllowOverlayTitle(true);
         actionBar.setActionBarMenuOnItemClick(new ActionBar.ActionBarMenuOnItemClick() {
             @Override
@@ -213,17 +347,32 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
             @Override public void onHistoryChanged() { updateHistoryButtons(); }
         });
         editText.addTextChangedListener(new TextWatcher() {
+            private int changeStart;
+            private int changeEnd;
+
             @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {
                 if (!ignoreTextChange && history != null) history.onBeforeChange(count, after);
             }
             @Override public void onTextChanged(CharSequence s, int start, int before, int count) {
+                changeStart = start;
+                changeEnd = start + count;
                 if (ignoreTextChange) return;
                 changedByUser = true;
-                // Debounced only: no snapshot, no parsing and no span work per keystroke.
+                // Debounced only: no snapshot and no document parsing per keystroke.
                 if (history != null) history.onTyping();
             }
-            @Override public void afterTextChanged(Editable s) { }
+            @Override public void afterTextChanged(Editable s) {
+                // Span work is bounded to the edited lines and never reported to the history:
+                // TextWatchers are notified of text changes, not span changes.
+                restyleTimestamps(s, changeStart, changeEnd);
+            }
         });
+        // Scope the selection toolbar to the real window, exactly as Telegram's own long-text
+        // editors do (ChatActivityEnterView, PhotoViewerCaptionEnterView). Nothing shared changes.
+        if (getParentActivity() != null && getParentActivity().getWindow() != null) {
+            editText.setWindowView(getParentActivity().getWindow().getDecorView());
+        }
+        restyleAllTimestamps();
         changedByUser = restoredSource != null && !initialSource.equals(restoredSource);
         updateOtherMenu();
         updateHistoryButtons();
@@ -271,6 +420,7 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
             editText.setText(initialSource);
             editText.setSelection(editText.length());
             ignoreTextChange = false;
+            restyleAllTimestamps();
             changedByUser = false;
             // The loaded document is the state the first undo should return to.
             if (history != null) history.resetBaseline();
@@ -323,6 +473,9 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
         final int end = Math.max(start, Math.min(selectionEnd, length));
         editText.setSelection(start, end);
         ignoreTextChange = false;
+        // Undo/redo restores text, then refreshes the presentation; the spans are never part of
+        // the snapshots themselves.
+        restyleAllTimestamps();
         changedByUser = !initialSource.equals(text);
     }
 
@@ -432,6 +585,7 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
                     if (history != null) history.flush();
                     editText.setText(result);
                     editText.setSelection(editText.length());
+                    restyleAllTimestamps();
                     changedByUser = true;
                     if (history != null) history.record();
                     updateOtherMenu();
@@ -476,12 +630,15 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
         Theme.ResourcesProvider provider = getResourceProvider();
         finishFragment();
         if (!(activity instanceof LaunchActivity) || activity.isFinishing()) return;
+        // Next frame, not a tuned delay. The old 180ms pause existed to cover a black frame that
+        // came from the player itself opening with a near-fullscreen sheet; that is fixed at the
+        // source, so the sheet can come straight back over the closing fragment.
         AndroidUtilities.runOnUIThread(() -> {
             MessageObject playing = MediaController.getInstance().getPlayingMessageObject();
             if (!activity.isFinishing() && playing != null && playing.isMusic() && AudioPlayerAlert.instance == null) {
-                new AudioPlayerAlert(activity, provider).showLyricsWhenAvailable().show();
+                new AudioPlayerAlert(activity, provider).openLyrics().show();
             }
-        }, 180);
+        });
     }
 
     private void showError(int message) {

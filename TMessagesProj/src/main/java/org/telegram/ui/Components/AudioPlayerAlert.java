@@ -43,7 +43,6 @@ import android.os.SystemClock;
 import android.text.SpannableStringBuilder;
 import android.text.Spanned;
 import android.text.TextUtils;
-import android.util.DisplayMetrics;
 import android.util.FloatProperty;
 import android.util.Property;
 import android.util.TypedValue;
@@ -68,7 +67,6 @@ import androidx.dynamicanimation.animation.SpringAnimation;
 import androidx.dynamicanimation.animation.SpringForce;
 import androidx.recyclerview.widget.ItemTouchHelper;
 import androidx.recyclerview.widget.LinearLayoutManager;
-import androidx.recyclerview.widget.LinearSmoothScroller;
 import androidx.recyclerview.widget.RecyclerView;
 
 import com.google.android.exoplayer2.C;
@@ -154,7 +152,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
     private boolean lyricsModeRequested;
     private boolean lyricsUserScrolling;
     private boolean lyricsUserDragging;
-    private boolean showLyricsWhenAvailable;
+    private boolean applySavedModeOnOpen;
+    private boolean dismissing;
     private SyncedLyricsController.Lyrics currentLyrics;
     private LinearLayout emptyView;
     private ImageView emptyImageView;
@@ -267,7 +266,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
     private boolean wasLight;
     private final Runnable resumeLyricsFollow = () -> {
         lyricsUserScrolling = false;
-        if (showingLyrics && activeLyricsRow != RecyclerView.NO_POSITION) centerLyricsRow(activeLyricsRow, true);
+        updateLyricsFollow(true);
     };
 
     private final static float[] speeds = new float[] {
@@ -387,11 +386,11 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 LayoutParams layoutParams = (LayoutParams) listView.getLayoutParams();
                 layoutParams.topMargin = ActionBar.getCurrentActionBarHeight() + AndroidUtilities.statusBarHeight;
 
-                if (isLyricsGeometryNeeded()) {
-                    layoutParams = (LayoutParams) lyricsListView.getLayoutParams();
-                    layoutParams.topMargin = getLyricsContentTop();
-                    layoutParams.bottomMargin = dp(getPlayerHeight());
-                }
+                // Unconditional: the lyrics surface must never be measured with a stale margin,
+                // which is what let a first frame render as a near-fullscreen sheet.
+                layoutParams = (LayoutParams) lyricsListView.getLayoutParams();
+                layoutParams.topMargin = getLyricsContentTop();
+                layoutParams.bottomMargin = dp(getPlayerHeight());
 
                 layoutParams = (LayoutParams) actionBarShadow.getLayoutParams();
                 layoutParams.topMargin = ActionBar.getCurrentActionBarHeight() + AndroidUtilities.statusBarHeight;
@@ -1293,8 +1292,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             protected void onSizeChanged(int w, int h, int oldw, int oldh) {
                 super.onSizeChanged(w, h, oldw, oldh);
                 updateLyricsPadding();
-                if (h > 0 && showingLyrics && activeLyricsRow != RecyclerView.NO_POSITION) {
-                    post(() -> centerLyricsRow(activeLyricsRow, false));
+                if (h > 0 && showingLyrics) {
+                    post(() -> updateLyricsFollow(false));
                 }
             }
         };
@@ -1313,6 +1312,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             int line = visibleLyrics.get(position);
             if (playing != null && line >= 0 && line < lyrics.lines.size() && lyrics.lines.get(line).timed) {
                 MediaController.getInstance().seekToProgressMs(playing, lyrics.lines.get(line).timeMs);
+                lyricsUserScrolling = false;
+                AndroidUtilities.cancelRunOnUIThread(resumeLyricsFollow);
                 updateLyrics(false);
             }
         });
@@ -1325,6 +1326,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             public void onScrollStateChanged(RecyclerView recyclerView, int newState) {
                 if (newState == RecyclerView.SCROLL_STATE_DRAGGING) {
                     AndroidUtilities.cancelRunOnUIThread(resumeLyricsFollow);
+                    // Never fight the finger: drop the driven follow and its pending pre-roll.
+                    cancelLyricsFollow();
                     lyricsUserDragging = true;
                     lyricsUserScrolling = true;
                 } else if (newState == RecyclerView.SCROLL_STATE_IDLE && lyricsUserScrolling) {
@@ -2127,6 +2130,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
     }
 
     private void updateLayout() {
+        if (dismissing) return;
         if (isLyricsChromeActive()) {
             // The playlist is off-screen; its scroll offset must not drive the lyrics geometry,
             // the action bar fade, or the profile header position.
@@ -2228,62 +2232,34 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         applyLightStatusBar(fullscreenLyrics && isDialogBackgroundLight());
     }
 
-    /**
-     * Resting playlist-sheet padding, exactly as {@code onMeasure} computes it but without the
-     * {@code padWithItem} override. That override pins the profile playlist list to the very top,
-     * which is playlist chrome - it must not define where the lyrics viewport starts.
-     */
-    private int computeLyricsShellPadding(int availableHeight) {
-        final int playerHeight = dp(getNormalPlayerHeight());
-        int contentSize = playerHeight;
-        if (playlist != null && playlist.size() > 1) {
-            contentSize += backgroundPaddingTop + playlist.size() * dp(56);
-        }
-        int padding = (contentSize < availableHeight ? availableHeight - contentSize : availableHeight - (int) (availableHeight / 5 * 3.5f)) + dp(8);
-        final int maxPadding = availableHeight - playerHeight - dp(150);
-        if (padding > maxPadding) padding = maxPadding;
-        if (padding < 0) padding = 0;
-        return padding;
-    }
+    // Normal-lyrics viewport target. Playlist mode keeps Telegram's sheet behaviour; Lyrics mode
+    // owns one deterministic geometry derived only from the window and the normal control block -
+    // never from playlist length, scroll offset, list children, sheet drags, profile pinning, a
+    // previous fullscreen state, a previous open, or any pager/animation value.
+    private static final float LYRICS_VIEWPORT_FRACTION = 0.29f;
+    private static final int LYRICS_VIEWPORT_MIN = 96;
+    private static final int LYRICS_VIEWPORT_MAX = 280;
 
-    /**
-     * The sheet offset the lyrics viewport is measured from. The ordinary chat/download player uses
-     * its own {@link #scrollOffsetY} unchanged - that geometry is approved and must not move. The
-     * profile playlist has no comparable offset because {@code padWithItem} zeroes its padding, so
-     * the same structural rule is resolved for it instead of inheriting playlist-pinned geometry.
-     */
-    private int getLyricsShellScrollOffset() {
-        if (!isProfilePlaylist) return scrollOffsetY;
-        int totalHeight = containerMeasuredHeight;
-        if (totalHeight <= 0 && containerView != null) totalHeight = containerView.getMeasuredHeight();
-        if (totalHeight <= 0) return scrollOffsetY;
-        final int availableHeight = totalHeight - (containerView == null ? 0 : containerView.getPaddingTop());
-        // Mirrors updateLayout(): scrollOffsetY = newOffset + listTopMargin - statusBarHeight - dp(11),
-        // with newOffset the resting first-child top, floored at dp(7) exactly as updateLayout() does.
-        final int restingOffset = Math.max(dp(7), computeLyricsShellPadding(availableHeight));
-        return restingOffset + ActionBar.getCurrentActionBarHeight() - dp(11);
+    /** Deterministic normal-lyrics viewport height for the current window. */
+    private int getNormalLyricsViewport(int totalHeight, int actionBarTop) {
+        final int available = totalHeight - actionBarTop;
+        int viewport = Math.round(available * LYRICS_VIEWPORT_FRACTION);
+        viewport = Math.max(dp(LYRICS_VIEWPORT_MIN), Math.min(dp(LYRICS_VIEWPORT_MAX), viewport));
+        // Never let the viewport overlap the control block, however short the window is.
+        return Math.max(0, Math.min(viewport, available - dp(getNormalPlayerHeight())));
     }
 
     private int getLyricsContentTop() {
-        int actionBarTop = ActionBar.getCurrentActionBarHeight() + AndroidUtilities.statusBarHeight;
+        final int actionBarTop = ActionBar.getCurrentActionBarHeight() + AndroidUtilities.statusBarHeight;
         if (fullscreenLyrics) return actionBarTop;
-        if (playlist == null || playlist.size() <= 1) return actionBarTop;
-        int shellOffset = getLyricsShellScrollOffset();
-        if (shellOffset == Integer.MAX_VALUE) return actionBarTop;
-        int offset = dp(13);
-        int top = shellOffset - backgroundPaddingTop - offset + (int) listView.getTranslationY();
-        float moveProgress = 0;
-        if (top + backgroundPaddingTop < ActionBar.getCurrentActionBarHeight()) {
-            float toMove = offset + dp(11 - 7);
-            moveProgress = Math.min(1.0f, (ActionBar.getCurrentActionBarHeight() - top - backgroundPaddingTop) / toMove);
-            top -= (int) ((ActionBar.getCurrentActionBarHeight() - toMove) * moveProgress);
-        }
-        top += (int) (AndroidUtilities.statusBarHeight * (1f - moveProgress));
-        return Math.max(actionBarTop, top + backgroundPaddingTop);
+        int totalHeight = containerMeasuredHeight;
+        if (totalHeight <= 0 && containerView != null) totalHeight = containerView.getMeasuredHeight();
+        if (totalHeight <= 0) return actionBarTop;
+        return Math.max(actionBarTop, totalHeight - dp(getNormalPlayerHeight()) - getNormalLyricsViewport(totalHeight, actionBarTop));
     }
 
     private boolean isLyricsGeometryNeeded() {
-        return showingLyrics || lyricsModeRequested || showLyricsWhenAvailable || lyricsPageProgress > 0f;
+        return showingLyrics || lyricsModeRequested || applySavedModeOnOpen || lyricsPageProgress > 0f;
     }
 
     /** True while the shell presents lyrics, so playlist-only chrome must stay out of the way. */
@@ -2316,6 +2292,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
      * lyrics mode (normal and fullscreen) takes them out of the way so nothing overlays the lyrics.
      */
     private void updateLyricsChrome() {
+        if (dismissing) return;
         final boolean lyricsChrome = isLyricsChromeActive();
         if (lyricsChrome && actionBar != null && actionBar.isSearchFieldVisible()) {
             actionBar.closeSearchField();
@@ -2383,6 +2360,16 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
 
     @Override
     public void dismiss() {
+        if (!dismissing) {
+            dismissing = true;
+            // Stop owning the surface before the sheet starts sliding out. No page settle, no
+            // geometry write and no chrome animation may run while the dismissal is on screen -
+            // that is what made outside-tap close glitch.
+            cancelLyricsPageAnimation();
+            cancelLyricsPagerTracking();
+            cancelLyricsFollow();
+            AndroidUtilities.cancelRunOnUIThread(resumeLyricsFollow);
+        }
         super.dismiss();
         NotificationCenter.getInstance(currentAccount).removeObserver(this, NotificationCenter.messagePlayingDidReset);
         NotificationCenter.getInstance(currentAccount).removeObserver(this, NotificationCenter.messagePlayingPlayStateChanged);
@@ -2395,8 +2382,6 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         NotificationCenter.getInstance(currentAccount).removeObserver(this, NotificationCenter.musicIdsLoaded);
         NotificationCenter.getInstance(currentAccount).removeObserver(this, NotificationCenter.syncedLyricsChanged);
         AndroidUtilities.cancelRunOnUIThread(resumeLyricsFollow);
-        cancelLyricsPageAnimation();
-        cancelLyricsPagerTracking();
         NotificationCenter.getGlobalInstance().removeObserver(this, NotificationCenter.messagePlayingSpeedChanged);
         DownloadController.getInstance(currentAccount).removeLoadingFileObserver(this);
         if (instance == this) {
@@ -2542,11 +2527,12 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
     }
 
     private void updateLyrics(boolean animated) {
-        if (lyricsListView == null) return;
+        if (lyricsListView == null || dismissing) return;
         MessageObject message = MediaController.getInstance().getPlayingMessageObject();
         SyncedLyricsController.Lyrics lyrics = SyncedLyricsController.getInstance(currentAccount).getLyrics(message);
         SyncedLyricsController.State state = SyncedLyricsController.getInstance(currentAccount).getState(message);
         if (currentLyrics != lyrics) {
+            cancelLyricsFollow();
             currentLyrics = lyrics;
             visibleLyrics.clear();
             for (int i = 0; i < lyrics.lines.size(); i++) {
@@ -2563,14 +2549,18 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             lyricsModeRequested = SyncedLyricsController.getInstance(currentAccount).isLyricsModePreferred();
             return;
         }
-        if (showLyricsWhenAvailable) {
-            showLyricsWhenAvailable = false;
-            lyricsModeRequested = true;
-            setShowingLyrics(true, false);
+        if (applySavedModeOnOpen) {
+            applySavedModeOnOpen = false;
+            // Opening honours the persisted page, without animation: never force Lyrics and never
+            // inherit a previous fullscreen or expanded presentation.
+            if (lyricsModeRequested) setShowingLyrics(true, false);
         } else if (lyricsModeRequested && !showingLyrics) {
             setShowingLyrics(true, animated);
         }
         int index = lyrics.lineAt(SyncedLyricsController.positionMs(message));
+        // The visual follow is re-evaluated on every tick so pause, seek and track changes always
+        // recompute from the real playback position instead of from a stale schedule.
+        updateLyricsFollow(true);
         if (index == activeLyricsLine) return;
         int oldRow = activeLyricsRow;
         activeLyricsLine = index;
@@ -2582,14 +2572,11 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             }
         }
         if (oldRow != RecyclerView.NO_POSITION) lyricsAdapter.notifyItemChanged(oldRow);
-        if (activeLyricsRow != RecyclerView.NO_POSITION) {
-            lyricsAdapter.notifyItemChanged(activeLyricsRow);
-            if (showingLyrics && !lyricsUserScrolling) centerLyricsRow(activeLyricsRow, animated);
-        }
+        if (activeLyricsRow != RecyclerView.NO_POSITION) lyricsAdapter.notifyItemChanged(activeLyricsRow);
     }
 
     private void setShowingLyrics(boolean show, boolean animated) {
-        if (show && visibleLyrics.isEmpty()) return;
+        if (dismissing || show && visibleLyrics.isEmpty()) return;
         // A programmatic mode change owns the surface; an in-flight drag must not keep writing
         // progress underneath it and strand a partial page.
         cancelLyricsPagerTracking();
@@ -2612,7 +2599,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         updateLyricsChrome();
         updateLyricsPadding();
         showLyricsExpandButton(show && !fullscreenLyrics);
-        if (show && activeLyricsRow != RecyclerView.NO_POSITION) centerLyricsRow(activeLyricsRow, false);
+        if (show) updateLyricsFollow(false);
+        else cancelLyricsFollow();
     }
 
     /** Reveal spec copied from Telegram's text-writer expander: alpha + 0.6 scale, EASE_OUT_QUINT, 420ms. */
@@ -2672,7 +2660,9 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 lyricsListView.setTranslationY(0f);
             }
             updateLyricsPadding();
-            if (activeLyricsRow != RecyclerView.NO_POSITION) centerLyricsRow(activeLyricsRow, true);
+            // Re-target into the new focus centre without touching the timing state, so expanding
+            // or collapsing never restarts or skips the synced follow.
+            updateLyricsFollow(true);
         });
     }
 
@@ -2701,6 +2691,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
     }
 
     private void setLyricsPageProgress(float progress) {
+        if (dismissing) return;
         lyricsPageProgress = Math.max(0f, Math.min(1f, progress));
         final int width = getLyricsPageWidth();
         final float direction = LocaleController.isRTL ? -1f : 1f;
@@ -2906,6 +2897,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                     lyricsListView.setAlpha(1f);
                     updateLyricsGeometry();
                     AndroidUtilities.cancelRunOnUIThread(resumeLyricsFollow);
+                    cancelLyricsFollow();
                 } else if (Math.abs(dy) >= lyricsPagerTouchSlop) {
                     abandonLyricsPagerGesture();
                     return false;
@@ -2979,9 +2971,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             showLyricsExpandButton(toLyrics && !fullscreenLyrics);
         }
         animateLyricsPage(endpoint, velocityX);
-        if (toLyrics && activeLyricsRow != RecyclerView.NO_POSITION && !lyricsUserScrolling) {
-            centerLyricsRow(activeLyricsRow, true);
-        }
+        if (toLyrics) updateLyricsFollow(true);
     }
 
     private float preFullscreenActionBarAlpha;
@@ -3115,54 +3105,149 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         return getNormalPlayerHeight();
     }
 
-    private void centerLyricsRow(int row, boolean animated) {
-        centerLyricsRow(row, animated, true);
-    }
-
     /** Vertical position inside the viewport that the active synced line settles on. */
     private int getLyricsFocusCenter() {
         return lyricsListView.getHeight() / 2;
     }
 
-    private void centerLyricsRow(int row, boolean animated, boolean allowRetry) {
-        lyricsListView.post(() -> {
-            if (!showingLyrics || row != activeLyricsRow || row < 0 || row >= visibleLyrics.size() || lyricsListView.getHeight() == 0) return;
-            if (animated) {
-                LinearSmoothScroller scroller = new LinearSmoothScroller(getContext()) {
-                    @Override
-                    public int calculateDyToMakeVisible(View view, int snapPreference) {
-                        final RecyclerView.LayoutManager manager = getLayoutManager();
-                        if (manager == null || !manager.canScrollVertically()) return 0;
-                        final RecyclerView.LayoutParams params = (RecyclerView.LayoutParams) view.getLayoutParams();
-                        final int top = manager.getDecoratedTop(view) - params.topMargin;
-                        final int bottom = manager.getDecoratedBottom(view) + params.bottomMargin;
-                        // Must follow the base contract of calculateDtToFit(): target - current.
-                        // The previous implementation returned current - target, which inverted
-                        // every animated follow (onTargetFound applies action.update(-dx, -dy)).
-                        return getLyricsFocusCenter() - (top + bottom) / 2;
-                    }
-                    @Override protected float calculateSpeedPerPixel(DisplayMetrics metrics) {
-                        return 90f / metrics.densityDpi;
-                    }
-                    @Override protected int calculateTimeForDeceleration(int dx) {
-                        return Math.min(700, Math.max(280, super.calculateTimeForDeceleration(dx)));
-                    }
-                };
-                scroller.setTargetPosition(row);
-                lyricsLayoutManager.startSmoothScroll(scroller);
-                return;
+    // ---------------------------------------------------------------------------------------
+    // Large-player synced follow. The compact player is the motion reference: it starts moving a
+    // little BEFORE the next timestamp and eases over that lead, so nothing ever snaps on the
+    // timestamp itself. The same philosophy is applied here to the lyrics list - one driven
+    // animation at a time, never a stack of competing SmoothScrollers - while the LOGICAL active
+    // line (emphasis, colour, tap-to-seek) still changes exactly at the real timestamp.
+    // ---------------------------------------------------------------------------------------
+
+    private static final long LYRIC_FOLLOW_LEAD_MAX = 440;
+    private static final long LYRIC_FOLLOW_MIN_MS = 160;
+    private static final long LYRIC_FOLLOW_MAX_MS = 900;
+
+    private ValueAnimator lyricsFollowAnimator;
+    private int lyricsFollowRow = RecyclerView.NO_POSITION;
+    private final Runnable advanceLyricsFollow = () -> updateLyricsFollow(true);
+
+    private void cancelLyricsFollow() {
+        AndroidUtilities.cancelRunOnUIThread(advanceLyricsFollow);
+        if (lyricsFollowAnimator != null) {
+            final ValueAnimator animator = lyricsFollowAnimator;
+            lyricsFollowAnimator = null;
+            animator.cancel();
+        }
+        lyricsFollowRow = RecyclerView.NO_POSITION;
+    }
+
+    /**
+     * Schedules and drives the visual follow. Mirrors the compact player's lead algorithm: the move
+     * toward the next line starts {@code lead} before its timestamp, where the lead is half the gap
+     * capped at the compact roll duration, so closely spaced lines flow continuously and widely
+     * spaced ones get a long, soft move.
+     */
+    private void updateLyricsFollow(boolean animated) {
+        AndroidUtilities.cancelRunOnUIThread(advanceLyricsFollow);
+        if (dismissing || lyricsListView == null || !showingLyrics) return;
+        if (currentLyrics == null || !currentLyrics.isSynced()) return;
+        if (lyricsUserScrolling || lyricsPagerTracking || draggingSeekBar) return;
+        final MessageObject message = MediaController.getInstance().getPlayingMessageObject();
+        if (message == null) return;
+        final long position = SyncedLyricsController.positionMs(message);
+        final int line = currentLyrics.lineAt(position);
+        int targetRow = rowForLyricsLine(line);
+        long duration = 0;
+        if (!MediaController.getInstance().isMessagePaused() && line + 1 < currentLyrics.lines.size()) {
+            final long nextTime = currentLyrics.lines.get(line + 1).timeMs;
+            final long previousTime = line < 0 ? 0 : currentLyrics.lines.get(line).timeMs;
+            final long untilNext = nextTime - position;
+            final long gap = Math.max(1, nextTime - previousTime);
+            final long lead = Math.min(LYRIC_FOLLOW_LEAD_MAX, Math.max(80, gap / 2));
+            final int nextRow = rowForLyricsLine(line + 1);
+            if (untilNext <= lead) {
+                // Inside the lead window: move toward the next line now. A blank timestamp has no
+                // row, so nothing is visually promoted during the blank interval.
+                if (nextRow != RecyclerView.NO_POSITION) {
+                    targetRow = nextRow;
+                    duration = Math.max(80, Math.min(lead, untilNext));
+                }
+            } else {
+                AndroidUtilities.runOnUIThread(advanceLyricsFollow, untilNext - lead);
             }
-            View child = lyricsLayoutManager.findViewByPosition(row);
-            if (child == null) {
-                lyricsLayoutManager.scrollToPositionWithOffset(row, Math.max(0, getLyricsFocusCenter() - dp(32)));
-                if (allowRetry) lyricsListView.post(() -> centerLyricsRow(row, false, false));
-                return;
-            }
-            // scrollBy() takes the opposite sign convention: positive dy moves content up.
-            int distance = (child.getTop() + child.getBottom()) / 2 - getLyricsFocusCenter();
-            lyricsListView.scrollBy(0, distance);
+        }
+        if (targetRow == RecyclerView.NO_POSITION) return;
+        scrollLyricsToRow(targetRow, animated, duration);
+    }
+
+    private int rowForLyricsLine(int line) {
+        if (line < 0) return RecyclerView.NO_POSITION;
+        for (int i = 0; i < visibleLyrics.size(); i++) {
+            if (visibleLyrics.get(i) == line) return i;
+        }
+        return RecyclerView.NO_POSITION;
+    }
+
+    private void scrollLyricsToRow(int row, boolean animated, long preferredDuration) {
+        if (lyricsListView == null || row < 0 || row >= visibleLyrics.size()) return;
+        if (lyricsListView.getHeight() == 0) {
+            lyricsListView.post(() -> scrollLyricsToRow(row, false, 0));
+            return;
+        }
+        final View child = lyricsLayoutManager.findViewByPosition(row);
+        if (child == null) {
+            // Far away (first open, long seek): reach the destination immediately rather than
+            // crawling through the whole document, then let the next update ease from there.
+            cancelLyricsFollowAnimator();
+            lyricsLayoutManager.scrollToPositionWithOffset(row, Math.max(0, getLyricsFocusCenter() - dp(32)));
+            lyricsFollowRow = row;
             updateLyricsDepth();
+            return;
+        }
+        // scrollBy() takes the opposite sign convention: positive dy moves content up.
+        final int distance = (child.getTop() + child.getBottom()) / 2 - getLyricsFocusCenter();
+        if (!animated) {
+            cancelLyricsFollowAnimator();
+            lyricsListView.scrollBy(0, distance);
+            lyricsFollowRow = row;
+            updateLyricsDepth();
+            return;
+        }
+        // updateLyricsFollow() runs on every progress tick, so a move already easing toward this
+        // row must be left alone. Restarting it per tick is exactly what made the old
+        // implementation stutter: each restart reset the interpolator and the velocity.
+        if (lyricsFollowRow == row && (lyricsFollowAnimator != null || Math.abs(distance) <= dp(1))) {
+            return;
+        }
+        long duration = preferredDuration;
+        if (duration <= 0) {
+            // Distance-proportional, so a one-line step stays soft and a long seek stays responsive.
+            duration = Math.round(220 + Math.abs(distance) / AndroidUtilities.density * 0.9f);
+        }
+        duration = Math.max(LYRIC_FOLLOW_MIN_MS, Math.min(LYRIC_FOLLOW_MAX_MS, duration));
+        lyricsFollowRow = row;
+        cancelLyricsFollowAnimator();
+        final int[] applied = {0};
+        final ValueAnimator animator = ValueAnimator.ofFloat(0f, 1f);
+        animator.addUpdateListener(a -> {
+            if (lyricsFollowAnimator != a) return;
+            final int step = Math.round(distance * (float) a.getAnimatedValue());
+            lyricsListView.scrollBy(0, step - applied[0]);
+            applied[0] = step;
         });
+        animator.addListener(new AnimatorListenerAdapter() {
+            @Override public void onAnimationEnd(Animator animation) {
+                if (lyricsFollowAnimator != animation) return;
+                lyricsFollowAnimator = null;
+            }
+        });
+        animator.setDuration(duration);
+        // Same easing family as the compact lyric transition: soft in, soft out, no snap.
+        animator.setInterpolator(CubicBezierInterpolator.EASE_BOTH);
+        lyricsFollowAnimator = animator;
+        animator.start();
+    }
+
+    private void cancelLyricsFollowAnimator() {
+        if (lyricsFollowAnimator == null) return;
+        final ValueAnimator animator = lyricsFollowAnimator;
+        lyricsFollowAnimator = null;
+        animator.cancel();
     }
 
     private void updateLyricsDepth() {
@@ -3214,9 +3299,21 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         }
     }
 
+    /**
+     * Opening path used by the compact player. It resolves the persisted page as soon as lyrics are
+     * known, and deliberately does not force Lyrics - the one-shot "came in through the compact
+     * player so show lyrics" behaviour is gone; the user's saved choice decides.
+     */
     public AudioPlayerAlert showLyricsWhenAvailable() {
-        showLyricsWhenAvailable = true;
+        applySavedModeOnOpen = true;
+        return this;
+    }
+
+    /** Explicit Lyrics entry point (returning from the lyrics editor), which is a user choice. */
+    public AudioPlayerAlert openLyrics() {
+        applySavedModeOnOpen = true;
         lyricsModeRequested = true;
+        SyncedLyricsController.getInstance(currentAccount).setLyricsModePreferred(true);
         return this;
     }
 

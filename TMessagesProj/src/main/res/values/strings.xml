@@ -11196,6 +11196,7 @@
     <string name="ArticleAIPrompt">Write a prompt...</string>
     <string name="ArticleAIGenerate">Generate</string>
     <string name="SyncedLyrics">Synced Lyrics</string>
+    <string name="Lyrics">Lyrics</string>
     <string name="AddLyrics">Add Lyrics</string>
     <string name="EditLyrics">Edit Lyrics</string>
     <string name="ImportLyrics">Import or replace lyrics</string>
