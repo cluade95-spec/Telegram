@@ -36,12 +36,14 @@ jobs:
         run: chmod +x gradlew
 
       - name: Build standalone APK
-        run: ./gradlew :TMessagesProj_App:assembleAfatStandalone --no-daemon
+        run: ./gradlew :TMessagesProj_AppStandalone:assembleAfatStandalone --no-daemon
 
       - name: Collect APK
         run: |
           mkdir -p apk
-          find TMessagesProj_App/build/outputs/apk -name "*.apk" -exec cp {} apk/Telegram-Lyrics-Standalone.apk \;
+          APK_PATH=$(find TMessagesProj_AppStandalone/build/outputs/apk -type f -name "*.apk" | head -n 1)
+          test -n "$APK_PATH"
+          cp "$APK_PATH" apk/Telegram-Lyrics-Standalone.apk
           ls -lh apk
 
       - name: Upload APK
