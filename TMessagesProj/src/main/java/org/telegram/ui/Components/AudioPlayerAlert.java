@@ -49,6 +49,7 @@ import android.util.Property;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.MotionEvent;
+import android.view.VelocityTracker;
 import android.view.View;
 import android.view.ViewConfiguration;
 import android.view.ViewGroup;
@@ -173,8 +174,23 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
     private int activeLyricsLine = Integer.MIN_VALUE;
     private int activeLyricsRow = RecyclerView.NO_POSITION;
     private ActionBarMenuItem optionsButton;
-    private ActionBarMenuItem lyricsFullscreenButton;
+    private ImageView lyricsExpandButton;
+    private boolean lyricsExpandShown;
     private boolean fullscreenLyrics;
+    private String playlistChromeTitle;
+    private int containerMeasuredHeight;
+    private int containerMeasuredWidth;
+    private float lyricsPageProgress;
+    private AnimatorSet lyricsPageAnimation;
+    private boolean lyricsPagerTracking;
+    private boolean lyricsPagerMaybeTracking;
+    private float lyricsPagerStartProgress;
+    private int lyricsPagerStartX;
+    private int lyricsPagerStartY;
+    private int lyricsPagerPointerId;
+    private VelocityTracker lyricsPagerVelocity;
+    private final float lyricsPagerTouchSlop = AndroidUtilities.getPixelsInCM(0.3f, true);
+    private int maximumVelocity;
     private ChooseQualityLayout.QualityIcon optionsIcon;
     private ActionBarMenuSubItem castItem;
     private CastMediaRouteButton castItemButton;
@@ -317,6 +333,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         lyricsModeRequested = SyncedLyricsController.getInstance(currentAccount).isLyricsModePreferred();
 
         parentActivity = (LaunchActivity) context;
+        maximumVelocity = ViewConfiguration.get(context).getScaledMaximumFlingVelocity();
 
         TAG = DownloadController.getInstance(currentAccount).generateObserverTag();
         NotificationCenter.getInstance(currentAccount).addObserver(this, NotificationCenter.messagePlayingDidReset);
@@ -340,13 +357,17 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
 
             @Override
             public boolean onTouchEvent(MotionEvent e) {
-                return !isDismissed() && super.onTouchEvent(e);
+                if (isDismissed()) return false;
+                if (handleLyricsPagerTouch(e)) return true;
+                return super.onTouchEvent(e);
             }
 
             @Override
             protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
                 int totalHeight = MeasureSpec.getSize(heightMeasureSpec);
                 int w = MeasureSpec.getSize(widthMeasureSpec);
+                containerMeasuredHeight = totalHeight;
+                containerMeasuredWidth = w;
                 if (totalHeight != lastMeasturedHeight || w != lastMeasturedWidth) {
                     if (blurredView.getTag() != null) {
                         showAlbumCover(false, false);
@@ -416,7 +437,10 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
 
             @Override
             public boolean onInterceptTouchEvent(MotionEvent ev) {
-                if (showingLyrics) {
+                if (handleLyricsPagerTouch(ev)) {
+                    return true;
+                }
+                if (showingLyrics || lyricsPageProgress > 0f) {
                     return super.onInterceptTouchEvent(ev);
                 }
                 if (ev.getAction() == MotionEvent.ACTION_DOWN && scrollOffsetY != 0 && actionBar.getAlpha() == 0.0f) {
@@ -427,11 +451,22 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                         dismiss = ev.getY() < getMeasuredHeight() - dp(179 + (!isMyList() && !noforwards ? 52 : 0) + 12);
                     }
                     if (dismiss) {
+                        cancelLyricsPagerTracking();
                         dismiss();
                         return true;
                     }
                 }
                 return super.onInterceptTouchEvent(ev);
+            }
+
+            @Override
+            public void requestDisallowInterceptTouchEvent(boolean disallowIntercept) {
+                // Same guard as ViewPagerFixed: while the dominant axis is still undecided a nested
+                // list must not be able to lock the shell out of the gesture.
+                if (disallowIntercept && lyricsPagerMaybeTracking && !lyricsPagerTracking) {
+                    return;
+                }
+                super.requestDisallowInterceptTouchEvent(disallowIntercept);
             }
 
             @Override
@@ -449,10 +484,12 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                     return;
                 }
                 if (playlist.size() <= 1) {
-                    int top = showingLyrics ? lyricsListView.getTop() - backgroundPaddingTop : getMeasuredHeight() - playerLayout.getMeasuredHeight() - backgroundPaddingTop;
+                    int playlistTop = getMeasuredHeight() - playerLayout.getMeasuredHeight() - backgroundPaddingTop;
+                    int lyricsTop = getLyricsContentTop() - backgroundPaddingTop;
+                    int top = (int) lerp(playlistTop, lyricsTop, lyricsPageProgress);
                     shadowDrawable.setBounds(0, top, getMeasuredWidth(), getMeasuredHeight());
                     shadowDrawable.draw(canvas);
-                    if (isProfilePlaylist) {
+                    if (isProfilePlaylist && !isLyricsChromeActive()) {
                         actionBar.setVisibility(View.GONE);
                     }
                 } else {
@@ -486,6 +523,14 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                     top += (int) (AndroidUtilities.statusBarHeight * (1f - moveProgress));
                     y += (int) (AndroidUtilities.statusBarHeight * (1f - moveProgress));
 
+                    if (lyricsPageProgress > 0f) {
+                        // The sheet edge morphs between the playlist geometry and the canonical
+                        // lyrics geometry so both pages stay inside one shell while swiping.
+                        top = (int) lerp(top, getLyricsContentTop() - backgroundPaddingTop, lyricsPageProgress);
+                        y = (int) lerp(y, top + dp(20), lyricsPageProgress);
+                        rad = lerp(rad, 1f, lyricsPageProgress);
+                    }
+
                     shadowDrawable.setBounds(0, top, getMeasuredWidth(), height);
                     shadowDrawable.draw(canvas);
 
@@ -506,7 +551,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                         canvas.drawRoundRect(rect, dp(2), dp(2), Theme.dialogs_onlineCirclePaint);
                     }
 
-                    if (isProfilePlaylist) {
+                    if (isProfilePlaylist && !isLyricsChromeActive()) {
                         actionBar.setVisibility(View.VISIBLE);
                         actionBar.setTranslationY(Math.max(0, top - backgroundPaddingTop - dp(10) + dp(6) * (1.0f - actionBarSlide) - actionBar.getTop()));
                         actionBarShadow.setTranslationY(Math.max(0, top - backgroundPaddingTop - dp(10) + dp(6) * (1.0f - actionBarSlide) - actionBar.getTop()));
@@ -551,9 +596,6 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
 
         final ActionBarMenu menu = actionBar.createMenu();
         menu.setLayoutParams(LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.MATCH_PARENT, Gravity.FILL));
-        lyricsFullscreenButton = menu.addItem(20, R.drawable.ic_gofullscreen);
-        lyricsFullscreenButton.setContentDescription(getString(R.string.AccSwitchToFullscreen));
-        lyricsFullscreenButton.setVisibility(View.GONE);
         actionBarBackground = new View(context);
         actionBarBackground.setBackgroundColor(getThemedColor(Theme.key_dialogBackground));
         actionBar.addView(actionBarBackground, 0, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.MATCH_PARENT, Gravity.FILL));
@@ -566,8 +608,6 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 if (id == -1) {
                     if (fullscreenLyrics) setFullscreenLyrics(false);
                     else dismiss();
-                } else if (id == 20) {
-                    setFullscreenLyrics(!fullscreenLyrics);
                 } else {
                     onSubItemClick(id);
                 }
@@ -1305,6 +1345,26 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             @Override public void onChildViewDetachedFromWindow(@NonNull View view) { }
         });
 
+        // Expand control. Same component, iconography, ripple, pressed state and reveal spec as
+        // Telegram's own text-writer expander (ChatActivityEnterView.richButton): it lives inside
+        // the surface it expands, not in the action bar, so it is present in every lyrics
+        // configuration regardless of playlist size, playlist source or action-bar fade state.
+        lyricsExpandButton = new ImageView(context);
+        lyricsExpandButton.setImageResource(R.drawable.iv_fullscreen);
+        lyricsExpandButton.setScaleType(ImageView.ScaleType.CENTER);
+        lyricsExpandButton.setColorFilter(new PorterDuffColorFilter(getThemedColor(Theme.key_player_actionBarTitle), PorterDuff.Mode.SRC_IN));
+        lyricsExpandButton.setBackground(Theme.createSelectorDrawable(getThemedColor(Theme.key_player_actionBarSelector), Theme.RIPPLE_MASK_CIRCLE_20DP, dp(16)));
+        ScaleStateListAnimator.apply(lyricsExpandButton);
+        lyricsExpandButton.setContentDescription(getString(R.string.AccSwitchToFullscreen));
+        lyricsExpandButton.setOnClickListener(v -> setFullscreenLyrics(true));
+        lyricsExpandButton.setVisibility(View.GONE);
+        lyricsExpandButton.setAlpha(0.0f);
+        lyricsExpandButton.setScaleX(0.6f);
+        lyricsExpandButton.setScaleY(0.6f);
+        FrameLayout.LayoutParams expandParams = LayoutHelper.createFrame(40, 40, Gravity.TOP | (LocaleController.isRTL ? Gravity.LEFT : Gravity.RIGHT), 6, 0, 6, 0);
+        expandParams.topMargin = lyricsParams.topMargin + dp(4);
+        containerView.addView(lyricsExpandButton, expandParams);
+
         listView.setOnScrollListener(new RecyclerView.OnScrollListener() {
             @Override
             public void onScrollStateChanged(RecyclerView recyclerView, int newState) {
@@ -1406,6 +1466,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                     if (addItem != null) {
                         addItem.setVisibility(View.VISIBLE);
                     }
+                    updateLyricsChrome();
                 }
             }
 
@@ -1420,6 +1481,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 if (addItem != null) {
                     addItem.setVisibility(View.GONE);
                 }
+                updateLyricsChrome();
             }
 
             @Override
@@ -1450,6 +1512,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
 
         listAdapter.setup();
         listAdapter.notifyDataSetChanged();
+        updateLyricsChrome();
 
         actionBar.setTitle(LocaleController.getString(R.string.AttachMusic));
         if (savedMusicList != null) {
@@ -2060,7 +2123,9 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
     }
 
     private void updateLayout() {
-        if (fullscreenLyrics) {
+        if (isLyricsChromeActive()) {
+            // The playlist is off-screen; its scroll offset must not drive the lyrics geometry,
+            // the action bar fade, or the profile header position.
             updateLyricsGeometry();
             containerView.invalidate();
             return;
@@ -2141,28 +2206,42 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         }
     }
 
+    /**
+     * Canonical normal-mode lyrics viewport top. Deliberately independent of the playlist scroll
+     * offset and of {@link #isProfilePlaylist}: chat, downloaded and profile music must all present
+     * lyrics in the same shell. The expression reproduces the resting sheet top of the ordinary
+     * chat/download player - the geometry device QA confirmed as correct - by evaluating the same
+     * rule {@code onMeasure} uses for the playlist sheet padding, against the canonical player
+     * height rather than the current one, so every source resolves to the identical top. The old
+     * scroll-derived formula resolved to {@code padding + actionBarTop - dp(24)} and this keeps it.
+     */
+    private static final int CANONICAL_PLAYER_HEIGHT = 179 + 52;
+
+    private int getNormalLyricsTop() {
+        final int actionBarTop = ActionBar.getCurrentActionBarHeight() + AndroidUtilities.statusBarHeight;
+        int totalHeight = containerMeasuredHeight;
+        if (totalHeight <= 0 && containerView != null) totalHeight = containerView.getMeasuredHeight();
+        if (totalHeight <= 0) return actionBarTop;
+        final int availableHeight = totalHeight - (containerView == null ? 0 : containerView.getPaddingTop());
+        int padding = availableHeight - (int) (availableHeight / 5f * 3.5f) + dp(8);
+        final int maxPadding = availableHeight - dp(CANONICAL_PLAYER_HEIGHT + 150);
+        if (padding > maxPadding) padding = maxPadding;
+        if (padding < 0) padding = 0;
+        return Math.max(actionBarTop, padding + actionBarTop - dp(24));
+    }
+
     private int getLyricsContentTop() {
-        int actionBarTop = ActionBar.getCurrentActionBarHeight() + AndroidUtilities.statusBarHeight;
-        if (fullscreenLyrics) return actionBarTop;
-        if (playlist == null || playlist.size() <= 1 || scrollOffsetY == Integer.MAX_VALUE) return actionBarTop;
-        int offset = dp(13);
-        int top = scrollOffsetY - backgroundPaddingTop - offset + (int) listView.getTranslationY();
-        if (isProfilePlaylist) {
-            top -= ActionBar.getCurrentActionBarHeight();
-            top += dp(10);
-        }
-        float moveProgress = 0;
-        if (!isProfilePlaylist && top + backgroundPaddingTop < ActionBar.getCurrentActionBarHeight()) {
-            float toMove = offset + dp(11 - 7);
-            moveProgress = Math.min(1.0f, (ActionBar.getCurrentActionBarHeight() - top - backgroundPaddingTop) / toMove);
-            top -= (int) ((ActionBar.getCurrentActionBarHeight() - toMove) * moveProgress);
-        }
-        top += (int) (AndroidUtilities.statusBarHeight * (1f - moveProgress));
-        return Math.max(actionBarTop, top + backgroundPaddingTop);
+        if (fullscreenLyrics) return ActionBar.getCurrentActionBarHeight() + AndroidUtilities.statusBarHeight;
+        return getNormalLyricsTop();
     }
 
     private boolean isLyricsGeometryNeeded() {
-        return showingLyrics || lyricsModeRequested || showLyricsWhenAvailable;
+        return showingLyrics || lyricsModeRequested || showLyricsWhenAvailable || lyricsPageProgress > 0f;
+    }
+
+    /** True while the shell presents lyrics, so playlist-only chrome must stay out of the way. */
+    private boolean isLyricsChromeActive() {
+        return fullscreenLyrics || showingLyrics;
     }
 
     private void updateLyricsGeometry() {
@@ -2172,6 +2251,51 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         if (params.topMargin != top) {
             params.topMargin = top;
             lyricsListView.setLayoutParams(params);
+        }
+        if (lyricsExpandButton != null) {
+            FrameLayout.LayoutParams expandParams = (FrameLayout.LayoutParams) lyricsExpandButton.getLayoutParams();
+            int expandTop = top + dp(4);
+            if (expandParams.topMargin != expandTop) {
+                expandParams.topMargin = expandTop;
+                lyricsExpandButton.setLayoutParams(expandParams);
+            }
+        }
+    }
+
+    private int lyricsChromeState = -1;
+
+    /**
+     * Mode-aware chrome. Playlist mode keeps Telegram's profile playlist title and search intact;
+     * lyrics mode (normal and fullscreen) takes them out of the way so nothing overlays the lyrics.
+     */
+    private void updateLyricsChrome() {
+        final boolean lyricsChrome = isLyricsChromeActive();
+        if (lyricsChrome && actionBar != null && actionBar.isSearchFieldVisible()) {
+            actionBar.closeSearchField();
+        }
+        if (searchItem != null) {
+            searchItem.setVisibility(lyricsChrome ? View.GONE : View.VISIBLE);
+        }
+        if (addItem != null) {
+            addItem.setVisibility(lyricsChrome || searching ? View.GONE : View.VISIBLE);
+        }
+        final int state = fullscreenLyrics ? 2 : lyricsChrome ? 1 : 0;
+        if (state == lyricsChromeState) return;
+        lyricsChromeState = state;
+        if (lyricsChrome) {
+            if (playlistChromeTitle == null) playlistChromeTitle = actionBar.getTitle();
+            actionBar.setTitle(getString(R.string.SyncedLyrics));
+            // The profile playlist floats its action bar with the sheet; pin it back so it can never
+            // cut through the lyric stream (normal) or split the viewport (fullscreen).
+            actionBar.setTranslationY(0);
+            actionBarShadow.setTranslationY(0);
+            actionBar.setVisibility(fullscreenLyrics ? View.VISIBLE : View.GONE);
+        } else {
+            if (playlistChromeTitle != null) {
+                actionBar.setTitle(playlistChromeTitle);
+                playlistChromeTitle = null;
+            }
+            actionBar.setVisibility(View.VISIBLE);
         }
     }
 
@@ -2221,6 +2345,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         NotificationCenter.getInstance(currentAccount).removeObserver(this, NotificationCenter.musicIdsLoaded);
         NotificationCenter.getInstance(currentAccount).removeObserver(this, NotificationCenter.syncedLyricsChanged);
         AndroidUtilities.cancelRunOnUIThread(resumeLyricsFollow);
+        cancelLyricsPageAnimation();
+        cancelLyricsPagerTracking();
         NotificationCenter.getGlobalInstance().removeObserver(this, NotificationCenter.messagePlayingSpeedChanged);
         DownloadController.getInstance(currentAccount).removeLoadingFileObserver(this);
         if (instance == this) {
@@ -2414,33 +2540,56 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
 
     private void setShowingLyrics(boolean show, boolean animated) {
         if (show && visibleLyrics.isEmpty()) return;
+        final boolean changed = showingLyrics != show;
         if (show) updateLyricsGeometry();
         showingLyrics = show;
-        lyricsFullscreenButton.setVisibility(show ? View.VISIBLE : View.GONE);
         if (!show && fullscreenLyrics) setFullscreenLyrics(false);
         lyricsListView.setEnabled(show);
         listView.setEnabled(!show);
-        if (show) {
-            listView.animate().cancel();
-            listView.setTranslationY(0);
-            AndroidUtilities.updateViewShow(listView, false, false, false);
-            AndroidUtilities.updateViewShow(lyricsListView, true, false, animated);
+        listView.animate().cancel();
+        listView.setTranslationY(0);
+        listView.setAlpha(1f);
+        lyricsListView.setAlpha(1f);
+        if (animated && changed) {
+            animateLyricsPage(show ? 1f : 0f, 0f);
         } else {
-            AndroidUtilities.updateViewShow(lyricsListView, false, false, false);
-            AndroidUtilities.updateViewShow(listView, true, false, animated);
+            cancelLyricsPageAnimation();
+            setLyricsPageProgress(show ? 1f : 0f);
         }
+        updateLyricsChrome();
+        updateLyricsPadding();
+        showLyricsExpandButton(show && !fullscreenLyrics);
         if (show && activeLyricsRow != RecyclerView.NO_POSITION) centerLyricsRow(activeLyricsRow, false);
+    }
+
+    /** Reveal spec copied from Telegram's text-writer expander: alpha + 0.6 scale, EASE_OUT_QUINT, 420ms. */
+    private void showLyricsExpandButton(boolean show) {
+        if (lyricsExpandButton == null || lyricsExpandShown == show) return;
+        lyricsExpandShown = show;
+        lyricsExpandButton.animate().cancel();
+        lyricsExpandButton.setVisibility(View.VISIBLE);
+        lyricsExpandButton.animate()
+            .alpha(show ? 1.0f : 0.0f)
+            .scaleX(show ? 1.0f : 0.6f)
+            .scaleY(show ? 1.0f : 0.6f)
+            .setInterpolator(CubicBezierInterpolator.EASE_OUT_QUINT)
+            .setDuration(420)
+            .withEndAction(() -> {
+                if (!lyricsExpandShown) lyricsExpandButton.setVisibility(View.GONE);
+            })
+            .start();
     }
 
     private void setFullscreenLyrics(boolean fullscreen) {
         if (fullscreenLyrics == fullscreen || fullscreen && !showingLyrics) return;
+        final int previousLyricsTop = lyricsListView.getTop();
         fullscreenLyrics = fullscreen;
         if (actionBarAnimation != null) {
             actionBarAnimation.cancel();
             actionBarAnimation = null;
         }
-        lyricsFullscreenButton.setIcon(fullscreen ? R.drawable.ic_outfullscreen : R.drawable.ic_gofullscreen);
-        lyricsFullscreenButton.setContentDescription(getString(fullscreen ? R.string.AccExitFullscreen : R.string.AccSwitchToFullscreen));
+        // Fullscreen offers Back only; there is no second shrink control.
+        showLyricsExpandButton(!fullscreen && showingLyrics);
         actionBar.animate().cancel();
         actionBarBackground.animate().cancel();
         actionBarShadow.animate().cancel();
@@ -2451,30 +2600,244 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             preFullscreenActionBarSlide = actionBarSlide;
         }
         if (isProfilePlaylist) actionBarSlideProperty.set(actionBar, fullscreen ? 1f : preFullscreenActionBarSlide);
+        updateLyricsChrome();
         actionBar.animate().alpha(fullscreen ? 1f : preFullscreenActionBarAlpha).setDuration(220).setInterpolator(CubicBezierInterpolator.EASE_OUT_QUINT).start();
         actionBarBackground.animate().alpha(fullscreen ? 1f : preFullscreenActionBarBackgroundAlpha).setDuration(220).setInterpolator(CubicBezierInterpolator.EASE_OUT_QUINT).start();
         actionBarShadow.animate().alpha(fullscreen ? 1f : preFullscreenActionBarShadowAlpha).setDuration(220).setInterpolator(CubicBezierInterpolator.EASE_OUT_QUINT).start();
         setAllowNestedScroll(!fullscreen);
         applyFullscreenPlayerLayout(fullscreen);
         updateLyricsGeometry();
-        if (activeLyricsRow != RecyclerView.NO_POSITION) centerLyricsRow(activeLyricsRow, true);
+        updateLyricsPadding();
+        // Expand/collapse continuity: the same viewport slides to its new bounds instead of cutting.
+        lyricsListView.animate().cancel();
+        lyricsListView.post(() -> {
+            int delta = previousLyricsTop - lyricsListView.getTop();
+            if (delta != 0) {
+                lyricsListView.setTranslationY(delta);
+                lyricsListView.animate().translationY(0f).setDuration(420).setInterpolator(CubicBezierInterpolator.EASE_OUT_QUINT).start();
+            } else {
+                lyricsListView.setTranslationY(0f);
+            }
+            updateLyricsPadding();
+            if (activeLyricsRow != RecyclerView.NO_POSITION) centerLyricsRow(activeLyricsRow, true);
+        });
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Playlist <-> Lyrics pager. One shell, two surfaces; no extra fragment, activity, media
+    // controller or playback engine is involved - only the presentation changes.
+    // ---------------------------------------------------------------------------------------
+
+    private int getLyricsPageWidth() {
+        int width = containerMeasuredWidth;
+        if (width <= 0 && containerView != null) width = containerView.getMeasuredWidth();
+        return width;
+    }
+
+    private void setLyricsPageProgress(float progress) {
+        lyricsPageProgress = Math.max(0f, Math.min(1f, progress));
+        final int width = getLyricsPageWidth();
+        final float direction = LocaleController.isRTL ? -1f : 1f;
+        listView.setTranslationX(-direction * lyricsPageProgress * width);
+        lyricsListView.setTranslationX(direction * (1f - lyricsPageProgress) * width);
+        listView.setVisibility(lyricsPageProgress < 1f ? View.VISIBLE : View.GONE);
+        lyricsListView.setVisibility(lyricsPageProgress > 0f ? View.VISIBLE : View.GONE);
+        if (lyricsExpandButton != null) {
+            lyricsExpandButton.setTranslationX(direction * (1f - lyricsPageProgress) * width);
+        }
+        containerView.invalidate();
+        if (lyricsPageProgress == 0f) {
+            updateLayout();
+            updateEmptyViewPosition();
+        }
+    }
+
+    private void cancelLyricsPageAnimation() {
+        if (lyricsPageAnimation != null) {
+            lyricsPageAnimation.cancel();
+            lyricsPageAnimation = null;
+        }
+    }
+
+    private void animateLyricsPage(float target, float velocityX) {
+        cancelLyricsPageAnimation();
+        final int width = getLyricsPageWidth();
+        if (width <= 0) {
+            setLyricsPageProgress(target);
+            return;
+        }
+        final float from = lyricsPageProgress;
+        if (from == target) {
+            setLyricsPageProgress(target);
+            return;
+        }
+        float travelled = Math.abs(target - from) * width;
+        int duration;
+        float speed = Math.abs(velocityX);
+        if (speed > 0) {
+            duration = 4 * Math.round(1000.0f * (width / 2f + width / 2f * Math.min(1f, travelled / (float) width)) / speed);
+        } else {
+            duration = (int) ((travelled / width + 1.0f) * 100.0f);
+        }
+        duration = Math.max(150, Math.min(duration, 600));
+        ValueAnimator animator = ValueAnimator.ofFloat(from, target);
+        animator.addUpdateListener(a -> setLyricsPageProgress((float) a.getAnimatedValue()));
+        lyricsPageAnimation = new AnimatorSet();
+        lyricsPageAnimation.playTogether(animator);
+        lyricsPageAnimation.setDuration(duration);
+        lyricsPageAnimation.setInterpolator(CubicBezierInterpolator.EASE_OUT_QUINT);
+        lyricsPageAnimation.addListener(new AnimatorListenerAdapter() {
+            @Override public void onAnimationEnd(Animator animation) {
+                if (lyricsPageAnimation != animation) return;
+                lyricsPageAnimation = null;
+                setLyricsPageProgress(target);
+            }
+        });
+        lyricsPageAnimation.start();
+    }
+
+    /** Never expose an empty Lyrics page, and never fight the seek bar, search or fullscreen. */
+    private boolean canSwitchLyricsPage() {
+        return !fullscreenLyrics && !searching && !searchWas && !keyboardVisible && !draggingSeekBar
+            && !visibleLyrics.isEmpty() && lyricsListView != null && listView != null
+            && listAdapter != null && listAdapter.getItemCount() > 0
+            && (actionBar == null || !actionBar.isSearchFieldVisible())
+            && blurredView.getTag() == null;
+    }
+
+    /** Only the page area arbitrates horizontal gestures; the controls strip is left untouched. */
+    private boolean isInLyricsPageArea(float y) {
+        if (containerView == null) return false;
+        final int lyricsTop = ((FrameLayout.LayoutParams) lyricsListView.getLayoutParams()).topMargin;
+        final int listTop = ((FrameLayout.LayoutParams) listView.getLayoutParams()).topMargin;
+        final int top = Math.max(0, Math.min(lyricsTop, listTop));
+        final int bottom = containerView.getHeight() - dp(getPlayerHeight());
+        return y >= top && y <= bottom;
+    }
+
+    private void cancelLyricsPagerTracking() {
+        lyricsPagerTracking = false;
+        lyricsPagerMaybeTracking = false;
+        if (lyricsPagerVelocity != null) {
+            lyricsPagerVelocity.recycle();
+            lyricsPagerVelocity = null;
+        }
+    }
+
+    private boolean handleLyricsPagerTouch(MotionEvent ev) {
+        if (ev == null) return false;
+        final int action = ev.getActionMasked();
+        if (action == MotionEvent.ACTION_DOWN) {
+            cancelLyricsPagerTracking();
+            if (!canSwitchLyricsPage() || !isInLyricsPageArea(ev.getY())) return false;
+            lyricsPagerMaybeTracking = true;
+            lyricsPagerPointerId = ev.getPointerId(0);
+            lyricsPagerStartX = (int) ev.getX();
+            lyricsPagerStartY = (int) ev.getY();
+            lyricsPagerStartProgress = lyricsPageProgress;
+            if (lyricsPagerVelocity == null) lyricsPagerVelocity = VelocityTracker.obtain();
+            lyricsPagerVelocity.clear();
+            lyricsPagerVelocity.addMovement(ev);
+            return false;
+        }
+        if (!lyricsPagerMaybeTracking && !lyricsPagerTracking) return false;
+        if (lyricsPagerVelocity != null) lyricsPagerVelocity.addMovement(ev);
+        if (action == MotionEvent.ACTION_MOVE && ev.getPointerId(0) == lyricsPagerPointerId) {
+            if (!canSwitchLyricsPage()) {
+                cancelLyricsPagerTracking();
+                return false;
+            }
+            final int dx = (int) (ev.getX() - lyricsPagerStartX);
+            final int dy = (int) (ev.getY() - lyricsPagerStartY);
+            if (!lyricsPagerTracking) {
+                // Dominant-axis arbitration, identical to ViewPagerFixed: a clearly vertical drag
+                // stays with the list, a clearly horizontal one becomes a page switch.
+                if (Math.abs(dx) >= lyricsPagerTouchSlop && Math.abs(dx) > Math.abs(dy)) {
+                    final float forward = LocaleController.isRTL ? dx : -dx;
+                    if (lyricsPagerStartProgress <= 0f && forward <= 0 || lyricsPagerStartProgress >= 1f && forward >= 0) {
+                        cancelLyricsPagerTracking();
+                        return false;
+                    }
+                    lyricsPagerTracking = true;
+                    lyricsPagerMaybeTracking = false;
+                    cancelLyricsPageAnimation();
+                    listView.setVisibility(View.VISIBLE);
+                    lyricsListView.setVisibility(View.VISIBLE);
+                    listView.setAlpha(1f);
+                    lyricsListView.setAlpha(1f);
+                    updateLyricsGeometry();
+                    AndroidUtilities.cancelRunOnUIThread(resumeLyricsFollow);
+                } else if (Math.abs(dy) >= lyricsPagerTouchSlop) {
+                    cancelLyricsPagerTracking();
+                    return false;
+                }
+            }
+            if (lyricsPagerTracking) {
+                final int width = getLyricsPageWidth();
+                if (width > 0) {
+                    final float forward = (LocaleController.isRTL ? dx : -dx) / (float) width;
+                    setLyricsPageProgress(lyricsPagerStartProgress + forward);
+                }
+                return true;
+            }
+            return false;
+        }
+        if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+            final boolean wasTracking = lyricsPagerTracking;
+            float velocityX = 0, velocityY = 0;
+            if (lyricsPagerVelocity != null && action == MotionEvent.ACTION_UP) {
+                lyricsPagerVelocity.computeCurrentVelocity(1000, maximumVelocity);
+                velocityX = lyricsPagerVelocity.getXVelocity();
+                velocityY = lyricsPagerVelocity.getYVelocity();
+            }
+            cancelLyricsPagerTracking();
+            if (wasTracking) {
+                final int width = Math.max(1, getLyricsPageWidth());
+                final float travelled = Math.abs(lyricsPageProgress - lyricsPagerStartProgress) * width;
+                final boolean back = travelled < width / 3.0f
+                    && (Math.abs(velocityX) < 3500 || Math.abs(velocityX) < Math.abs(velocityY));
+                final float target = back ? lyricsPagerStartProgress : (lyricsPagerStartProgress > 0.5f ? 0f : 1f);
+                settleLyricsPage(target, velocityX);
+                return true;
+            }
+            return false;
+        }
+        return lyricsPagerTracking;
+    }
+
+    private void settleLyricsPage(float target, float velocityX) {
+        final boolean toLyrics = target > 0.5f;
+        if (toLyrics != showingLyrics) {
+            // Settling on a surface is an explicit mode choice by the user.
+            lyricsModeRequested = toLyrics;
+            SyncedLyricsController.getInstance(currentAccount).setLyricsModePreferred(toLyrics);
+            showingLyrics = toLyrics;
+            lyricsListView.setEnabled(toLyrics);
+            listView.setEnabled(!toLyrics);
+            updateLyricsChrome();
+            updateLyricsPadding();
+            showLyricsExpandButton(toLyrics && !fullscreenLyrics);
+        }
+        animateLyricsPage(target, velocityX);
+        if (toLyrics && activeLyricsRow != RecyclerView.NO_POSITION && !lyricsUserScrolling) {
+            centerLyricsRow(activeLyricsRow, true);
+        }
     }
 
     private float preFullscreenActionBarAlpha;
     private float preFullscreenActionBarBackgroundAlpha;
     private float preFullscreenActionBarShadowAlpha;
     private float preFullscreenActionBarSlide;
-    private int preFullscreenSaveVisibility;
-    private int preFullscreenUnsaveVisibility;
     private boolean fullscreenPlayerLayoutApplied;
     private int fullscreenArtworkSize = 104;
 
     private void applyFullscreenPlayerLayout(boolean fullscreen) {
         boolean animateArtwork = fullscreen != fullscreenPlayerLayoutApplied;
         int height = getPlayerHeight();
-        int fullscreenBaseHeight = height;
-        boolean compactFullscreen = fullscreen && fullscreenBaseHeight < 250;
-        int artworkSize = fullscreen ? (compactFullscreen ? 72 : 104) : 44;
+        // Three fullscreen control tiers keep every control usable without a landscape-only window.
+        boolean compactFullscreen = fullscreen && height < FULLSCREEN_PLAYER_REGULAR;
+        boolean tightFullscreen = fullscreen && height < FULLSCREEN_PLAYER_COMPACT;
+        int artworkSize = fullscreen ? (tightFullscreen ? 56 : compactFullscreen ? 72 : 104) : 44;
         int oldArtworkSize = animateArtwork ? (fullscreen ? 44 : fullscreenArtworkSize) : artworkSize;
         if (fullscreen) fullscreenArtworkSize = artworkSize;
         FrameLayout.LayoutParams playerParams = (FrameLayout.LayoutParams) playerLayout.getLayoutParams();
@@ -2486,56 +2849,119 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         FrameLayout.LayoutParams lyricsParams = (FrameLayout.LayoutParams) lyricsListView.getLayoutParams();
         lyricsParams.bottomMargin = dp(height);
         lyricsListView.setLayoutParams(lyricsParams);
-        if (fullscreen && !fullscreenPlayerLayoutApplied) {
-            preFullscreenSaveVisibility = saveToProfileButton.getVisibility();
-            preFullscreenUnsaveVisibility = unsaveFromProfileButton.getVisibility();
-            saveToProfileButton.setVisibility(View.GONE);
-            unsaveFromProfileButton.setVisibility(View.GONE);
-        } else {
-            if (!fullscreen) {
-                saveToProfileButton.setVisibility(preFullscreenSaveVisibility);
-                unsaveFromProfileButton.setVisibility(preFullscreenUnsaveVisibility);
-            }
-        }
         fullscreenPlayerLayoutApplied = fullscreen;
+        applyProfileButtonsVisibility(false);
 
-        int artTop = compactFullscreen ? 12 : 20;
+        int artTop = tightFullscreen ? 8 : compactFullscreen ? 12 : 20;
         setFrame(coverContainer, artworkSize, artworkSize, Gravity.TOP | (fullscreen ? Gravity.START : Gravity.END), 20, artTop, 20, 0);
-        float titleStart = fullscreen ? (compactFullscreen ? 108 : 144) : 20;
-        float authorStart = fullscreen ? (compactFullscreen ? 102 : 138) : 14;
-        setFrame(titleTextView, LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, Gravity.TOP | Gravity.START, LocaleController.isRTL ? 20 : titleStart, fullscreen ? (compactFullscreen ? 18 : 26) : 20, LocaleController.isRTL ? titleStart : 20, 0);
-        setFrame(authorTextView, LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, Gravity.TOP | Gravity.START, LocaleController.isRTL ? 20 : authorStart, fullscreen ? (compactFullscreen ? 45 : 55) : 47, LocaleController.isRTL ? authorStart : 20, 0);
-        setFrame(seekBarView, LayoutHelper.MATCH_PARENT, 44, Gravity.TOP | Gravity.LEFT, 5, fullscreen ? (compactFullscreen ? 84 : 128) : 67, 5, 0);
-        setFrame(progressView, LayoutHelper.MATCH_PARENT, 2, Gravity.TOP | Gravity.LEFT, 21, fullscreen ? (compactFullscreen ? 107 : 151) : 90, 21, 0);
-        setFrame(timeTextView, 100, LayoutHelper.WRAP_CONTENT, Gravity.TOP | Gravity.LEFT, 20, fullscreen ? (compactFullscreen ? 115 : 159) : 98, 0, 0);
-        setFrame(durationTextView, LayoutHelper.WRAP_CONTENT, LayoutHelper.WRAP_CONTENT, Gravity.TOP | Gravity.RIGHT, 0, fullscreen ? (compactFullscreen ? 113 : 157) : 96, 20, 0);
-        setFrame(playbackSpeedButton, 36, 36, Gravity.TOP | Gravity.RIGHT, 0, fullscreen ? (compactFullscreen ? 104 : 148) : 86, 20, 0);
-        setFrame(playbackControlsView, LayoutHelper.MATCH_PARENT, 66, Gravity.TOP | Gravity.LEFT, 0, fullscreen ? (compactFullscreen ? 139 : 184) : 111, 0, 0);
+        float titleStart = fullscreen ? (tightFullscreen ? 88 : compactFullscreen ? 108 : 144) : 20;
+        float authorStart = fullscreen ? (tightFullscreen ? 82 : compactFullscreen ? 102 : 138) : 14;
+        setFrame(titleTextView, LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, Gravity.TOP | Gravity.START, LocaleController.isRTL ? 20 : titleStart, fullscreen ? (tightFullscreen ? 8 : compactFullscreen ? 18 : 26) : 20, LocaleController.isRTL ? titleStart : 20, 0);
+        setFrame(authorTextView, LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, Gravity.TOP | Gravity.START, LocaleController.isRTL ? 20 : authorStart, fullscreen ? (tightFullscreen ? 34 : compactFullscreen ? 45 : 55) : 47, LocaleController.isRTL ? authorStart : 20, 0);
+        setFrame(seekBarView, LayoutHelper.MATCH_PARENT, 44, Gravity.TOP | Gravity.LEFT, 5, fullscreen ? (tightFullscreen ? 58 : compactFullscreen ? 84 : 128) : 67, 5, 0);
+        setFrame(progressView, LayoutHelper.MATCH_PARENT, 2, Gravity.TOP | Gravity.LEFT, 21, fullscreen ? (tightFullscreen ? 81 : compactFullscreen ? 107 : 151) : 90, 21, 0);
+        setFrame(timeTextView, 100, LayoutHelper.WRAP_CONTENT, Gravity.TOP | Gravity.LEFT, 20, fullscreen ? (tightFullscreen ? 89 : compactFullscreen ? 115 : 159) : 98, 0, 0);
+        setFrame(durationTextView, LayoutHelper.WRAP_CONTENT, LayoutHelper.WRAP_CONTENT, Gravity.TOP | Gravity.RIGHT, 0, fullscreen ? (tightFullscreen ? 87 : compactFullscreen ? 113 : 157) : 96, 20, 0);
+        setFrame(playbackSpeedButton, 36, 36, Gravity.TOP | Gravity.RIGHT, 0, fullscreen ? (tightFullscreen ? 78 : compactFullscreen ? 104 : 148) : 86, 20, 0);
+        setFrame(playbackControlsView, LayoutHelper.MATCH_PARENT, 66, Gravity.TOP | Gravity.LEFT, 0, fullscreen ? (tightFullscreen ? 104 : compactFullscreen ? 139 : 184) : 111, 0, 0);
         coverContainer.setPivotX((fullscreen ? LocaleController.isRTL : !LocaleController.isRTL) ? dp(artworkSize) : 0);
         coverContainer.setPivotY(0);
         float artworkScale = oldArtworkSize / (float) artworkSize;
         coverContainer.setScaleX(artworkScale);
         coverContainer.setScaleY(artworkScale);
         if (animateArtwork) {
-            coverContainer.animate().scaleX(1f).scaleY(1f).setDuration(320).setInterpolator(CubicBezierInterpolator.EASE_OUT_QUINT).start();
+            // Same spec as Telegram's own text-writer expander: EASE_OUT_QUINT over 420ms.
+            coverContainer.animate().cancel();
+            coverContainer.animate().scaleX(1f).scaleY(1f).setDuration(420).setInterpolator(CubicBezierInterpolator.EASE_OUT_QUINT).start();
         }
         containerView.invalidate();
+    }
+
+    /**
+     * Single authority over the "Add to profile" pair. Everything outside fullscreen keeps
+     * Telegram's existing behaviour; fullscreen never shows them, playing or paused, so they can
+     * never cover the playback controls.
+     */
+    private void applyProfileButtonsVisibility(boolean animated) {
+        if (saveToProfileButton == null || unsaveFromProfileButton == null) return;
+        if (isMyList() || noforwards || fullscreenLyrics) {
+            saveToProfileButton.animate().cancel();
+            unsaveFromProfileButton.animate().cancel();
+            saveToProfileButton.setVisibility(View.GONE);
+            unsaveFromProfileButton.setVisibility(View.GONE);
+            return;
+        }
+        final boolean visible = visibleInProfile;
+        saveToProfileButton.setVisibility(View.VISIBLE);
+        unsaveFromProfileButton.setVisibility(View.VISIBLE);
+        saveToProfileButton.animate().cancel();
+        unsaveFromProfileButton.animate().cancel();
+        if (!animated) {
+            saveToProfileButton.setAlpha(visible ? 0.0f : 1.0f);
+            saveToProfileButton.setScaleX(visible ? 0.8f : 1.0f);
+            saveToProfileButton.setScaleY(visible ? 0.8f : 1.0f);
+            saveToProfileButton.setVisibility(visible ? View.GONE : View.VISIBLE);
+            unsaveFromProfileButton.setAlpha(!visible ? 0.0f : 1.0f);
+            unsaveFromProfileButton.setScaleX(!visible ? 0.8f : 1.0f);
+            unsaveFromProfileButton.setScaleY(!visible ? 0.8f : 1.0f);
+            unsaveFromProfileButton.setVisibility(visible ? View.VISIBLE : View.GONE);
+            return;
+        }
+        saveToProfileButton.animate()
+            .alpha(visible ? 0.0f : 1.0f)
+            .scaleX(visible ? 0.8f : 1.0f)
+            .scaleY(visible ? 0.8f : 1.0f)
+            .setDuration(420)
+            .setInterpolator(CubicBezierInterpolator.EASE_OUT_QUINT)
+            .withEndAction(() -> saveToProfileButton.setVisibility(visible ? View.GONE : View.VISIBLE))
+            .start();
+        unsaveFromProfileButton.animate()
+            .alpha(!visible ? 0.0f : 1.0f)
+            .scaleX(!visible ? 0.8f : 1.0f)
+            .scaleY(!visible ? 0.8f : 1.0f)
+            .setDuration(420)
+            .setInterpolator(CubicBezierInterpolator.EASE_OUT_QUINT)
+            .withEndAction(() -> unsaveFromProfileButton.setVisibility(visible ? View.VISIBLE : View.GONE))
+            .start();
     }
 
     private static void setFrame(View view, int width, int height, int gravity, float left, float top, float right, float bottom) {
         view.setLayoutParams(LayoutHelper.createFrame(width, height, gravity, left, top, right, bottom));
     }
 
+    /** Height (dp) of the ordinary, non-fullscreen player shell. */
+    private int getNormalPlayerHeight() {
+        return 179 + (!isMyList() && !noforwards ? 52 : 0);
+    }
+
+    // Fullscreen control tiers. Each value is the exact stack height the matching branch of
+    // applyFullscreenPlayerLayout() lays out, so the controls can never overlap or overflow.
+    private static final int FULLSCREEN_PLAYER_REGULAR = 250;
+    private static final int FULLSCREEN_PLAYER_COMPACT = 205;
+    private static final int FULLSCREEN_PLAYER_TIGHT = 172;
+    private static final int FULLSCREEN_LYRICS_MIN = 132;
+
     private int getPlayerHeight() {
         if (fullscreenLyrics) {
-            int available = containerView == null || containerView.getHeight() == 0 ? dp(276) : containerView.getHeight() - ActionBar.getCurrentActionBarHeight() - AndroidUtilities.statusBarHeight - dp(120);
-            return Math.max(210, Math.min(276, Math.round(available / AndroidUtilities.density)));
+            int containerHeight = containerMeasuredHeight;
+            if (containerHeight <= 0 && containerView != null) containerHeight = containerView.getHeight();
+            if (containerHeight <= 0) return 276;
+            int availableDp = Math.round((containerHeight - ActionBar.getCurrentActionBarHeight() - AndroidUtilities.statusBarHeight) / AndroidUtilities.density);
+            // Reserve a lyrics viewport that is actually readable rather than merely non-negative.
+            int reserved = Math.max(FULLSCREEN_LYRICS_MIN, Math.round(availableDp * 0.3f));
+            int maxPlayer = availableDp - reserved;
+            return Math.max(FULLSCREEN_PLAYER_TIGHT, Math.min(276, maxPlayer));
         }
-        return 179 + (!isMyList() && !noforwards ? 52 : 0);
+        return getNormalPlayerHeight();
     }
 
     private void centerLyricsRow(int row, boolean animated) {
         centerLyricsRow(row, animated, true);
+    }
+
+    /** Vertical position inside the viewport that the active synced line settles on. */
+    private int getLyricsFocusCenter() {
+        return lyricsListView.getHeight() / 2;
     }
 
     private void centerLyricsRow(int row, boolean animated, boolean allowRetry) {
@@ -2543,9 +2969,17 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             if (!showingLyrics || row != activeLyricsRow || row < 0 || row >= visibleLyrics.size() || lyricsListView.getHeight() == 0) return;
             if (animated) {
                 LinearSmoothScroller scroller = new LinearSmoothScroller(getContext()) {
-                    @Override protected int getVerticalSnapPreference() { return SNAP_TO_START; }
-                    @Override public int calculateDyToMakeVisible(View view, int snapPreference) {
-                        return (view.getTop() + view.getBottom()) / 2 - lyricsListView.getHeight() / 2;
+                    @Override
+                    public int calculateDyToMakeVisible(View view, int snapPreference) {
+                        final RecyclerView.LayoutManager manager = getLayoutManager();
+                        if (manager == null || !manager.canScrollVertically()) return 0;
+                        final RecyclerView.LayoutParams params = (RecyclerView.LayoutParams) view.getLayoutParams();
+                        final int top = manager.getDecoratedTop(view) - params.topMargin;
+                        final int bottom = manager.getDecoratedBottom(view) + params.bottomMargin;
+                        // Must follow the base contract of calculateDtToFit(): target - current.
+                        // The previous implementation returned current - target, which inverted
+                        // every animated follow (onTargetFound applies action.update(-dx, -dy)).
+                        return getLyricsFocusCenter() - (top + bottom) / 2;
                     }
                     @Override protected float calculateSpeedPerPixel(DisplayMetrics metrics) {
                         return 90f / metrics.densityDpi;
@@ -2560,11 +2994,12 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             }
             View child = lyricsLayoutManager.findViewByPosition(row);
             if (child == null) {
-                lyricsLayoutManager.scrollToPositionWithOffset(row, Math.max(0, lyricsListView.getHeight() / 2 - dp(32)));
+                lyricsLayoutManager.scrollToPositionWithOffset(row, Math.max(0, getLyricsFocusCenter() - dp(32)));
                 if (allowRetry) lyricsListView.post(() -> centerLyricsRow(row, false, false));
                 return;
             }
-            int distance = (child.getTop() + child.getBottom()) / 2 - lyricsListView.getHeight() / 2;
+            // scrollBy() takes the opposite sign convention: positive dy moves content up.
+            int distance = (child.getTop() + child.getBottom()) / 2 - getLyricsFocusCenter();
             lyricsListView.scrollBy(0, distance);
             updateLyricsDepth();
         });
@@ -2572,7 +3007,6 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
 
     private void updateLyricsDepth() {
         if (lyricsListView == null || lyricsListView.getHeight() == 0) return;
-        final float center = lyricsListView.getHeight() / 2f;
         for (int i = 0; i < lyricsListView.getChildCount(); i++) {
             applyLyricsDepth(lyricsListView.getChildAt(i));
         }
@@ -2580,10 +3014,17 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
 
     private void applyLyricsDepth(View child) {
         if (lyricsListView.getHeight() == 0) return;
+        if (currentLyrics == null || !currentLyrics.isSynced()) {
+            // Untimed lyrics are read, not followed: no invented focus, no depth falloff.
+            child.setAlpha(1f);
+            child.setScaleX(1f);
+            child.setScaleY(1f);
+            return;
+        }
         RecyclerView.ViewHolder holder = lyricsListView.getChildViewHolder(child);
         int row = holder.getAdapterPosition();
-        boolean active = currentLyrics != null && currentLyrics.isSynced() && row == activeLyricsRow;
-        float center = lyricsListView.getHeight() / 2f;
+        boolean active = row == activeLyricsRow;
+        float center = getLyricsFocusCenter();
         float distance = Math.abs((child.getTop() + child.getBottom()) / 2f - center) / Math.max(1f, center);
         float depth = Math.min(1f, distance);
         child.setAlpha(active ? 1f : 0.86f - depth * .42f);
@@ -2592,15 +3033,21 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         child.setScaleY(scale);
     }
 
+    /** Inset of the expand control (40dp target + 4dp) reserved at the top of the normal viewport. */
+    private static final int LYRICS_EXPAND_INSET = 44;
+
     private void updateLyricsPadding() {
         if (lyricsListView == null || lyricsListView.getHeight() == 0) return;
         int top;
         int bottom;
-        if (currentLyrics != null && currentLyrics.kind == SyncedLyricsController.Kind.PLAIN) {
-            top = dp(12);
-            bottom = dp(32);
+        if (currentLyrics == null || !currentLyrics.isSynced()) {
+            // Untimed lyrics scroll manually, so the first and last lines must both be reachable.
+            // The top inset is exactly the expand control's bounds in normal mode - not padding
+            // chosen by eye - and fullscreen has no expand control at all.
+            top = dp(fullscreenLyrics ? 12 : LYRICS_EXPAND_INSET);
+            bottom = dp(24);
         } else {
-            top = bottom = Math.max(0, lyricsListView.getHeight() / 2 - dp(32));
+            top = bottom = Math.max(0, getLyricsFocusCenter() - dp(32));
         }
         if (lyricsListView.getPaddingTop() != top || lyricsListView.getPaddingBottom() != bottom) {
             lyricsListView.setPadding(0, top, 0, bottom);
@@ -2826,6 +3273,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
 
         @Override
         public boolean isEnabled(RecyclerView.ViewHolder holder) {
+            // Untimed lyrics have nothing to seek to, so they are not presented as tappable.
+            if (currentLyrics == null || !currentLyrics.isSynced()) return false;
             int position = holder.getAdapterPosition();
             return position >= 0 && position < visibleLyrics.size() && !TextUtils.isEmpty(currentLyrics.lines.get(visibleLyrics.get(position)).text);
         }
@@ -2851,18 +3300,21 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         public void onBindViewHolder(RecyclerView.ViewHolder holder, int position) {
             TextView textView = (TextView) holder.itemView;
             int line = visibleLyrics.get(position);
-            boolean active = currentLyrics.isSynced() && line == activeLyricsLine;
+            final boolean synced = currentLyrics.isSynced();
+            boolean active = synced && line == activeLyricsLine;
             textView.setText(currentLyrics.lines.get(line).text);
-            boolean stanzaSpace = currentLyrics.kind == SyncedLyricsController.Kind.PLAIN && TextUtils.isEmpty(currentLyrics.lines.get(line).text);
+            boolean stanzaSpace = !synced && TextUtils.isEmpty(currentLyrics.lines.get(line).text);
+            // Identical viewport, typography, sizes, spacing and margins for timed and untimed
+            // lyrics; only the timed visual hierarchy is synced-only.
             textView.setMinHeight(dp(stanzaSpace ? 24 : 56));
             textView.setPadding(dp(24), dp(stanzaSpace ? 0 : 12), dp(24), dp(stanzaSpace ? 0 : 12));
             textView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16);
             textView.setTypeface(active ? AndroidUtilities.bold() : Typeface.DEFAULT);
-            textView.setTextColor(getThemedColor(active ? Theme.key_player_actionBarTitle : Theme.key_player_time));
-            textView.setAlpha(active ? 1f : .65f);
-            textView.setScaleX(active ? 1f : .97f);
-            textView.setScaleY(active ? 1f : .97f);
-            textView.setBackground(stanzaSpace ? null : Theme.createSelectorDrawable(getThemedColor(Theme.key_listSelector), 2));
+            textView.setTextColor(getThemedColor(active || !synced ? Theme.key_player_actionBarTitle : Theme.key_player_time));
+            textView.setAlpha(active || !synced ? 1f : .65f);
+            textView.setScaleX(active || !synced ? 1f : .97f);
+            textView.setScaleY(active || !synced ? 1f : .97f);
+            textView.setBackground(stanzaSpace || !synced ? null : Theme.createSelectorDrawable(getThemedColor(Theme.key_listSelector), 2));
         }
     }
 
@@ -3507,34 +3959,11 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         o.show();
     }
 
+    private boolean visibleInProfile;
+
     private void setVisibleInProfile(boolean visible) {
-        if (isMyList() || noforwards) {
-            saveToProfileButton.setVisibility(View.GONE);
-            unsaveFromProfileButton.setVisibility(View.GONE);
-            return;
-        }
-        saveToProfileButton.setVisibility(View.VISIBLE);
-        unsaveFromProfileButton.setVisibility(View.VISIBLE);
-        saveToProfileButton.animate()
-            .alpha(visible ? 0.0f : 1.0f)
-            .scaleX(visible ? 0.8f : 1.0f)
-            .scaleY(visible ? 0.8f : 1.0f)
-            .setDuration(420)
-            .setInterpolator(CubicBezierInterpolator.EASE_OUT_QUINT)
-            .withEndAction(() -> {
-                saveToProfileButton.setVisibility(visible ? View.GONE : View.VISIBLE);
-            })
-            .start();
-        unsaveFromProfileButton.animate()
-            .alpha(!visible ? 0.0f : 1.0f)
-            .scaleX(!visible ? 0.8f : 1.0f)
-            .scaleY(!visible ? 0.8f : 1.0f)
-            .setDuration(420)
-            .setInterpolator(CubicBezierInterpolator.EASE_OUT_QUINT)
-            .withEndAction(() -> {
-                unsaveFromProfileButton.setVisibility(visible ? View.VISIBLE : View.GONE);
-            })
-            .start();
+        visibleInProfile = visible;
+        applyProfileButtonsVisibility(true);
     }
 
     private void saveToMusic(MessageObject messageObject) {
