@@ -2,9 +2,6 @@ name: Build Telegram APK
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - codex/create-working-branch-for-synced-lyrics-feature
 
 jobs:
   build:
@@ -38,75 +35,17 @@ jobs:
       - name: Make Gradle executable
         run: chmod +x gradlew
 
-      - name: Configure QA build
-        env:
-          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
-          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          import os
-          import re
+      - name: Build debug APK
+        run: ./gradlew :TMessagesProj_App:assembleAfatDebug --no-daemon
 
-          api_id = os.environ.get("TELEGRAM_API_ID", "").strip()
-          api_hash = os.environ.get("TELEGRAM_API_HASH", "").strip()
-
-          if not re.fullmatch(r"[0-9]+", api_id):
-              raise SystemExit("TELEGRAM_API_ID is missing or invalid")
-          if not re.fullmatch(r"[0-9a-fA-F]{32}", api_hash):
-              raise SystemExit("TELEGRAM_API_HASH is missing or invalid")
-
-          gradle_path = Path("TMessagesProj_AppStandalone/build.gradle")
-          gradle_text = gradle_path.read_text()
-          gradle_pattern = r'(standalone\s*\{.*?applicationIdSuffix\s+)"\.web"'
-          gradle_text, count = re.subn(gradle_pattern, r'\1".beta"', gradle_text, count=1, flags=re.S)
-          if count != 1:
-              raise SystemExit("Could not isolate standalone QA package")
-          gradle_path.write_text(gradle_text)
-
-          vars_path = Path("TMessagesProj/src/main/java/org/telegram/messenger/BuildVars.java")
-          vars_text = vars_path.read_text()
-          vars_text, id_count = re.subn(
-              r'public static int APP_ID = \d+;',
-              f'public static int APP_ID = {api_id};',
-              vars_text,
-              count=1,
-          )
-          vars_text, hash_count = re.subn(
-              r'public static String APP_HASH = "[^"]*";',
-              f'public static String APP_HASH = "{api_hash}";',
-              vars_text,
-              count=1,
-          )
-          vars_text, passkey_count = re.subn(
-              r'public static boolean SUPPORTS_PASSKEYS = true;',
-              'public static boolean SUPPORTS_PASSKEYS = false;',
-              vars_text,
-              count=1,
-          )
-          if id_count != 1 or hash_count != 1 or passkey_count != 1:
-              raise SystemExit("Could not configure Telegram API credentials safely")
-          vars_path.write_text(vars_text)
-
-          print("QA package isolated and Telegram API credentials injected")
-          PY
-
-      - name: Build standalone QA APK
-        run: ./gradlew :TMessagesProj_AppStandalone:assembleAfatStandalone --no-daemon
-
-      - name: Collect and verify APK
+      - name: Collect APK
         run: |
           mkdir -p apk
-          APK_PATH=$(find TMessagesProj_AppStandalone/build/outputs/apk -type f -name "*.apk" | head -n 1)
-          test -n "$APK_PATH"
-          cp "$APK_PATH" apk/Telegram-Lyrics-QA.apk
-          AAPT="$ANDROID_HOME/build-tools/36.0.0/aapt"
-          "$AAPT" dump badging apk/Telegram-Lyrics-QA.apk | head -n 1
-          "$AAPT" dump badging apk/Telegram-Lyrics-QA.apk | grep -q "package: name='org.telegram.messenger.beta'"
+          find TMessagesProj_App/build/outputs/apk -name "*.apk" -exec cp {} apk/Telegram-Lyrics-Test.apk \;
           ls -lh apk
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: Telegram-Android-Lyrics-QA
-          path: apk/Telegram-Lyrics-QA.apk
+          name: Telegram-Android-Debug
+          path: apk/Telegram-Lyrics-Test.apk
