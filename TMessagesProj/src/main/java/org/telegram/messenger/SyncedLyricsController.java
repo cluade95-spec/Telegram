@@ -374,7 +374,11 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
         ArrayList<MessageObject> retry = new ArrayList<>();
         synchronized (cache) {
             for (Entry entry : cache.values()) {
-                if ((entry.state == State.WAITING_FILE || entry.lyrics.origin == Source.EMBEDDED || entry.lyrics.origin == Source.LOCAL && !entry.embeddedChecked) && entry.message != null && TextUtils.equals(entry.message.getFileName(), loadedName)) {
+                if (entry.message == null || !TextUtils.equals(entry.message.getFileName(), loadedName)) continue;
+                // Only entries whose embedded extraction never completed need the media again.
+                // A finished EMBEDDED result stays cached: re-parsing it on every playback start
+                // re-ran AudioInfo over the whole file for no gain.
+                if (entry.state == State.WAITING_FILE || !entry.embeddedChecked) {
                     entry.state = State.WAITING_FILE;
                     retry.add(entry.message);
                 }
@@ -396,7 +400,8 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
         if (key == null) return false;
         synchronized (cache) {
             Entry entry = cache.get(key);
-            return entry != null && entry.suppressed && entry.embeddedChecked && !entry.embeddedLyrics.lines.isEmpty();
+            return entry != null && entry.suppressed && entry.embeddedChecked
+                && !entry.embeddedLyrics.lines.isEmpty() && entry.lyrics.origin != Source.LOCAL;
         }
     }
 
@@ -447,6 +452,7 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
         }
         Utilities.globalQueue.postRunnable(() -> {
             boolean success = false;
+            boolean suppressionCleared = false;
             File temporary = null;
             File target = file(key);
             try {
@@ -458,13 +464,17 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
                     output.getFD().sync();
                 }
                 if (!temporary.renameTo(target)) throw new IllegalStateException("Could not replace lyrics file");
-                suppressionFile(key).delete();
+                File marker = suppressionFile(key);
+                // A local override replaces the embedded source; drop the suppression marker so a
+                // later cold load does not resurrect a stale "suppressed" flag.
+                suppressionCleared = !marker.exists() || marker.delete();
                 success = true;
             } catch (Exception e) {
                 FileLog.e(e);
             }
             if (!success && temporary != null) temporary.delete();
             final boolean result = success;
+            final boolean clearedSuppression = suppressionCleared;
             Lyrics fallback = previous;
             if (!result && fallback == EMPTY && target.exists()) {
                 try {
@@ -479,7 +489,7 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
                     Entry entry = cache.get(key);
                     if (entry != null && entry.generation == generation) {
                         entry.lyrics = result ? parsed.withOrigin(Source.LOCAL) : finalFallback;
-                        if (result) entry.suppressed = false;
+                        if (result) entry.suppressed = !clearedSuppression;
                         entry.state = result ? (parsed.kind == Kind.MALFORMED ? State.MALFORMED : parsed.lines.isEmpty() ? State.MISSING : State.LOADED) : State.WRITE_FAILED;
                     }
                 }
@@ -505,7 +515,21 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
         }
         Utilities.globalQueue.postRunnable(() -> {
             File target = file(key);
-            boolean success = (!target.exists() || target.delete()) && writeSuppression(key);
+            File marker = suppressionFile(key);
+            final boolean markerExisted = marker.exists();
+            // Durable suppression first: if the marker cannot be written we must not have destroyed
+            // the user's local override, otherwise the embedded lyrics silently come back while the
+            // UI reports a failure.
+            boolean deleted = false;
+            if (writeSuppression(key)) {
+                if (!target.exists() || target.delete()) {
+                    deleted = true;
+                } else if (!markerExisted) {
+                    marker.delete(); // roll back the marker this attempt created
+                }
+            }
+            final boolean success = deleted;
+            final boolean suppressedNow = marker.exists();
             Lyrics fallback = previous;
             if (!success && fallback == EMPTY && target.exists()) {
                 try {
@@ -521,8 +545,8 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
                     if (entry != null && entry.generation == generation) {
                         entry.lyrics = success ? EMPTY : finalFallback;
                         entry.state = success ? State.NOT_LOADED : State.WRITE_FAILED;
+                        entry.suppressed = suppressedNow;
                         if (success) {
-                            entry.suppressed = true;
                             startLoading(key, message, entry);
                         }
                     }
