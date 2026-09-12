@@ -2718,11 +2718,21 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         }
     }
 
+    /**
+     * Stops an in-flight settle and leaves the surface wherever it was rendered.
+     *
+     * <p>The field is cleared <em>before</em> {@link AnimatorSet#cancel()}, which is not
+     * incidental: cancel() dispatches onAnimationCancel and then onAnimationEnd synchronously on
+     * the calling thread, so with the old ordering the completion listener's
+     * {@code lyricsPageAnimation != animation} guard would still match and snap the pager to the
+     * cancelled animation's target before the caller could read the rendered position. Clearing
+     * first makes the guard reject it. Same idiom as SearchTagsList.show() and ChatSearchTabs.
+     */
     private void cancelLyricsPageAnimation() {
-        if (lyricsPageAnimation != null) {
-            lyricsPageAnimation.cancel();
-            lyricsPageAnimation = null;
-        }
+        final AnimatorSet animation = lyricsPageAnimation;
+        if (animation == null) return;
+        lyricsPageAnimation = null;
+        animation.cancel();
     }
 
     private void animateLyricsPage(float targetProgress, float velocityX) {
