@@ -185,6 +185,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
     private boolean lyricsPagerTracking;
     private boolean lyricsPagerMaybeTracking;
     private float lyricsPagerStartProgress;
+    private float lyricsPagerOffsetProgress;
     private int lyricsPagerStartX;
     private int lyricsPagerStartY;
     private int lyricsPagerPointerId;
@@ -1353,7 +1354,10 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         lyricsExpandButton.setImageResource(R.drawable.iv_fullscreen);
         lyricsExpandButton.setScaleType(ImageView.ScaleType.CENTER);
         lyricsExpandButton.setColorFilter(new PorterDuffColorFilter(getThemedColor(Theme.key_player_actionBarTitle), PorterDuff.Mode.SRC_IN));
-        lyricsExpandButton.setBackground(Theme.createSelectorDrawable(getThemedColor(Theme.key_player_actionBarSelector), Theme.RIPPLE_MASK_CIRCLE_20DP, dp(16)));
+        // Opaque backing, like the rounded surface Telegram puts behind its own editor history
+        // buttons: lyricsListView keeps clipToPadding=false so timed lines scroll through the top
+        // of the viewport, and the control must occupy its own space rather than sit over text.
+        lyricsExpandButton.setBackground(Theme.createSimpleSelectorCircleDrawable(dp(40), getThemedColor(Theme.key_dialogBackground), getThemedColor(Theme.key_player_actionBarSelector)));
         ScaleStateListAnimator.apply(lyricsExpandButton);
         lyricsExpandButton.setContentDescription(getString(R.string.AccSwitchToFullscreen));
         lyricsExpandButton.setOnClickListener(v -> setFullscreenLyrics(true));
@@ -2127,6 +2131,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             // The playlist is off-screen; its scroll offset must not drive the lyrics geometry,
             // the action bar fade, or the profile header position.
             updateLyricsGeometry();
+            updateLightStatusBar();
             containerView.invalidate();
             return;
         }
@@ -2200,10 +2205,27 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             rad = 1.0f - moveProgress;
         }
 
-        boolean light = rad <= 0.5f && ColorUtils.calculateLuminance(getThemedColor(Theme.key_dialogBackground)) > 0.7f;
+        applyLightStatusBar(rad <= 0.5f && isDialogBackgroundLight());
+    }
+
+    private boolean isDialogBackgroundLight() {
+        return ColorUtils.calculateLuminance(getThemedColor(Theme.key_dialogBackground)) > 0.7f;
+    }
+
+    private void applyLightStatusBar(boolean light) {
         if (light != wasLight) {
             AndroidUtilities.setLightStatusBar(this, wasLight = light);
         }
+    }
+
+    /**
+     * Lyrics modes own their status-bar appearance, because updateLayout()'s playlist sheet-radius
+     * rule never runs while they are active and would otherwise leave {@link #wasLight} stale.
+     * Fullscreen fills the window with the dialog background; normal lyrics keeps the sheet below
+     * the status bar, so the dimmed backdrop is what shows there.
+     */
+    private void updateLightStatusBar() {
+        applyLightStatusBar(fullscreenLyrics && isDialogBackgroundLight());
     }
 
     /**
@@ -2317,6 +2339,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             actionBar.setTranslationY(0);
             actionBarShadow.setTranslationY(0);
             actionBar.setVisibility(fullscreenLyrics ? View.VISIBLE : View.GONE);
+            updateLightStatusBar();
         } else {
             if (playlistChromeTitle != null) {
                 actionBar.setTitle(playlistChromeTitle);
@@ -2567,6 +2590,9 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
 
     private void setShowingLyrics(boolean show, boolean animated) {
         if (show && visibleLyrics.isEmpty()) return;
+        // A programmatic mode change owns the surface; an in-flight drag must not keep writing
+        // progress underneath it and strand a partial page.
+        cancelLyricsPagerTracking();
         final boolean changed = showingLyrics != show;
         if (show) updateLyricsGeometry();
         showingLyrics = show;
@@ -2661,6 +2687,19 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         return width;
     }
 
+    /**
+     * The pager renders fractional progress while dragging or settling, but its resting state is
+     * binary: 0f is Playlist, 1f is Lyrics. Everything that ends an interaction goes through here.
+     */
+    private static float lyricsPageEndpoint(float progress) {
+        return progress > 0.5f ? 1f : 0f;
+    }
+
+    /** The page the shell logically holds, regardless of what is on screen mid-animation. */
+    private float currentLyricsPage() {
+        return showingLyrics ? 1f : 0f;
+    }
+
     private void setLyricsPageProgress(float progress) {
         lyricsPageProgress = Math.max(0f, Math.min(1f, progress));
         final int width = getLyricsPageWidth();
@@ -2686,7 +2725,9 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         }
     }
 
-    private void animateLyricsPage(float target, float velocityX) {
+    private void animateLyricsPage(float targetProgress, float velocityX) {
+        // Single funnel for every resting transition, so no caller can leave a stable partial page.
+        final float target = lyricsPageEndpoint(targetProgress);
         cancelLyricsPageAnimation();
         final int width = getLyricsPageWidth();
         if (width <= 0) {
@@ -2745,10 +2786,37 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
     private void cancelLyricsPagerTracking() {
         lyricsPagerTracking = false;
         lyricsPagerMaybeTracking = false;
+        lyricsPagerOffsetProgress = 0f;
         if (lyricsPagerVelocity != null) {
             lyricsPagerVelocity.recycle();
             lyricsPagerVelocity = null;
         }
+    }
+
+    /**
+     * Ends a gesture that never moved the pager itself. If ACTION_DOWN took a settle animation off
+     * the surface, that settle has to be finished here - dropping the gesture on its own would
+     * leave the surface frozen wherever the cancelled animation happened to be.
+     */
+    private void abandonLyricsPagerGesture() {
+        final boolean adopted = lyricsPagerOffsetProgress != 0f;
+        cancelLyricsPagerTracking();
+        if (adopted) animateLyricsPage(currentLyricsPage(), 0f);
+    }
+
+    /**
+     * Paging stopped being available while a gesture was live. Never abandon the surface mid-page:
+     * resolve to a coherent endpoint first, then drop the gesture. Losing usable lyrics can only
+     * resolve to Playlist; anything else returns to the page the shell logically holds. Neither is
+     * a completed user choice, so the stored mode preference is left alone.
+     */
+    private void resolveLyricsPagerInterruption() {
+        if (!lyricsPagerTracking) {
+            abandonLyricsPagerGesture();
+            return;
+        }
+        cancelLyricsPagerTracking();
+        settleLyricsPage(visibleLyrics.isEmpty() ? 0f : currentLyricsPage(), 0f, false);
     }
 
     private boolean handleLyricsPagerTouch(MotionEvent ev) {
@@ -2757,11 +2825,18 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         if (action == MotionEvent.ACTION_DOWN) {
             cancelLyricsPagerTracking();
             if (!canSwitchLyricsPage() || !isInLyricsPageArea(ev.getY())) return false;
+            // Take ownership of the surface immediately: an in-flight settle must not keep moving
+            // under the finger. Its remaining travel is carried as a visual offset so the picture
+            // does not jump, while the gesture baseline stays a real page.
+            if (lyricsPageAnimation != null || lyricsPageProgress != currentLyricsPage()) {
+                cancelLyricsPageAnimation();
+                lyricsPagerOffsetProgress = lyricsPageProgress - currentLyricsPage();
+            }
             lyricsPagerMaybeTracking = true;
             lyricsPagerPointerId = ev.getPointerId(0);
             lyricsPagerStartX = (int) ev.getX();
             lyricsPagerStartY = (int) ev.getY();
-            lyricsPagerStartProgress = lyricsPageProgress;
+            lyricsPagerStartProgress = currentLyricsPage();
             if (lyricsPagerVelocity == null) lyricsPagerVelocity = VelocityTracker.obtain();
             lyricsPagerVelocity.clear();
             lyricsPagerVelocity.addMovement(ev);
@@ -2769,20 +2844,47 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         }
         if (!lyricsPagerMaybeTracking && !lyricsPagerTracking) return false;
         if (lyricsPagerVelocity != null) lyricsPagerVelocity.addMovement(ev);
-        if (action == MotionEvent.ACTION_MOVE && ev.getPointerId(0) == lyricsPagerPointerId) {
-            if (!canSwitchLyricsPage()) {
-                cancelLyricsPagerTracking();
+        if (action == MotionEvent.ACTION_POINTER_UP) {
+            final int upIndex = ev.getActionIndex();
+            if (ev.getPointerId(upIndex) != lyricsPagerPointerId) return lyricsPagerTracking;
+            final int nextIndex = upIndex == 0 ? 1 : 0;
+            if (nextIndex >= ev.getPointerCount()) {
+                resolveLyricsPagerInterruption();
                 return false;
             }
-            final int dx = (int) (ev.getX() - lyricsPagerStartX);
-            final int dy = (int) (ev.getY() - lyricsPagerStartY);
+            // Hand the gesture to a remaining finger by rebasing the origin, so dx - and therefore
+            // the rendered progress - is unchanged across the handoff.
+            lyricsPagerStartX += (int) (ev.getX(nextIndex) - ev.getX(upIndex));
+            lyricsPagerStartY += (int) (ev.getY(nextIndex) - ev.getY(upIndex));
+            lyricsPagerPointerId = ev.getPointerId(nextIndex);
+            if (lyricsPagerVelocity != null) {
+                lyricsPagerVelocity.clear();
+                lyricsPagerVelocity.addMovement(ev);
+            }
+            return lyricsPagerTracking;
+        }
+        if (action == MotionEvent.ACTION_MOVE) {
+            final int index = ev.findPointerIndex(lyricsPagerPointerId);
+            if (index < 0) {
+                resolveLyricsPagerInterruption();
+                return false;
+            }
+            if (!canSwitchLyricsPage()) {
+                resolveLyricsPagerInterruption();
+                return false;
+            }
+            final int dx = (int) (ev.getX(index) - lyricsPagerStartX);
+            final int dy = (int) (ev.getY(index) - lyricsPagerStartY);
             if (!lyricsPagerTracking) {
                 // Dominant-axis arbitration, identical to ViewPagerFixed: a clearly vertical drag
                 // stays with the list, a clearly horizontal one becomes a page switch.
                 if (Math.abs(dx) >= lyricsPagerTouchSlop && Math.abs(dx) > Math.abs(dy)) {
                     final float forward = LocaleController.isRTL ? dx : -dx;
-                    if (lyricsPagerStartProgress <= 0f && forward <= 0 || lyricsPagerStartProgress >= 1f && forward >= 0) {
-                        cancelLyricsPagerTracking();
+                    // Judged against what is on screen, so a gesture begun mid-settle can still
+                    // drag toward the page the interrupted animation was heading for.
+                    final float rendered = lyricsPagerStartProgress + lyricsPagerOffsetProgress;
+                    if (rendered <= 0f && forward <= 0 || rendered >= 1f && forward >= 0) {
+                        abandonLyricsPagerGesture();
                         return false;
                     }
                     lyricsPagerTracking = true;
@@ -2795,7 +2897,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                     updateLyricsGeometry();
                     AndroidUtilities.cancelRunOnUIThread(resumeLyricsFollow);
                 } else if (Math.abs(dy) >= lyricsPagerTouchSlop) {
-                    cancelLyricsPagerTracking();
+                    abandonLyricsPagerGesture();
                     return false;
                 }
             }
@@ -2803,7 +2905,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 final int width = getLyricsPageWidth();
                 if (width > 0) {
                     final float forward = (LocaleController.isRTL ? dx : -dx) / (float) width;
-                    setLyricsPageProgress(lyricsPagerStartProgress + forward);
+                    setLyricsPageProgress(lyricsPagerStartProgress + lyricsPagerOffsetProgress + forward);
                 }
                 return true;
             }
@@ -2811,33 +2913,54 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         }
         if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
             final boolean wasTracking = lyricsPagerTracking;
+            final float startProgress = lyricsPagerStartProgress;
+            final float offsetProgress = lyricsPagerOffsetProgress;
             float velocityX = 0, velocityY = 0;
             if (lyricsPagerVelocity != null && action == MotionEvent.ACTION_UP) {
                 lyricsPagerVelocity.computeCurrentVelocity(1000, maximumVelocity);
                 velocityX = lyricsPagerVelocity.getXVelocity();
                 velocityY = lyricsPagerVelocity.getYVelocity();
             }
-            cancelLyricsPagerTracking();
-            if (wasTracking) {
-                final int width = Math.max(1, getLyricsPageWidth());
-                final float travelled = Math.abs(lyricsPageProgress - lyricsPagerStartProgress) * width;
-                final boolean back = travelled < width / 3.0f
-                    && (Math.abs(velocityX) < 3500 || Math.abs(velocityX) < Math.abs(velocityY));
-                final float target = back ? lyricsPagerStartProgress : (lyricsPagerStartProgress > 0.5f ? 0f : 1f);
-                settleLyricsPage(target, velocityX);
-                return true;
+            if (!wasTracking) {
+                abandonLyricsPagerGesture();
+                return false;
             }
-            return false;
+            cancelLyricsPagerTracking();
+            final int width = Math.max(1, getLyricsPageWidth());
+            final float forwardVelocity = LocaleController.isRTL ? velocityX : -velocityX;
+            final boolean flung = Math.abs(velocityX) >= 3500 && Math.abs(velocityX) > Math.abs(velocityY);
+            final float target;
+            if (flung) {
+                target = forwardVelocity > 0 ? 1f : 0f;
+            } else if (offsetProgress != 0f) {
+                // The gesture began mid-settle, so distance travelled from the logical page is
+                // meaningless; decide by where the surface actually came to rest.
+                target = lyricsPageEndpoint(lyricsPageProgress);
+            } else {
+                final float travelled = Math.abs(lyricsPageProgress - startProgress) * width;
+                target = travelled < width / 3.0f ? startProgress : (startProgress > 0.5f ? 0f : 1f);
+            }
+            settleLyricsPage(target, velocityX, true);
+            return true;
         }
         return lyricsPagerTracking;
     }
 
-    private void settleLyricsPage(float target, float velocityX) {
-        final boolean toLyrics = target > 0.5f;
+    /**
+     * Resolves the pager onto a page. {@code target} is snapped to an endpoint here as well, so no
+     * caller - present or future - can leave a stable partial page behind.
+     *
+     * @param userChoice true only when the user completed an interaction on this surface; a
+     *                   cancellation or an invalidation must not rewrite the stored mode preference.
+     */
+    private void settleLyricsPage(float target, float velocityX, boolean userChoice) {
+        final float endpoint = lyricsPageEndpoint(target);
+        final boolean toLyrics = endpoint > 0.5f;
         if (toLyrics != showingLyrics) {
-            // Settling on a surface is an explicit mode choice by the user.
-            lyricsModeRequested = toLyrics;
-            SyncedLyricsController.getInstance(currentAccount).setLyricsModePreferred(toLyrics);
+            if (userChoice) {
+                lyricsModeRequested = toLyrics;
+                SyncedLyricsController.getInstance(currentAccount).setLyricsModePreferred(toLyrics);
+            }
             showingLyrics = toLyrics;
             lyricsListView.setEnabled(toLyrics);
             listView.setEnabled(!toLyrics);
@@ -2845,7 +2968,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             updateLyricsPadding();
             showLyricsExpandButton(toLyrics && !fullscreenLyrics);
         }
-        animateLyricsPage(target, velocityX);
+        animateLyricsPage(endpoint, velocityX);
         if (toLyrics && activeLyricsRow != RecyclerView.NO_POSITION && !lyricsUserScrolling) {
             centerLyricsRow(activeLyricsRow, true);
         }
