@@ -50,6 +50,7 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.ByteBuffer;
 import java.nio.charset.CodingErrorAction;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Locale;
 
@@ -59,14 +60,19 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
     private static final int OTHER = 2;
     private static final int IMPORT = 3;
     private static final int DELETE = 4;
+    private static final int UNDO = 5;
+    private static final int REDO = 6;
     private static final int PICK_LRC = 41;
     private static final int MAX_SIZE = 1024 * 1024;
 
     private final MessageObject messageObject;
-    private EditTextBoldCursor editText;
+    private LyricsEditText editText;
     private ActionBarMenuItem doneButton;
     private ActionBarMenuItem otherButton;
+    private ActionBarMenuItem undoButton;
+    private ActionBarMenuItem redoButton;
     private RadialProgressView progressView;
+    private LyricsHistory history;
     private String initialSource = "";
     private String restoredSource;
     private int restoredSelection = -1;
@@ -75,6 +81,9 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
     private boolean importing;
     private boolean editorReady;
     private boolean readErrorShown;
+    private boolean ignoreTextChange;
+    private Boolean lastCanUndo;
+    private Boolean lastCanRedo;
 
     public SyncedLyricsEditorFragment(MessageObject messageObject) {
         super(new Bundle());
@@ -91,7 +100,49 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
     @Override
     public void onFragmentDestroy() {
         getNotificationCenter().removeObserver(this, NotificationCenter.syncedLyricsChanged);
+        if (history != null) history.detach();
         super.onFragmentDestroy();
+    }
+
+    /**
+     * A plain-text editing surface for raw LRC.
+     *
+     * <p>{@link EditTextBoldCursor} inherits Telegram's message-composer effects pipeline from
+     * {@code EditTextEffects}. That pipeline rescans the <em>whole</em> document on every keystroke
+     * (spoiler spans, quote blocks, animated emoji) and again on every frame from {@code onDraw},
+     * which is what made a long LRC document lag: the cost grows with the size of the document
+     * rather than with the size of the edit. None of those features can occur in raw LRC text, so
+     * this surface opts out of all of them. What remains per keystroke is the incremental
+     * {@code DynamicLayout} reflow of the edited paragraph - the same order of work per edit that
+     * Telegram's own editor gets by giving every block its own small {@code RichEditText} inside
+     * {@code RichEditorListView}.
+     */
+    private static class LyricsEditText extends EditTextBoldCursor {
+        LyricsEditText(Context context) {
+            super(context);
+            drawAnimatedEmojiDrawables = false;
+            setShouldRevealSpoilersByTouch(false);
+        }
+
+        @Override
+        public void invalidateEffects() {
+            // no spoilers in a lyrics document
+        }
+
+        @Override
+        protected void invalidateSpoilers() {
+            // no spoilers in a lyrics document
+        }
+
+        @Override
+        public void invalidateQuotes(boolean force) {
+            // no quote blocks in a lyrics document
+        }
+
+        @Override
+        public void updateAnimatedEmoji(boolean force) {
+            // no animated emoji spans in a lyrics document
+        }
     }
 
     @Override
@@ -108,6 +159,10 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
                     if (onBackPressed(true)) finishFragment();
                 } else if (id == DONE) {
                     save();
+                } else if (id == UNDO) {
+                    undo();
+                } else if (id == REDO) {
+                    redo();
                 } else if (id == IMPORT) {
                     importFile();
                 } else if (id == DELETE) {
@@ -116,12 +171,17 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
             }
         });
         ActionBarMenu menu = actionBar.createMenu();
+        // Same controls, icons and disabled treatment as Telegram's own editor history buttons.
+        undoButton = menu.addItem(UNDO, R.drawable.iv_undo);
+        undoButton.setContentDescription(LocaleController.getString(R.string.Undo));
+        redoButton = menu.addItem(REDO, R.drawable.iv_redo);
+        redoButton.setContentDescription(LocaleController.getString(R.string.Redo));
         otherButton = menu.addItem(OTHER, R.drawable.ic_ab_other);
         otherButton.setContentDescription(LocaleController.getString(R.string.AccDescrMoreOptions));
         doneButton = menu.addItemWithWidth(DONE, R.drawable.ic_ab_done, AndroidUtilities.dp(56));
         doneButton.setContentDescription(LocaleController.getString(R.string.Save));
 
-        editText = new EditTextBoldCursor(context);
+        editText = new LyricsEditText(context);
         editText.setTextSize(16);
         editText.setTextColor(getThemedColor(Theme.key_windowBackgroundWhiteBlackText));
         editText.setHintTextColor(getThemedColor(Theme.key_windowBackgroundWhiteHintText));
@@ -145,13 +205,28 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
         initialSource = controller.getLyrics(messageObject).source;
         editText.setText(restoredSource == null ? initialSource : restoredSource);
         editText.setSelection(restoredSelection < 0 ? editText.length() : Math.min(restoredSelection, editText.length()));
+        history = new LyricsHistory(new LyricsHistory.Delegate() {
+            @Override public String getText() { return editText == null ? "" : editText.getText().toString(); }
+            @Override public int getSelectionStart() { return editText == null ? 0 : editText.getSelectionStart(); }
+            @Override public int getSelectionEnd() { return editText == null ? 0 : editText.getSelectionEnd(); }
+            @Override public void restore(String text, int selStart, int selEnd) { applyHistoryText(text, selStart, selEnd); }
+            @Override public void onHistoryChanged() { updateHistoryButtons(); }
+        });
         editText.addTextChangedListener(new TextWatcher() {
-            @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) { }
-            @Override public void onTextChanged(CharSequence s, int start, int before, int count) { changedByUser = true; }
+            @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {
+                if (!ignoreTextChange && history != null) history.onBeforeChange(count, after);
+            }
+            @Override public void onTextChanged(CharSequence s, int start, int before, int count) {
+                if (ignoreTextChange) return;
+                changedByUser = true;
+                // Debounced only: no snapshot, no parsing and no span work per keystroke.
+                if (history != null) history.onTyping();
+            }
             @Override public void afterTextChanged(Editable s) { }
         });
         changedByUser = restoredSource != null && !initialSource.equals(restoredSource);
         updateOtherMenu();
+        updateHistoryButtons();
         FrameLayout content = new FrameLayout(context);
         content.setBackgroundColor(getThemedColor(Theme.key_windowBackgroundWhite));
         content.addView(editText, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.MATCH_PARENT));
@@ -192,11 +267,16 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
         String loadedSource = controller.getLyrics(messageObject).source;
         initialSource = loadedSource;
         if (replaceText) {
+            ignoreTextChange = true;
             editText.setText(initialSource);
             editText.setSelection(editText.length());
+            ignoreTextChange = false;
             changedByUser = false;
+            // The loaded document is the state the first undo should return to.
+            if (history != null) history.resetBaseline();
         }
         updateOtherMenu();
+        updateHistoryButtons();
         setEditorLoading(false);
     }
 
@@ -224,6 +304,44 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
         }
     }
 
+    private void undo() {
+        if (history == null || !editorReady || saving) return;
+        history.undo();
+    }
+
+    private void redo() {
+        if (history == null || !editorReady || saving) return;
+        history.redo();
+    }
+
+    private void applyHistoryText(String text, int selectionStart, int selectionEnd) {
+        if (editText == null) return;
+        ignoreTextChange = true;
+        editText.setText(text);
+        final int length = editText.length();
+        final int start = Math.max(0, Math.min(selectionStart, length));
+        final int end = Math.max(start, Math.min(selectionEnd, length));
+        editText.setSelection(start, end);
+        ignoreTextChange = false;
+        changedByUser = !initialSource.equals(text);
+    }
+
+    /** Enabled/disabled treatment taken from Telegram's editor toolbar: full opacity vs 0.35. */
+    private void updateHistoryButtons() {
+        if (undoButton == null || redoButton == null) return;
+        final boolean canUndo = history != null && editorReady && !saving && history.canUndo();
+        final boolean canRedo = history != null && editorReady && !saving && history.canRedo();
+        if (lastCanUndo != null && lastCanUndo == canUndo && lastCanRedo != null && lastCanRedo == canRedo) {
+            return;
+        }
+        lastCanUndo = canUndo;
+        lastCanRedo = canRedo;
+        undoButton.setEnabled(canUndo);
+        undoButton.setAlpha(canUndo ? 1f : 0.35f);
+        redoButton.setEnabled(canRedo);
+        redoButton.setAlpha(canRedo ? 1f : 0.35f);
+    }
+
     @Override
     public void didReceivedNotification(int id, int account, Object... args) {
         if (id == NotificationCenter.syncedLyricsChanged && editText != null && !saving && !importing) {
@@ -235,11 +353,13 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
         if (saving || !editorReady) return;
         saving = true;
         doneButton.setEnabled(false);
+        updateHistoryButtons();
         String source = editText.getText().toString();
         SyncedLyricsController.getInstance(currentAccount).save(messageObject, source, success -> {
             saving = false;
             if (isFinished || getParentActivity() == null) return;
             doneButton.setEnabled(true);
+            updateHistoryButtons();
             if (success) {
                 initialSource = source;
                 finishAndReturnToPlayer();
@@ -308,10 +428,14 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
                     showError(R.string.LyricsImportFailed);
                 } else {
                     setEditorLoading(false);
+                    // Commit what is on screen first so the replacement is a single undo step.
+                    if (history != null) history.flush();
                     editText.setText(result);
                     editText.setSelection(editText.length());
                     changedByUser = true;
+                    if (history != null) history.record();
                     updateOtherMenu();
+                    updateHistoryButtons();
                 }
             });
         });
@@ -333,10 +457,12 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
         if (saving) return;
         saving = true;
         doneButton.setEnabled(false);
+        updateHistoryButtons();
         SyncedLyricsController.getInstance(currentAccount).delete(messageObject, success -> {
             saving = false;
             if (isFinished || getParentActivity() == null) return;
             doneButton.setEnabled(true);
+            updateHistoryButtons();
             if (success) {
                 finishAndReturnToPlayer();
             } else {
@@ -389,7 +515,11 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
     public void onTransitionAnimationEnd(boolean isOpen, boolean backward) {
         if (isOpen && !backward && editText != null) {
             editText.requestFocus();
-            AndroidUtilities.showKeyboard(editText);
+            // Raising the keyboard immediately re-lays out the whole document; only do it when
+            // there is nothing to read yet, i.e. when the user came here to write.
+            if (editText.length() == 0) {
+                AndroidUtilities.showKeyboard(editText);
+            }
         }
     }
 
@@ -415,5 +545,191 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
         descriptions.add(new ThemeDescription(editText, ThemeDescription.FLAG_HINTTEXTCOLOR, null, null, null, null, Theme.key_windowBackgroundWhiteHintText));
         descriptions.add(new ThemeDescription(editText, ThemeDescription.FLAG_CURSORCOLOR, null, null, null, null, Theme.key_windowBackgroundWhiteBlackText));
         return descriptions;
+    }
+
+    /**
+     * Undo/redo for the lyrics source, following the contract of Telegram's own editor history
+     * ({@code org.telegram.ui.iv.RichEditorHistory}): nothing is captured per keystroke, a snapshot
+     * is committed on an 800 ms typing pause or immediately before a large change, the stack is
+     * bounded, and unchanged content is shared between snapshots by reference so that a long
+     * document does not retain a fresh copy per step.
+     */
+    private static final class LyricsHistory {
+        private static final long DEBOUNCE_MS = 800;
+        private static final int MAX_DEPTH = 60;
+        private static final int LARGE_CHANGE_THRESHOLD = 16;
+
+        interface Delegate {
+            String getText();
+            int getSelectionStart();
+            int getSelectionEnd();
+            void restore(String text, int selectionStart, int selectionEnd);
+            void onHistoryChanged();
+        }
+
+        private static final class Snapshot {
+            final String[] lines;
+            final int selectionStart;
+            final int selectionEnd;
+
+            Snapshot(String[] lines, int selectionStart, int selectionEnd) {
+                this.lines = lines;
+                this.selectionStart = selectionStart;
+                this.selectionEnd = selectionEnd;
+            }
+        }
+
+        private final Delegate delegate;
+        private final ArrayDeque<Snapshot> undoStack = new ArrayDeque<>();
+        private final ArrayDeque<Snapshot> redoStack = new ArrayDeque<>();
+        private Snapshot baseline;
+        private boolean dirty;
+        private boolean restoring;
+
+        private final Runnable commitRunnable = this::commit;
+
+        LyricsHistory(Delegate delegate) {
+            this.delegate = delegate;
+            baseline = capture();
+        }
+
+        void onTyping() {
+            if (restoring) return;
+            dirty = true;
+            AndroidUtilities.cancelRunOnUIThread(commitRunnable);
+            AndroidUtilities.runOnUIThread(commitRunnable, DEBOUNCE_MS);
+            delegate.onHistoryChanged();
+        }
+
+        void onBeforeChange(int removed, int added) {
+            if (restoring) return;
+            if (removed > LARGE_CHANGE_THRESHOLD || added > LARGE_CHANGE_THRESHOLD) {
+                flush();
+            }
+        }
+
+        void flush() {
+            AndroidUtilities.cancelRunOnUIThread(commitRunnable);
+            commit();
+        }
+
+        void record() {
+            if (restoring) return;
+            AndroidUtilities.cancelRunOnUIThread(commitRunnable);
+            dirty = true;
+            commit();
+        }
+
+        /** Re-establishes the baseline as the current content and clears undo/redo. */
+        void resetBaseline() {
+            AndroidUtilities.cancelRunOnUIThread(commitRunnable);
+            undoStack.clear();
+            redoStack.clear();
+            baseline = capture();
+            dirty = false;
+            delegate.onHistoryChanged();
+        }
+
+        void detach() {
+            AndroidUtilities.cancelRunOnUIThread(commitRunnable);
+            undoStack.clear();
+            redoStack.clear();
+            baseline = null;
+            dirty = false;
+        }
+
+        boolean canUndo() {
+            return dirty || !undoStack.isEmpty();
+        }
+
+        boolean canRedo() {
+            return !redoStack.isEmpty();
+        }
+
+        void undo() {
+            flush();
+            if (undoStack.isEmpty()) return;
+            redoStack.addLast(baseline);
+            baseline = undoStack.removeLast();
+            applyRestore(baseline);
+        }
+
+        void redo() {
+            flush();
+            if (redoStack.isEmpty()) return;
+            undoStack.addLast(baseline);
+            baseline = redoStack.removeLast();
+            applyRestore(baseline);
+        }
+
+        private void commit() {
+            AndroidUtilities.cancelRunOnUIThread(commitRunnable);
+            if (!dirty || restoring) return;
+            Snapshot now = capture();
+            dirty = false;
+            if (sameAs(baseline, now)) {
+                return;
+            }
+            undoStack.addLast(baseline);
+            while (undoStack.size() > MAX_DEPTH) {
+                undoStack.removeFirst();
+            }
+            redoStack.clear();
+            baseline = now;
+            delegate.onHistoryChanged();
+        }
+
+        private void applyRestore(Snapshot snapshot) {
+            dirty = false;
+            restoring = true;
+            delegate.restore(join(snapshot.lines), snapshot.selectionStart, snapshot.selectionEnd);
+            restoring = false;
+            delegate.onHistoryChanged();
+        }
+
+        private Snapshot capture() {
+            final String text = delegate.getText();
+            final String[] lines = text.split("\n", -1);
+            final String[] previous = baseline == null ? null : baseline.lines;
+            if (previous != null) {
+                // Share the unchanged head and tail with the previous snapshot by reference; a
+                // typical edit touches one line, so only that line is retained per step.
+                final int limit = Math.min(previous.length, lines.length);
+                int head = 0;
+                while (head < limit && previous[head].equals(lines[head])) {
+                    lines[head] = previous[head];
+                    head++;
+                }
+                int tail = 0;
+                while (tail < limit - head
+                        && previous[previous.length - 1 - tail].equals(lines[lines.length - 1 - tail])) {
+                    lines[lines.length - 1 - tail] = previous[previous.length - 1 - tail];
+                    tail++;
+                }
+            }
+            return new Snapshot(lines, delegate.getSelectionStart(), delegate.getSelectionEnd());
+        }
+
+        private static boolean sameAs(Snapshot a, Snapshot b) {
+            if (a == null || b == null) return false;
+            if (a.lines.length != b.lines.length) return false;
+            for (int i = 0; i < a.lines.length; i++) {
+                // capture() shares unchanged lines by reference
+                if (a.lines[i] != b.lines[i] && !a.lines[i].equals(b.lines[i])) return false;
+            }
+            return true;
+        }
+
+        private static String join(String[] lines) {
+            if (lines.length == 0) return "";
+            int length = lines.length - 1;
+            for (String line : lines) length += line.length();
+            StringBuilder builder = new StringBuilder(Math.max(0, length));
+            for (int i = 0; i < lines.length; i++) {
+                if (i > 0) builder.append('\n');
+                builder.append(lines[i]);
+            }
+            return builder.toString();
+        }
     }
 }
