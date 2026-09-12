@@ -1,4 +1,4 @@
-name: Build Telegram APK
+name: Build Telegram Lyrics QA APK
 
 on:
   workflow_dispatch:
@@ -35,17 +35,56 @@ jobs:
       - name: Make Gradle executable
         run: chmod +x gradlew
 
-      - name: Build debug APK
-        run: ./gradlew :TMessagesProj_App:assembleAfatDebug --no-daemon
+      # QA-only: keep credentials and package changes ephemeral in the Actions workspace.
+      # Revert this workflow before merging PR #2.
+      - name: Configure production QA application
+        env:
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          api_id = os.environ.get("TELEGRAM_API_ID", "")
+          api_hash = os.environ.get("TELEGRAM_API_HASH", "")
+          if not api_id.isdecimal() or not re.fullmatch(r"[0-9a-fA-F]{32}", api_hash):
+              raise SystemExit("Required Telegram API secrets are missing or invalid")
+
+          build_vars = Path("TMessagesProj/src/main/java/org/telegram/messenger/BuildVars.java")
+          source = build_vars.read_text()
+          source, id_count = re.subn(r"public static int APP_ID = \d+;", f"public static int APP_ID = {api_id};", source, count=1)
+          source, hash_count = re.subn(r'public static String APP_HASH = "[^"]*";', f'public static String APP_HASH = "{api_hash}";', source, count=1)
+          source, passkey_count = re.subn(r"public static boolean SUPPORTS_PASSKEYS = true;", "public static boolean SUPPORTS_PASSKEYS = false;", source, count=1)
+          if (id_count, hash_count, passkey_count) != (1, 1, 1):
+              raise SystemExit("BuildVars QA placeholders did not match expected source")
+          build_vars.write_text(source)
+
+          standalone = Path("TMessagesProj_AppStandalone/build.gradle")
+          source = standalone.read_text()
+          source, suffix_count = re.subn(r'applicationIdSuffix "\.web"', 'applicationIdSuffix ".beta"', source)
+          if suffix_count != 2:
+              raise SystemExit("Standalone package suffix did not match expected source")
+          standalone.write_text(source)
+          PY
+
+      - name: Build production standalone QA APK
+        run: ./gradlew :TMessagesProj_AppStandalone:assembleAfatStandalone --no-daemon
 
       - name: Collect APK
         run: |
-          mkdir -p apk
-          find TMessagesProj_App/build/outputs/apk -name "*.apk" -exec cp {} apk/Telegram-Lyrics-Test.apk \;
-          ls -lh apk
+          mapfile -t apks < <(find TMessagesProj_AppStandalone/build/outputs/apk -type f -name "*.apk")
+          if [ "${#apks[@]}" -ne 1 ]; then
+            printf 'Expected exactly one final standalone APK, found %s\n' "${#apks[@]}" >&2
+            exit 1
+          fi
+          cp "${apks[0]}" Telegram-Lyrics-QA.apk
+          test -s Telegram-Lyrics-QA.apk
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: Telegram-Android-Debug
-          path: apk/Telegram-Lyrics-Test.apk
+          name: Telegram-Lyrics-QA
+          path: Telegram-Lyrics-QA.apk
+          if-no-files-found: error
