@@ -524,11 +524,22 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                     y += (int) (AndroidUtilities.statusBarHeight * (1f - moveProgress));
 
                     if (lyricsPageProgress > 0f) {
-                        // The sheet edge morphs between the playlist geometry and the canonical
-                        // lyrics geometry so both pages stay inside one shell while swiping.
-                        top = (int) lerp(top, getLyricsContentTop() - backgroundPaddingTop, lyricsPageProgress);
-                        y = (int) lerp(y, top + dp(20), lyricsPageProgress);
-                        rad = lerp(rad, 1f, lyricsPageProgress);
+                        final int lyricsTop = getLyricsContentTop() - backgroundPaddingTop;
+                        if (scrollOffsetY == Integer.MAX_VALUE) {
+                            // Opened straight into Lyrics: the playlist sheet never resolved, so
+                            // there is no top to morph from. Interpolating from the sentinel used
+                            // to produce a garbage bound (float precision at 2^31) and the sheet
+                            // background was simply not painted, exposing the dim behind it.
+                            top = lyricsTop;
+                            y = top + dp(20);
+                            rad = 1f;
+                        } else {
+                            // The sheet edge morphs between the playlist geometry and the canonical
+                            // lyrics geometry so both pages stay inside one shell while swiping.
+                            top = (int) lerp(top, lyricsTop, lyricsPageProgress);
+                            y = (int) lerp(y, top + dp(20), lyricsPageProgress);
+                            rad = lerp(rad, 1f, lyricsPageProgress);
+                        }
                     }
 
                     shadowDrawable.setBounds(0, top, getMeasuredWidth(), height);
@@ -1654,6 +1665,20 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         updateEmptyView();
     }
 
+    /**
+     * The visible sheet height. BottomSheet uses this as the entrance and exit translation, so it
+     * has to describe the surface that is actually on screen.
+     *
+     * <p>In Lyrics mode it did not. updateLayout() early-returns while lyrics chrome is active, so
+     * when the player opened straight into Lyrics - saved mode Lyrics with the lyrics already
+     * cached, which resolves inside the constructor - scrollOffsetY was still Integer.MAX_VALUE and
+     * this returned {@code container.getMeasuredHeight() - Integer.MAX_VALUE}, about -2^31.
+     * startOpenAnimation() then set that as the starting translationY, throwing the sheet roughly
+     * 2^31px above the screen and animating it back to 0: for almost the whole animation nothing of
+     * the sheet was on screen and only BottomSheet's SheetBackDrawable (0xFF000000) was visible -
+     * the black frame - after which the player snapped into place with no perceptible rise.
+     * dismiss() animates back to the same value, which is why closing jumped instead of sliding.
+     */
     @Override
     public int getContainerViewHeight() {
         if (playerLayout == null) {
@@ -1661,6 +1686,10 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         }
         if (playlist.size() <= 1) {
             return playerLayout.getMeasuredHeight() + backgroundPaddingTop;
+        } else if (isLyricsChromeActive() || scrollOffsetY == Integer.MAX_VALUE) {
+            // The sheet is the Lyrics shell, whose top is deterministic and does not come from the
+            // playlist scroll at all.
+            return container.getMeasuredHeight() - getLyricsContentTop();
         } else {
             int offset = dp(13);
             int top = scrollOffsetY - backgroundPaddingTop - offset;
@@ -2015,6 +2044,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
     public void didReceivedNotification(int id, int account, Object... args) {
         if (id == NotificationCenter.messagePlayingDidStart || id == NotificationCenter.messagePlayingPlayStateChanged || id == NotificationCenter.messagePlayingDidReset) {
             updateTitle(id == NotificationCenter.messagePlayingDidReset && (Boolean) args[1]);
+            if (id == NotificationCenter.messagePlayingPlayStateChanged) updateLyricsFollow(true);
             if (id == NotificationCenter.messagePlayingDidReset || id == NotificationCenter.messagePlayingPlayStateChanged) {
                 int count = listView.getChildCount();
                 for (int a = 0; a < count; a++) {
@@ -2133,7 +2163,12 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         if (dismissing) return;
         if (isLyricsChromeActive()) {
             // The playlist is off-screen; its scroll offset must not drive the lyrics geometry,
-            // the action bar fade, or the profile header position.
+            // the action bar fade, or the profile header position. It must still be resolved once,
+            // though: the sheet background is drawn from it, and leaving it at its sentinel is what
+            // left the shell unpainted when the player opened directly into Lyrics.
+            if (scrollOffsetY == Integer.MAX_VALUE) {
+                listView.setTopGlowOffset(scrollOffsetY = listView.getPaddingTop());
+            }
             updateLyricsGeometry();
             updateLightStatusBar();
             containerView.invalidate();
@@ -2571,8 +2606,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 break;
             }
         }
-        if (oldRow != RecyclerView.NO_POSITION) lyricsAdapter.notifyItemChanged(oldRow);
-        if (activeLyricsRow != RecyclerView.NO_POSITION) lyricsAdapter.notifyItemChanged(activeLyricsRow);
+        // No notifyItemChanged here: the timestamp changes the LOGICAL active line only. The
+        // visual transition is already in flight from the pre-roll and owns the presentation.
     }
 
     private void setShowingLyrics(boolean show, boolean animated) {
@@ -3124,16 +3159,35 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
 
     private ValueAnimator lyricsFollowAnimator;
     private int lyricsFollowRow = RecyclerView.NO_POSITION;
+    // Visual transition state. Deliberately separate from activeLyricsLine/activeLyricsRow, which
+    // stay the LOGICAL state and still change exactly at the real timestamp.
+    private int lyricsEmphasisFromRow = RecyclerView.NO_POSITION;
+    private int lyricsEmphasisToRow = RecyclerView.NO_POSITION;
+    private float lyricsEmphasisProgress = 1f;
     private final Runnable advanceLyricsFollow = () -> updateLyricsFollow(true);
 
     private void cancelLyricsFollow() {
         AndroidUtilities.cancelRunOnUIThread(advanceLyricsFollow);
-        if (lyricsFollowAnimator != null) {
-            final ValueAnimator animator = lyricsFollowAnimator;
-            lyricsFollowAnimator = null;
-            animator.cancel();
-        }
+        cancelLyricsFollowAnimator();
         lyricsFollowRow = RecyclerView.NO_POSITION;
+        // Never leave a line half-emphasised behind a cancelled transition: resolve onto whatever
+        // the logical state says is active right now.
+        setLyricsEmphasis(RecyclerView.NO_POSITION, activeLyricsRow, 1f);
+    }
+
+    private void setLyricsEmphasis(int fromRow, int toRow, float progress) {
+        lyricsEmphasisFromRow = fromRow;
+        lyricsEmphasisToRow = toRow;
+        lyricsEmphasisProgress = progress;
+        updateLyricsDepth();
+    }
+
+    /** 0 = fully inactive, 1 = fully active, blended while a transition is in flight. */
+    private float lyricsEmphasisOf(int row) {
+        if (row == RecyclerView.NO_POSITION) return 0f;
+        if (row == lyricsEmphasisToRow) return lyricsEmphasisProgress;
+        if (row == lyricsEmphasisFromRow) return 1f - lyricsEmphasisProgress;
+        return 0f;
     }
 
     /**
@@ -3153,7 +3207,15 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         final int line = currentLyrics.lineAt(position);
         int targetRow = rowForLyricsLine(line);
         long duration = 0;
-        if (!MediaController.getInstance().isMessagePaused() && line + 1 < currentLyrics.lines.size()) {
+        final boolean paused = MediaController.getInstance().isMessagePaused();
+        if (paused && lyricsFollowAnimator != null && lyricsFollowRow != targetRow) {
+            // Paused inside a pre-roll: stop short of the next line and hand the emphasis back to
+            // the line whose timestamp has actually passed.
+            cancelLyricsFollowAnimator();
+            lyricsFollowRow = targetRow;
+            setLyricsEmphasis(RecyclerView.NO_POSITION, targetRow, 1f);
+        }
+        if (!paused && line + 1 < currentLyrics.lines.size()) {
             final long nextTime = currentLyrics.lines.get(line + 1).timeMs;
             final long previousTime = line < 0 ? 0 : currentLyrics.lines.get(line).timeMs;
             final long untilNext = nextTime - position;
@@ -3196,7 +3258,9 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             cancelLyricsFollowAnimator();
             lyricsLayoutManager.scrollToPositionWithOffset(row, Math.max(0, getLyricsFocusCenter() - dp(32)));
             lyricsFollowRow = row;
-            updateLyricsDepth();
+            // Resolve emphasis onto the destination too, so a long seek cannot leave the previous
+            // line emphasised or bold a row that is no longer current.
+            setLyricsEmphasis(RecyclerView.NO_POSITION, row, 1f);
             return;
         }
         // scrollBy() takes the opposite sign convention: positive dy moves content up.
@@ -3205,13 +3269,17 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             cancelLyricsFollowAnimator();
             lyricsListView.scrollBy(0, distance);
             lyricsFollowRow = row;
-            updateLyricsDepth();
+            setLyricsEmphasis(RecyclerView.NO_POSITION, row, 1f);
             return;
         }
         // updateLyricsFollow() runs on every progress tick, so a move already easing toward this
         // row must be left alone. Restarting it per tick is exactly what made the old
         // implementation stutter: each restart reset the interpolator and the velocity.
         if (lyricsFollowRow == row && (lyricsFollowAnimator != null || Math.abs(distance) <= dp(1))) {
+            return;
+        }
+        if (distance == 0 && lyricsEmphasisToRow == row && lyricsEmphasisProgress >= 1f) {
+            lyricsFollowRow = row;
             return;
         }
         long duration = preferredDuration;
@@ -3222,18 +3290,40 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         duration = Math.max(LYRIC_FOLLOW_MIN_MS, Math.min(LYRIC_FOLLOW_MAX_MS, duration));
         lyricsFollowRow = row;
         cancelLyricsFollowAnimator();
+        // The incoming row's emphasis and the movement share this one clock, so the line gains
+        // prominence while it rises instead of popping into bold once the scroll has finished.
+        // Re-targeting the SAME row - a fullscreen expand/collapse, a viewport resize - only moves
+        // the surface; restarting the emphasis there would un-bold and re-bold the current line.
+        final boolean advancing = lyricsEmphasisToRow != row;
+        if (advancing) {
+            lyricsEmphasisFromRow = lyricsEmphasisToRow;
+            lyricsEmphasisToRow = row;
+            lyricsEmphasisProgress = 0f;
+        }
         final int[] applied = {0};
         final ValueAnimator animator = ValueAnimator.ofFloat(0f, 1f);
         animator.addUpdateListener(a -> {
             if (lyricsFollowAnimator != a) return;
-            final int step = Math.round(distance * (float) a.getAnimatedValue());
-            lyricsListView.scrollBy(0, step - applied[0]);
+            final float fraction = (float) a.getAnimatedValue();
+            final int step = Math.round(distance * fraction);
+            final int delta = step - applied[0];
             applied[0] = step;
+            if (advancing) lyricsEmphasisProgress = fraction;
+            if (delta != 0) {
+                lyricsListView.scrollBy(0, delta); // onScrolled repaints the emphasis
+            } else if (advancing) {
+                updateLyricsDepth();
+            }
         });
         animator.addListener(new AnimatorListenerAdapter() {
             @Override public void onAnimationEnd(Animator animation) {
                 if (lyricsFollowAnimator != animation) return;
                 lyricsFollowAnimator = null;
+                if (advancing) {
+                    lyricsEmphasisProgress = 1f;
+                    lyricsEmphasisFromRow = RecyclerView.NO_POSITION;
+                    updateLyricsDepth();
+                }
             }
         });
         animator.setDuration(duration);
@@ -3266,16 +3356,28 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             child.setScaleY(1f);
             return;
         }
-        RecyclerView.ViewHolder holder = lyricsListView.getChildViewHolder(child);
-        int row = holder.getAdapterPosition();
-        boolean active = row == activeLyricsRow;
-        float center = getLyricsFocusCenter();
-        float distance = Math.abs((child.getTop() + child.getBottom()) / 2f - center) / Math.max(1f, center);
-        float depth = Math.min(1f, distance);
-        child.setAlpha(active ? 1f : 0.86f - depth * .42f);
-        float scale = active ? 1f : 0.985f - depth * .025f;
+        final RecyclerView.ViewHolder holder = lyricsListView.findContainingViewHolder(child);
+        final int row = holder == null ? RecyclerView.NO_POSITION : holder.getAdapterPosition();
+        // Emphasis is a continuous value driven by the same clock as the movement, applied straight
+        // to the attached view. Nothing is rebound, so the style can never pop after the scroll.
+        final float emphasis = lyricsEmphasisOf(row);
+        final float center = getLyricsFocusCenter();
+        final float distance = Math.abs((child.getTop() + child.getBottom()) / 2f - center) / Math.max(1f, center);
+        final float depth = Math.min(1f, distance);
+        final float restAlpha = 0.86f - depth * .42f;
+        final float restScale = 0.985f - depth * .025f;
+        child.setAlpha(lerp(restAlpha, 1f, emphasis));
+        final float scale = lerp(restScale, 1f, emphasis);
         child.setScaleX(scale);
         child.setScaleY(scale);
+        if (child instanceof TextView) {
+            final TextView textView = (TextView) child;
+            textView.setTextColor(ColorUtils.blendARGB(getThemedColor(Theme.key_player_time), getThemedColor(Theme.key_player_actionBarTitle), emphasis));
+            // Weight cannot interpolate, so it crosses over mid-transition where colour, alpha and
+            // scale have already carried most of the change and the switch is not perceptible.
+            final Typeface typeface = emphasis >= 0.5f ? AndroidUtilities.bold() : Typeface.DEFAULT;
+            if (textView.getTypeface() != typeface) textView.setTypeface(typeface);
+        }
     }
 
     /** Inset of the expand control (40dp target + 4dp) reserved at the top of the normal viewport. */
@@ -3558,7 +3660,6 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             TextView textView = (TextView) holder.itemView;
             int line = visibleLyrics.get(position);
             final boolean synced = currentLyrics.isSynced();
-            boolean active = synced && line == activeLyricsLine;
             textView.setText(currentLyrics.lines.get(line).text);
             boolean stanzaSpace = !synced && TextUtils.isEmpty(currentLyrics.lines.get(line).text);
             // Identical viewport, typography, sizes, spacing and margins for timed and untimed
@@ -3566,11 +3667,18 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             textView.setMinHeight(dp(stanzaSpace ? 24 : 56));
             textView.setPadding(dp(24), dp(stanzaSpace ? 0 : 12), dp(24), dp(stanzaSpace ? 0 : 12));
             textView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16);
-            textView.setTypeface(active ? AndroidUtilities.bold() : Typeface.DEFAULT);
-            textView.setTextColor(getThemedColor(active || !synced ? Theme.key_player_actionBarTitle : Theme.key_player_time));
-            textView.setAlpha(active || !synced ? 1f : .65f);
-            textView.setScaleX(active || !synced ? 1f : .97f);
-            textView.setScaleY(active || !synced ? 1f : .97f);
+            // Timed rows get their emphasis from applyLyricsDepth(), which runs on attach and on
+            // every frame of the transition; binding it here as well would reintroduce the pop.
+            if (synced) {
+                textView.setTypeface(Typeface.DEFAULT);
+                textView.setTextColor(getThemedColor(Theme.key_player_time));
+            } else {
+                textView.setTypeface(Typeface.DEFAULT);
+                textView.setTextColor(getThemedColor(Theme.key_player_actionBarTitle));
+                textView.setAlpha(1f);
+                textView.setScaleX(1f);
+                textView.setScaleY(1f);
+            }
             textView.setBackground(stanzaSpace || !synced ? null : Theme.createSelectorDrawable(getThemedColor(Theme.key_listSelector), 2));
         }
     }
