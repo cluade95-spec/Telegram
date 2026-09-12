@@ -353,6 +353,9 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                     }
                     lastMeasturedWidth = w;
                     lastMeasturedHeight = totalHeight;
+                    if (fullscreenLyrics) post(() -> {
+                        if (fullscreenLyrics) applyFullscreenPlayerLayout(true);
+                    });
                 }
                 ignoreLayout = true;
                 playerLayout.setVisibility(searchWas || keyboardVisible ? INVISIBLE : VISIBLE);
@@ -2440,16 +2443,18 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         lyricsFullscreenButton.setContentDescription(getString(fullscreen ? R.string.AccExitFullscreen : R.string.AccSwitchToFullscreen));
         actionBar.animate().cancel();
         actionBarBackground.animate().cancel();
+        actionBarShadow.animate().cancel();
         if (fullscreen) {
             preFullscreenActionBarAlpha = actionBar.getAlpha();
             preFullscreenActionBarBackgroundAlpha = actionBarBackground.getAlpha();
             preFullscreenActionBarShadowAlpha = actionBarShadow.getAlpha();
             preFullscreenActionBarSlide = actionBarSlide;
         }
-        actionBarSlideProperty.set(actionBar, fullscreen ? 1f : preFullscreenActionBarSlide);
+        if (isProfilePlaylist) actionBarSlideProperty.set(actionBar, fullscreen ? 1f : preFullscreenActionBarSlide);
         actionBar.animate().alpha(fullscreen ? 1f : preFullscreenActionBarAlpha).setDuration(220).setInterpolator(CubicBezierInterpolator.EASE_OUT_QUINT).start();
         actionBarBackground.animate().alpha(fullscreen ? 1f : preFullscreenActionBarBackgroundAlpha).setDuration(220).setInterpolator(CubicBezierInterpolator.EASE_OUT_QUINT).start();
         actionBarShadow.animate().alpha(fullscreen ? 1f : preFullscreenActionBarShadowAlpha).setDuration(220).setInterpolator(CubicBezierInterpolator.EASE_OUT_QUINT).start();
+        setAllowNestedScroll(!fullscreen);
         applyFullscreenPlayerLayout(fullscreen);
         updateLyricsGeometry();
         if (activeLyricsRow != RecyclerView.NO_POSITION) centerLyricsRow(activeLyricsRow, true);
@@ -2459,9 +2464,19 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
     private float preFullscreenActionBarBackgroundAlpha;
     private float preFullscreenActionBarShadowAlpha;
     private float preFullscreenActionBarSlide;
+    private int preFullscreenSaveVisibility;
+    private int preFullscreenUnsaveVisibility;
+    private boolean fullscreenPlayerLayoutApplied;
+    private int fullscreenArtworkSize = 104;
 
     private void applyFullscreenPlayerLayout(boolean fullscreen) {
+        boolean animateArtwork = fullscreen != fullscreenPlayerLayoutApplied;
         int height = getPlayerHeight();
+        int fullscreenBaseHeight = height;
+        boolean compactFullscreen = fullscreen && fullscreenBaseHeight < 250;
+        int artworkSize = fullscreen ? (compactFullscreen ? 72 : 104) : 44;
+        int oldArtworkSize = animateArtwork ? (fullscreen ? 44 : fullscreenArtworkSize) : artworkSize;
+        if (fullscreen) fullscreenArtworkSize = artworkSize;
         FrameLayout.LayoutParams playerParams = (FrameLayout.LayoutParams) playerLayout.getLayoutParams();
         playerParams.height = dp(height);
         playerLayout.setLayoutParams(playerParams);
@@ -2471,23 +2486,39 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         FrameLayout.LayoutParams lyricsParams = (FrameLayout.LayoutParams) lyricsListView.getLayoutParams();
         lyricsParams.bottomMargin = dp(height);
         lyricsListView.setLayoutParams(lyricsParams);
+        if (fullscreen && !fullscreenPlayerLayoutApplied) {
+            preFullscreenSaveVisibility = saveToProfileButton.getVisibility();
+            preFullscreenUnsaveVisibility = unsaveFromProfileButton.getVisibility();
+            saveToProfileButton.setVisibility(View.GONE);
+            unsaveFromProfileButton.setVisibility(View.GONE);
+        } else {
+            if (!fullscreen) {
+                saveToProfileButton.setVisibility(preFullscreenSaveVisibility);
+                unsaveFromProfileButton.setVisibility(preFullscreenUnsaveVisibility);
+            }
+        }
+        fullscreenPlayerLayoutApplied = fullscreen;
 
-        setFrame(coverContainer, fullscreen ? 104 : 44, fullscreen ? 104 : 44, Gravity.TOP | (fullscreen ? Gravity.START : Gravity.END), 20, 20, 20, 0);
-        float titleStart = fullscreen ? 144 : 20;
-        float authorStart = fullscreen ? 138 : 14;
-        setFrame(titleTextView, LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, Gravity.TOP | Gravity.START, LocaleController.isRTL ? 20 : titleStart, fullscreen ? 26 : 20, LocaleController.isRTL ? titleStart : 20, 0);
-        setFrame(authorTextView, LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, Gravity.TOP | Gravity.START, LocaleController.isRTL ? 20 : authorStart, fullscreen ? 55 : 47, LocaleController.isRTL ? authorStart : 20, 0);
-        setFrame(seekBarView, LayoutHelper.MATCH_PARENT, 44, Gravity.TOP | Gravity.LEFT, 5, fullscreen ? 128 : 67, 5, 0);
-        setFrame(progressView, LayoutHelper.MATCH_PARENT, 2, Gravity.TOP | Gravity.LEFT, 21, fullscreen ? 151 : 90, 21, 0);
-        setFrame(timeTextView, 100, LayoutHelper.WRAP_CONTENT, Gravity.TOP | Gravity.LEFT, 20, fullscreen ? 159 : 98, 0, 0);
-        setFrame(durationTextView, LayoutHelper.WRAP_CONTENT, LayoutHelper.WRAP_CONTENT, Gravity.TOP | Gravity.RIGHT, 0, fullscreen ? 157 : 96, 20, 0);
-        setFrame(playbackSpeedButton, 36, 36, Gravity.TOP | Gravity.RIGHT, 0, fullscreen ? 148 : 86, 20, 0);
-        setFrame(playbackControlsView, LayoutHelper.MATCH_PARENT, 66, Gravity.TOP | Gravity.LEFT, 0, fullscreen ? 184 : 111, 0, 0);
-        coverContainer.setPivotX(coverContainer.getWidth());
-        coverContainer.setPivotY(coverContainer.getHeight());
-        coverContainer.setScaleX(fullscreen ? .72f : 1.25f);
-        coverContainer.setScaleY(fullscreen ? .72f : 1.25f);
-        coverContainer.animate().scaleX(1f).scaleY(1f).setDuration(320).setInterpolator(CubicBezierInterpolator.EASE_OUT_QUINT).start();
+        int artTop = compactFullscreen ? 12 : 20;
+        setFrame(coverContainer, artworkSize, artworkSize, Gravity.TOP | (fullscreen ? Gravity.START : Gravity.END), 20, artTop, 20, 0);
+        float titleStart = fullscreen ? (compactFullscreen ? 108 : 144) : 20;
+        float authorStart = fullscreen ? (compactFullscreen ? 102 : 138) : 14;
+        setFrame(titleTextView, LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, Gravity.TOP | Gravity.START, LocaleController.isRTL ? 20 : titleStart, fullscreen ? (compactFullscreen ? 18 : 26) : 20, LocaleController.isRTL ? titleStart : 20, 0);
+        setFrame(authorTextView, LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, Gravity.TOP | Gravity.START, LocaleController.isRTL ? 20 : authorStart, fullscreen ? (compactFullscreen ? 45 : 55) : 47, LocaleController.isRTL ? authorStart : 20, 0);
+        setFrame(seekBarView, LayoutHelper.MATCH_PARENT, 44, Gravity.TOP | Gravity.LEFT, 5, fullscreen ? (compactFullscreen ? 84 : 128) : 67, 5, 0);
+        setFrame(progressView, LayoutHelper.MATCH_PARENT, 2, Gravity.TOP | Gravity.LEFT, 21, fullscreen ? (compactFullscreen ? 107 : 151) : 90, 21, 0);
+        setFrame(timeTextView, 100, LayoutHelper.WRAP_CONTENT, Gravity.TOP | Gravity.LEFT, 20, fullscreen ? (compactFullscreen ? 115 : 159) : 98, 0, 0);
+        setFrame(durationTextView, LayoutHelper.WRAP_CONTENT, LayoutHelper.WRAP_CONTENT, Gravity.TOP | Gravity.RIGHT, 0, fullscreen ? (compactFullscreen ? 113 : 157) : 96, 20, 0);
+        setFrame(playbackSpeedButton, 36, 36, Gravity.TOP | Gravity.RIGHT, 0, fullscreen ? (compactFullscreen ? 104 : 148) : 86, 20, 0);
+        setFrame(playbackControlsView, LayoutHelper.MATCH_PARENT, 66, Gravity.TOP | Gravity.LEFT, 0, fullscreen ? (compactFullscreen ? 139 : 184) : 111, 0, 0);
+        coverContainer.setPivotX((fullscreen ? LocaleController.isRTL : !LocaleController.isRTL) ? dp(artworkSize) : 0);
+        coverContainer.setPivotY(0);
+        float artworkScale = oldArtworkSize / (float) artworkSize;
+        coverContainer.setScaleX(artworkScale);
+        coverContainer.setScaleY(artworkScale);
+        if (animateArtwork) {
+            coverContainer.animate().scaleX(1f).scaleY(1f).setDuration(320).setInterpolator(CubicBezierInterpolator.EASE_OUT_QUINT).start();
+        }
         containerView.invalidate();
     }
 
@@ -2496,7 +2527,11 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
     }
 
     private int getPlayerHeight() {
-        return (fullscreenLyrics ? 276 : 179) + (!isMyList() && !noforwards ? 52 : 0);
+        if (fullscreenLyrics) {
+            int available = containerView == null || containerView.getHeight() == 0 ? dp(276) : containerView.getHeight() - ActionBar.getCurrentActionBarHeight() - AndroidUtilities.statusBarHeight - dp(120);
+            return Math.max(210, Math.min(276, Math.round(available / AndroidUtilities.density)));
+        }
+        return 179 + (!isMyList() && !noforwards ? 52 : 0);
     }
 
     private void centerLyricsRow(int row, boolean animated) {
@@ -2791,7 +2826,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
 
         @Override
         public boolean isEnabled(RecyclerView.ViewHolder holder) {
-            return true;
+            int position = holder.getAdapterPosition();
+            return position >= 0 && position < visibleLyrics.size() && !TextUtils.isEmpty(currentLyrics.lines.get(visibleLyrics.get(position)).text);
         }
 
         @Override
@@ -2826,7 +2862,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             textView.setAlpha(active ? 1f : .65f);
             textView.setScaleX(active ? 1f : .97f);
             textView.setScaleY(active ? 1f : .97f);
-            textView.setBackground(Theme.createSelectorDrawable(getThemedColor(Theme.key_listSelector), 2));
+            textView.setBackground(stanzaSpace ? null : Theme.createSelectorDrawable(getThemedColor(Theme.key_listSelector), 2));
         }
     }
 
@@ -3342,6 +3378,10 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             o.dismiss();
             dismiss();
             parentActivity.presentFragment(new SyncedLyricsEditorFragment(messageObject));
+        });
+        o.addIf(lyricsController.canRestoreEmbedded(messageObject), R.drawable.msg_retry, getString(R.string.RestoreEmbeddedLyrics), () -> {
+            o.dismiss();
+            lyricsController.restoreEmbedded(messageObject, success -> updateLyrics(true));
         });
         if (castAvailable) {
             castItem = o.add();

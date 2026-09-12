@@ -7,6 +7,7 @@ package org.telegram.messenger;
 import android.text.TextUtils;
 
 import org.telegram.tgnet.TLRPC;
+import org.telegram.messenger.audioinfo.AudioInfo;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
@@ -22,21 +23,27 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /** Local, client-only storage and parsing for synced LRC and plain music lyrics. */
-public final class SyncedLyricsController {
+public final class SyncedLyricsController implements NotificationCenter.NotificationCenterDelegate {
     private static final Pattern TIMESTAMP = Pattern.compile("\\[(\\d{1,3}):(\\d{1,2})(?:[\\.:](\\d{1,3}))?\\]");
     private static final Pattern OFFSET = Pattern.compile("(?i)\\[offset\\s*:\\s*([+-]?\\d+)\\s*\\]");
     private static final Pattern WORD_TIMESTAMP = Pattern.compile("<\\d{1,3}:\\d{1,2}(?:[\\.:]\\d{1,3})?>");
-    private static final Pattern METADATA = Pattern.compile("(?i)^\\[(?:ar|al|ti|au|by|re|ve|length|offset)\\s*:.*]$");
+    private static final Pattern METADATA = Pattern.compile("(?i)^\\[[a-z][a-z0-9_-]{0,31}\\s*:.*]$");
     private static final Pattern LOOKS_TIMED = Pattern.compile("^\\s*(?:\\[\\d{1,3}:|<\\d{1,3}:).*");
     private static final SyncedLyricsController[] instances = new SyncedLyricsController[UserConfig.MAX_ACCOUNT_COUNT];
-    private static final Lyrics EMPTY = new Lyrics(Collections.emptyList(), "", Kind.MISSING);
+    private static final int MAX_EMBEDDED_LYRICS_LENGTH = 1024 * 1024;
+    private static final int MAX_EMBEDDED_LYRICS_LINES = 10000;
+    private static final Lyrics EMPTY = new Lyrics(Collections.emptyList(), "", Kind.MISSING, Source.NONE);
 
     public enum Kind {
         MISSING, SYNCED, PLAIN, MALFORMED
     }
 
+    public enum Source {
+        NONE, LOCAL, EMBEDDED
+    }
+
     public enum State {
-        NOT_LOADED, LOADING, LOADED, MISSING, MALFORMED, READ_FAILED, WRITE_FAILED
+        NOT_LOADED, LOADING, WAITING_FILE, LOADED, MISSING, MALFORMED, READ_FAILED, WRITE_FAILED
     }
 
     public interface Completion {
@@ -46,6 +53,10 @@ public final class SyncedLyricsController {
     private static final class Entry {
         State state;
         Lyrics lyrics;
+        Lyrics embeddedLyrics = EMPTY;
+        boolean embeddedChecked;
+        boolean suppressed;
+        MessageObject message;
         int generation;
 
         Entry(State state, Lyrics lyrics, int generation) {
@@ -80,15 +91,25 @@ public final class SyncedLyricsController {
         public final ArrayList<Line> lines;
         public final String source;
         public final Kind kind;
+        public final Source origin;
 
-        private Lyrics(java.util.List<Line> lines, String source, Kind kind) {
+        private Lyrics(java.util.List<Line> lines, String source, Kind kind, Source origin) {
             this.lines = new ArrayList<>(lines);
             this.source = source;
             this.kind = kind;
+            this.origin = origin;
         }
 
         public boolean isSynced() {
-            return kind == Kind.SYNCED;
+            return hasTimedLines();
+        }
+
+        public boolean hasTimedLines() {
+            return !lines.isEmpty() && lines.get(0).timed;
+        }
+
+        private Lyrics withOrigin(Source origin) {
+            return new Lyrics(lines, source, kind, origin);
         }
 
         public int lineAt(long positionMs) {
@@ -123,6 +144,7 @@ public final class SyncedLyricsController {
 
     private SyncedLyricsController(int account) {
         this.account = account;
+        NotificationCenter.getInstance(account).addObserver(this, NotificationCenter.fileLoaded);
     }
 
     public boolean isLyricsModePreferred() {
@@ -138,6 +160,7 @@ public final class SyncedLyricsController {
         ArrayList<ParsedLine> parsed = new ArrayList<>();
         boolean hasMalformedTiming = false;
         boolean hasUntimedContent = false;
+        boolean hasTimingSyntax = false;
         String[] sourceLines = source.replace("\r\n", "\n").replace('\r', '\n').split("\n", -1);
         long offset = 0;
         for (String sourceLine : sourceLines) {
@@ -177,8 +200,8 @@ public final class SyncedLyricsController {
         for (String sourceLine : sourceLines) {
             String text = sourceLine.trim();
             if (text.isEmpty() || METADATA.matcher(text).matches()) continue;
-            Matcher timestamp = TIMESTAMP.matcher(sourceLine);
-            boolean validTimedLine = timestamp.find() && timestamp.start() == 0;
+            hasTimingSyntax |= LOOKS_TIMED.matcher(sourceLine).matches();
+            boolean validTimedLine = hasValidLeadingTimestamp(sourceLine);
             if (!validTimedLine) {
                 hasUntimedContent = true;
                 hasMalformedTiming |= LOOKS_TIMED.matcher(sourceLine).matches();
@@ -203,10 +226,10 @@ public final class SyncedLyricsController {
             i = j;
         }
         if (!result.isEmpty() && !hasUntimedContent) {
-            return new Lyrics(result, source, Kind.SYNCED);
+            return new Lyrics(result, source, Kind.SYNCED, Source.NONE);
         }
-        if (!result.isEmpty() || hasMalformedTiming) {
-            return new Lyrics(Collections.emptyList(), source, Kind.MALFORMED);
+        if (!result.isEmpty() || hasMalformedTiming || hasTimingSyntax) {
+            return new Lyrics(result, source, Kind.MALFORMED, Source.NONE);
         }
         ArrayList<Line> plain = new ArrayList<>();
         boolean pendingBlank = false;
@@ -221,7 +244,7 @@ public final class SyncedLyricsController {
             plain.add(new Line(-1, text, false));
             pendingBlank = false;
         }
-        return plain.isEmpty() ? new Lyrics(Collections.emptyList(), source, Kind.MISSING) : new Lyrics(plain, source, Kind.PLAIN);
+        return plain.isEmpty() ? new Lyrics(Collections.emptyList(), source, Kind.MISSING, Source.NONE) : new Lyrics(plain, source, Kind.PLAIN, Source.NONE);
     }
 
     private static final class ParsedLine {
@@ -233,6 +256,16 @@ public final class SyncedLyricsController {
             this.timeMs = timeMs;
             this.text = text;
             this.order = order;
+        }
+    }
+
+    private static boolean hasValidLeadingTimestamp(String sourceLine) {
+        Matcher timestamp = TIMESTAMP.matcher(sourceLine);
+        if (!timestamp.find() || !TextUtils.isEmpty(sourceLine.substring(0, timestamp.start()).trim())) return false;
+        try {
+            return Long.parseLong(timestamp.group(2)) < 60;
+        } catch (RuntimeException ignore) {
+            return false;
         }
     }
 
@@ -251,12 +284,12 @@ public final class SyncedLyricsController {
         synchronized (cache) {
             Entry entry = cache.get(key);
             if (entry != null) {
-                if (entry.state == State.NOT_LOADED) startLoading(key, entry);
+                if (entry.state == State.NOT_LOADED) startLoading(key, message, entry);
                 return entry.lyrics;
             }
             entry = new Entry(State.LOADING, EMPTY, 0);
             cache.put(key, entry);
-            startLoading(key, entry);
+            startLoading(key, message, entry);
         }
         return EMPTY;
     }
@@ -268,35 +301,65 @@ public final class SyncedLyricsController {
             Entry entry = cache.get(key);
             if (entry != null && entry.state == State.READ_FAILED) {
                 entry.state = State.NOT_LOADED;
-                startLoading(key, entry);
+                startLoading(key, message, entry);
             }
         }
     }
 
-    private void startLoading(String key, Entry entry) {
+    private void startLoading(String key, MessageObject message, Entry entry) {
         if (entry.state == State.LOADING && entry.generation != 0) return;
         entry.state = State.LOADING;
+        entry.message = message;
         final int generation = ++entry.generation;
         Utilities.globalQueue.postRunnable(() -> {
             Lyrics lyrics = EMPTY;
+            Lyrics embeddedLyrics = EMPTY;
+            boolean embeddedChecked = false;
+            boolean suppressed = false;
             State state = State.MISSING;
             try {
-                File file = file(key);
-                if (file.exists()) {
-                    lyrics = read(file);
+                File local = file(key);
+                suppressed = suppressionFile(key).exists();
+                if (local.exists()) {
+                    lyrics = read(local).withOrigin(Source.LOCAL);
                     state = lyrics.kind == Kind.MALFORMED ? State.MALFORMED : lyrics.lines.isEmpty() ? State.MISSING : State.LOADED;
+                    File media = mediaFile(message);
+                    if (isMediaReady(message, media)) {
+                        embeddedLyrics = extractEmbedded(media);
+                        embeddedChecked = true;
+                    }
+                } else {
+                    File media = mediaFile(message);
+                    if (!isMediaReady(message, media)) {
+                        state = State.WAITING_FILE;
+                    } else {
+                        Lyrics embedded = extractEmbedded(media);
+                        embeddedLyrics = embedded;
+                        embeddedChecked = true;
+                        if (!suppressed) {
+                            lyrics = embedded;
+                            state = embedded.kind == Kind.MALFORMED ? State.MALFORMED : embedded.lines.isEmpty() ? State.MISSING : State.LOADED;
+                        }
+                        if (suppressed) state = State.MISSING;
+                    }
                 }
             } catch (Exception e) {
                 FileLog.e(e);
                 state = State.READ_FAILED;
             }
             final Lyrics loadedLyrics = lyrics;
+            final Lyrics loadedEmbeddedLyrics = embeddedLyrics;
+            final boolean didCheckEmbedded = embeddedChecked;
+            final boolean isSuppressed = suppressed;
             final State loadedState = state;
             AndroidUtilities.runOnUIThread(() -> {
                 synchronized (cache) {
                     Entry current = cache.get(key);
                     if (current == null || current.generation != generation) return;
                     current.lyrics = loadedLyrics;
+                    current.embeddedLyrics = loadedEmbeddedLyrics;
+                    current.embeddedChecked = didCheckEmbedded;
+                    current.suppressed = isSuppressed;
                     current.state = loadedState;
                 }
                 notifyChanged(key);
@@ -304,8 +367,67 @@ public final class SyncedLyricsController {
         });
     }
 
+    @Override
+    public void didReceivedNotification(int id, int account, Object... args) {
+        if (id != NotificationCenter.fileLoaded || args.length == 0) return;
+        String loadedName = (String) args[0];
+        ArrayList<MessageObject> retry = new ArrayList<>();
+        synchronized (cache) {
+            for (Entry entry : cache.values()) {
+                if ((entry.state == State.WAITING_FILE || entry.lyrics.origin == Source.EMBEDDED || entry.lyrics.origin == Source.LOCAL && !entry.embeddedChecked) && entry.message != null && TextUtils.equals(entry.message.getFileName(), loadedName)) {
+                    entry.state = State.WAITING_FILE;
+                    retry.add(entry.message);
+                }
+            }
+        }
+        for (MessageObject message : retry) retryEmbeddedIfFileAvailable(message);
+    }
+
     public boolean hasLyrics(MessageObject message) {
         return !getLyrics(message).lines.isEmpty();
+    }
+
+    public boolean isEmbedded(MessageObject message) {
+        return getLyrics(message).origin == Source.EMBEDDED;
+    }
+
+    public boolean canRestoreEmbedded(MessageObject message) {
+        String key = key(message);
+        if (key == null) return false;
+        synchronized (cache) {
+            Entry entry = cache.get(key);
+            return entry != null && entry.suppressed && entry.embeddedChecked && !entry.embeddedLyrics.lines.isEmpty();
+        }
+    }
+
+    public boolean hasEmbeddedLyrics(MessageObject message) {
+        String key = key(message);
+        if (key == null) return false;
+        synchronized (cache) {
+            Entry entry = cache.get(key);
+            return entry != null && entry.embeddedChecked && !entry.embeddedLyrics.lines.isEmpty();
+        }
+    }
+
+    public boolean isEmbeddedSuppressed(MessageObject message) {
+        String key = key(message);
+        if (key == null) return false;
+        synchronized (cache) {
+            Entry entry = cache.get(key);
+            return entry != null && entry.suppressed;
+        }
+    }
+
+    public void retryEmbeddedIfFileAvailable(MessageObject message) {
+        String key = key(message);
+        if (key == null) return;
+        synchronized (cache) {
+            Entry entry = cache.get(key);
+            if (entry != null && entry.state == State.WAITING_FILE) {
+                entry.state = State.NOT_LOADED;
+                startLoading(key, message, entry);
+            }
+        }
     }
 
     public void save(MessageObject message, String source, Completion completion) {
@@ -336,6 +458,7 @@ public final class SyncedLyricsController {
                     output.getFD().sync();
                 }
                 if (!temporary.renameTo(target)) throw new IllegalStateException("Could not replace lyrics file");
+                suppressionFile(key).delete();
                 success = true;
             } catch (Exception e) {
                 FileLog.e(e);
@@ -355,7 +478,8 @@ public final class SyncedLyricsController {
                 synchronized (cache) {
                     Entry entry = cache.get(key);
                     if (entry != null && entry.generation == generation) {
-                        entry.lyrics = result ? parsed : finalFallback;
+                        entry.lyrics = result ? parsed.withOrigin(Source.LOCAL) : finalFallback;
+                        if (result) entry.suppressed = false;
                         entry.state = result ? (parsed.kind == Kind.MALFORMED ? State.MALFORMED : parsed.lines.isEmpty() ? State.MISSING : State.LOADED) : State.WRITE_FAILED;
                     }
                 }
@@ -381,7 +505,7 @@ public final class SyncedLyricsController {
         }
         Utilities.globalQueue.postRunnable(() -> {
             File target = file(key);
-            boolean success = !target.exists() || target.delete();
+            boolean success = (!target.exists() || target.delete()) && writeSuppression(key);
             Lyrics fallback = previous;
             if (!success && fallback == EMPTY && target.exists()) {
                 try {
@@ -396,7 +520,39 @@ public final class SyncedLyricsController {
                     Entry entry = cache.get(key);
                     if (entry != null && entry.generation == generation) {
                         entry.lyrics = success ? EMPTY : finalFallback;
-                        entry.state = success ? State.MISSING : State.WRITE_FAILED;
+                        entry.state = success ? State.NOT_LOADED : State.WRITE_FAILED;
+                        if (success) {
+                            entry.suppressed = true;
+                            startLoading(key, message, entry);
+                        }
+                    }
+                }
+                notifyChanged(key);
+                if (completion != null) completion.run(success);
+            });
+        });
+    }
+
+    public void restoreEmbedded(MessageObject message, Completion completion) {
+        String key = key(message);
+        if (key == null) {
+            if (completion != null) completion.run(false);
+            return;
+        }
+        Utilities.globalQueue.postRunnable(() -> {
+            boolean success = !suppressionFile(key).exists() || suppressionFile(key).delete();
+            AndroidUtilities.runOnUIThread(() -> {
+                synchronized (cache) {
+                    Entry entry = cache.get(key);
+                    if (success && entry != null) {
+                        entry.suppressed = false;
+                        if (entry.embeddedChecked) {
+                            entry.lyrics = entry.embeddedLyrics;
+                            entry.state = entry.lyrics.kind == Kind.MALFORMED ? State.MALFORMED : entry.lyrics.lines.isEmpty() ? State.MISSING : State.LOADED;
+                        } else {
+                            entry.state = State.NOT_LOADED;
+                            startLoading(key, message, entry);
+                        }
                     }
                 }
                 notifyChanged(key);
@@ -436,6 +592,47 @@ public final class SyncedLyricsController {
         }
     }
 
+    private boolean writeSuppression(String key) {
+        File target = suppressionFile(key);
+        try {
+            File parent = target.getParentFile();
+            if (parent != null && !parent.exists() && !parent.mkdirs()) return false;
+            if (target.exists()) return true;
+            try (FileOutputStream output = new FileOutputStream(target)) {
+                output.write(1);
+                output.getFD().sync();
+            }
+            return true;
+        } catch (Exception e) {
+            FileLog.e(e);
+            return false;
+        }
+    }
+
+    private File mediaFile(MessageObject message) {
+        if (message == null) return null;
+        if (!TextUtils.isEmpty(message.messageOwner.attachPath)) {
+            File attached = new File(message.messageOwner.attachPath);
+            if (attached.exists()) return attached;
+        }
+        return FileLoader.getInstance(account).getPathToMessage(message.messageOwner);
+    }
+
+    private boolean isMediaReady(MessageObject message, File media) {
+        return message != null && media != null && media.exists() && media.length() > 0 && !FileLoader.getInstance(account).isLoadingFile(message.getFileName());
+    }
+
+    private Lyrics extractEmbedded(File media) {
+        AudioInfo info = AudioInfo.getAudioInfo(media);
+        String source = info == null ? null : info.getLyrics();
+        if (source == null || source.length() > MAX_EMBEDDED_LYRICS_LENGTH) return EMPTY;
+        Lyrics embedded = parse(source).withOrigin(Source.EMBEDDED);
+        if (embedded.lines.size() > MAX_EMBEDDED_LYRICS_LINES) {
+            return new Lyrics(Collections.emptyList(), source, Kind.MALFORMED, Source.EMBEDDED);
+        }
+        return embedded;
+    }
+
     public static long positionMs(MessageObject message) {
         if (message == null) return 0;
         long progress = MediaController.getInstance().getProgressMs(message);
@@ -451,5 +648,9 @@ public final class SyncedLyricsController {
 
     private File file(String key) {
         return new File(ApplicationLoader.applicationContext.getFilesDir(), "lyrics/" + account + "/" + key + ".lrc");
+    }
+
+    private File suppressionFile(String key) {
+        return new File(ApplicationLoader.applicationContext.getFilesDir(), "lyrics/" + account + "/" + key + ".suppressed");
     }
 }

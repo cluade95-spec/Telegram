@@ -11172,6 +11172,7 @@
     <string name="ArticleCommandDivider">Divider</string>
     <string name="ArticleCommandImage">Image</string>
     <string name="ArticleCommandVideo">Video</string>
+    <string name="RestoreEmbeddedLyrics">Restore lyrics</string>
     <string name="ArticleCommandAudio">Audio</string>
     <string name="ArticleCommandMap">Map</string>
     <string name="ArticleAlignment">Alignment</string>
