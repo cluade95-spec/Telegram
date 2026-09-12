@@ -1684,12 +1684,19 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         if (playerLayout == null) {
             return 0;
         }
-        if (playlist.size() <= 1) {
-            return playerLayout.getMeasuredHeight() + backgroundPaddingTop;
-        } else if (isLyricsChromeActive() || scrollOffsetY == Integer.MAX_VALUE) {
-            // The sheet is the Lyrics shell, whose top is deterministic and does not come from the
-            // playlist scroll at all.
+        if (isLyricsChromeActive()) {
+            // Lyrics is presented as its own shell whose top is deterministic, so it is measured
+            // the same way for a single-song chat as for a full playlist. Ordering matters: the
+            // single-song branch below returns the player block alone, which would leave the whole
+            // lyrics viewport out of the entrance and exit translation.
             return container.getMeasuredHeight() - getLyricsContentTop();
+        } else if (playlist.size() <= 1) {
+            return playerLayout.getMeasuredHeight() + backgroundPaddingTop;
+        } else if (scrollOffsetY == Integer.MAX_VALUE) {
+            // Playlist, but its offset has not resolved yet. Measuring from the sentinel returns
+            // about -2^31 and throws the sheet off-screen, so fall back to the player block rather
+            // than to lyrics geometry, which is not what this sheet is showing.
+            return playerLayout.getMeasuredHeight() + backgroundPaddingTop;
         } else {
             int offset = dp(13);
             int top = scrollOffsetY - backgroundPaddingTop - offset;
@@ -3175,6 +3182,36 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         setLyricsEmphasis(RecyclerView.NO_POSITION, activeLyricsRow, 1f);
     }
 
+    /** Eases the current emphasis out to "no active lyric", used for an explicit timed blank. */
+    private void clearLyricsEmphasis() {
+        if (lyricsEmphasisToRow == RecyclerView.NO_POSITION && (lyricsFollowAnimator != null || lyricsEmphasisProgress >= 1f)) {
+            return; // already clearing, or already clear: the blank interval ticks many times
+        }
+        cancelLyricsFollowAnimator();
+        lyricsEmphasisFromRow = lyricsEmphasisToRow;
+        lyricsEmphasisToRow = RecyclerView.NO_POSITION;
+        lyricsEmphasisProgress = 0f;
+        final ValueAnimator animator = ValueAnimator.ofFloat(0f, 1f);
+        animator.addUpdateListener(a -> {
+            if (lyricsFollowAnimator != a) return;
+            lyricsEmphasisProgress = (float) a.getAnimatedValue();
+            updateLyricsDepth();
+        });
+        animator.addListener(new AnimatorListenerAdapter() {
+            @Override public void onAnimationEnd(Animator animation) {
+                if (lyricsFollowAnimator != animation) return;
+                lyricsFollowAnimator = null;
+                lyricsEmphasisProgress = 1f;
+                lyricsEmphasisFromRow = RecyclerView.NO_POSITION;
+                updateLyricsDepth();
+            }
+        });
+        animator.setDuration(LYRIC_FOLLOW_MIN_MS);
+        animator.setInterpolator(CubicBezierInterpolator.EASE_BOTH);
+        lyricsFollowAnimator = animator;
+        animator.start();
+    }
+
     private void setLyricsEmphasis(int fromRow, int toRow, float progress) {
         lyricsEmphasisFromRow = fromRow;
         lyricsEmphasisToRow = toRow;
@@ -3205,6 +3242,16 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         if (message == null) return;
         final long position = SyncedLyricsController.positionMs(message);
         final int line = currentLyrics.lineAt(position);
+        if (line >= 0 && line < currentLyrics.lines.size() && TextUtils.isEmpty(currentLyrics.lines.get(line).text)) {
+            // An explicit timed blank. Timed blanks are not rows, so there is nothing to follow:
+            // the visible active lyric clears and stays clear for the whole interval. Crucially we
+            // return before the pre-roll below, which would otherwise start promoting line + 1
+            // early. Only a real blank event lands here - line < 0 is "before the first lyric" and
+            // keeps its normal pre-roll into the first line.
+            lyricsFollowRow = RecyclerView.NO_POSITION;
+            clearLyricsEmphasis();
+            return;
+        }
         int targetRow = rowForLyricsLine(line);
         long duration = 0;
         final boolean paused = MediaController.getInstance().isMessagePaused();
