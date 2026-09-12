@@ -2,6 +2,9 @@ name: Build Telegram APK
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - codex/create-working-branch-for-synced-lyrics-feature
 
 jobs:
   build:
@@ -35,19 +38,37 @@ jobs:
       - name: Make Gradle executable
         run: chmod +x gradlew
 
-      - name: Build standalone APK
+      - name: Use isolated QA package
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path("TMessagesProj_AppStandalone/build.gradle")
+          text = path.read_text()
+          pattern = r'(standalone\s*\{.*?applicationIdSuffix\s+)"\.web"'
+          text, count = re.subn(pattern, r'\1".beta"', text, count=1, flags=re.S)
+          if count != 1:
+              raise SystemExit("Could not isolate standalone QA package")
+          path.write_text(text)
+          PY
+
+      - name: Build standalone QA APK
         run: ./gradlew :TMessagesProj_AppStandalone:assembleAfatStandalone --no-daemon
 
-      - name: Collect APK
+      - name: Collect and verify APK
         run: |
           mkdir -p apk
           APK_PATH=$(find TMessagesProj_AppStandalone/build/outputs/apk -type f -name "*.apk" | head -n 1)
           test -n "$APK_PATH"
-          cp "$APK_PATH" apk/Telegram-Lyrics-Standalone.apk
+          cp "$APK_PATH" apk/Telegram-Lyrics-QA.apk
+          AAPT="$ANDROID_HOME/build-tools/36.0.0/aapt"
+          "$AAPT" dump badging apk/Telegram-Lyrics-QA.apk | head -n 1
+          "$AAPT" dump badging apk/Telegram-Lyrics-QA.apk | grep -q "package: name='org.telegram.messenger.beta'"
           ls -lh apk
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: Telegram-Android-Standalone
-          path: apk/Telegram-Lyrics-Standalone.apk
+          name: Telegram-Android-Lyrics-QA
+          path: apk/Telegram-Lyrics-QA.apk
