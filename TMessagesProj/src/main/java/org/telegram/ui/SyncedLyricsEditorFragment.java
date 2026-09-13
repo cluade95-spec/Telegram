@@ -101,6 +101,7 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
     private Boolean lastCanRedo;
     private LyricsOnlineSearch.Request onlineRequest;
     private AlertDialog onlineProgressDialog;
+    private boolean pendingControllerRefresh;
     private String searchArtist;
     private String searchTitle;
 
@@ -121,7 +122,8 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
         getNotificationCenter().removeObserver(this, NotificationCenter.syncedLyricsChanged);
         if (history != null) history.detach();
         // The search owns a background request and a dialog that showDialog() does not manage.
-        cancelOnlineSearch();
+        // The views are already going away here, so nothing is restored or replayed.
+        cancelOnlineSearch(false);
         super.onFragmentDestroy();
     }
 
@@ -406,7 +408,26 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
         editText.setEnabled(!loading);
         editText.setVisibility(loading ? View.INVISIBLE : View.VISIBLE);
         progressView.setVisibility(loading ? View.VISIBLE : View.GONE);
-        doneButton.setEnabled(!loading && !saving);
+        updateDoneButton();
+    }
+
+    /** Single source of truth for Done, so no path can re-enable it while something else owns the editor. */
+    private void updateDoneButton() {
+        if (doneButton == null) return;
+        doneButton.setEnabled(editorReady && !saving && !searching);
+    }
+
+    /**
+     * Reflects the online-search lock in the chrome. Only {@code searching} is considered here:
+     * the editorReady/saving treatment of these controls is unchanged.
+     */
+    private void updateSearchLock() {
+        if (otherButton != null) {
+            otherButton.setEnabled(!searching);
+            otherButton.setAlpha(searching ? 0.35f : 1f);
+        }
+        updateDoneButton();
+        updateHistoryButtons();
     }
 
     private void applyControllerState(boolean replaceText) {
@@ -470,12 +491,12 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
     }
 
     private void undo() {
-        if (history == null || !editorReady || saving) return;
+        if (history == null || !editorReady || saving || searching) return;
         history.undo();
     }
 
     private void redo() {
-        if (history == null || !editorReady || saving) return;
+        if (history == null || !editorReady || saving || searching) return;
         history.redo();
     }
 
@@ -497,8 +518,8 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
     /** Enabled/disabled treatment taken from Telegram's editor toolbar: full opacity vs 0.35. */
     private void updateHistoryButtons() {
         if (undoButton == null || redoButton == null) return;
-        final boolean canUndo = history != null && editorReady && !saving && history.canUndo();
-        final boolean canRedo = history != null && editorReady && !saving && history.canRedo();
+        final boolean canUndo = history != null && editorReady && !saving && !searching && history.canUndo();
+        final boolean canRedo = history != null && editorReady && !saving && !searching && history.canRedo();
         if (lastCanUndo != null && lastCanUndo == canUndo && lastCanRedo != null && lastCanRedo == canRedo) {
             return;
         }
@@ -512,21 +533,41 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
 
     @Override
     public void didReceivedNotification(int id, int account, Object... args) {
-        if (id == NotificationCenter.syncedLyricsChanged && editText != null && !saving && !importing && !searching) {
-            applyControllerState(!changedByUser);
+        if (id != NotificationCenter.syncedLyricsChanged || editText == null || saving || importing) return;
+        if (searching) {
+            // The controller may finish loading (for example the media file arrives and embedded
+            // lyrics are extracted) while an online request is visibly in progress. Applying it now
+            // would replace the editor underneath the user, but dropping it would strand the editor
+            // on a stale state until some later notification. Remember it and replay it when the
+            // search terminates.
+            pendingControllerRefresh = true;
+            return;
         }
+        applyControllerState(!changedByUser);
+    }
+
+    /**
+     * Replays a controller transition that arrived while a search was running. Nothing is applied
+     * unless the UI is still alive, and {@code changedByUser} keeps its existing meaning: a manual
+     * unsaved edit is never overwritten, only {@code initialSource} and the menus catch up.
+     */
+    private void consumePendingControllerRefresh() {
+        if (!pendingControllerRefresh) return;
+        pendingControllerRefresh = false;
+        if (isFinished || getParentActivity() == null || editText == null) return;
+        applyControllerState(!changedByUser);
     }
 
     private void save() {
-        if (saving || !editorReady) return;
+        if (saving || searching || !editorReady) return;
         saving = true;
-        doneButton.setEnabled(false);
+        updateDoneButton();
         updateHistoryButtons();
         String source = editText.getText().toString();
         SyncedLyricsController.getInstance(currentAccount).save(messageObject, source, success -> {
             saving = false;
             if (isFinished || getParentActivity() == null) return;
-            doneButton.setEnabled(true);
+            updateDoneButton();
             updateHistoryButtons();
             if (success) {
                 initialSource = source;
@@ -538,6 +579,7 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
     }
 
     private void importFile() {
+        if (saving || searching || !editorReady) return;
         try {
             Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
             intent.addCategory(Intent.CATEGORY_OPENABLE);
@@ -692,10 +734,13 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
         AndroidUtilities.hideKeyboard(titleField);
 
         searching = true;
+        // The spinner is deliberately delayed, so the lock - not the dialog - is what keeps Save,
+        // Import, Delete, Undo/Redo and a second search out during the window before it appears.
+        updateSearchLock();
         final AlertDialog progress = new AlertDialog(activity, AlertDialog.ALERT_TYPE_SPINNER, getResourceProvider());
         // Cancelling the spinner abandons the request; a delayed show keeps a fast answer from
         // flashing a spinner on screen.
-        progress.setOnCancelListener(ignored -> cancelOnlineSearch());
+        progress.setOnCancelListener(ignored -> cancelOnlineSearch(true));
         progress.showDelayed(180);
         onlineProgressDialog = progress;
 
@@ -708,6 +753,11 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
             searching = false;
             dismissOnlineProgress();
             if (isFinished || getParentActivity() == null || editText == null) return;
+            updateSearchLock();
+            // Catch up on any controller transition that arrived during the request first, so
+            // initialSource reflects the real persisted source before the result is inserted - and
+            // so that on failure the editor is not left on a stale state.
+            consumePendingControllerRefresh();
             if (lyrics != null) {
                 applyOnlineLyrics(lyrics);
             } else {
@@ -717,12 +767,20 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
         onlineRequest = started[0];
     }
 
-    private void cancelOnlineSearch() {
+    /**
+     * @param uiAlive false during fragment teardown, when the views are gone and there is nothing
+     *                to restore or replay - the request and the dialog are still released.
+     */
+    private void cancelOnlineSearch(boolean uiAlive) {
+        final boolean wasSearching = searching;
         searching = false;
         LyricsOnlineSearch.Request request = onlineRequest;
         onlineRequest = null;
         if (request != null) request.cancel();
         dismissOnlineProgress();
+        if (!uiAlive) return;
+        if (wasSearching) updateSearchLock();
+        consumePendingControllerRefresh();
     }
 
     private void dismissOnlineProgress() {
@@ -817,6 +875,7 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
     }
 
     private void confirmDelete() {
+        if (saving || searching) return;
         AlertDialog dialog = new AlertDialog.Builder(getParentActivity(), getResourceProvider())
                 .setTitle(LocaleController.getString(R.string.DeleteLyrics))
                 .setMessage(LocaleController.getString(R.string.DeleteLyricsConfirm))
@@ -829,14 +888,14 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
     }
 
     private void delete() {
-        if (saving) return;
+        if (saving || searching) return;
         saving = true;
-        doneButton.setEnabled(false);
+        updateDoneButton();
         updateHistoryButtons();
         SyncedLyricsController.getInstance(currentAccount).delete(messageObject, success -> {
             saving = false;
             if (isFinished || getParentActivity() == null) return;
-            doneButton.setEnabled(true);
+            updateDoneButton();
             updateHistoryButtons();
             if (success) {
                 finishAndReturnToPlayer();

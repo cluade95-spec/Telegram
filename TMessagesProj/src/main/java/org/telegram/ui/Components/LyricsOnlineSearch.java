@@ -95,8 +95,13 @@ public final class LyricsOnlineSearch {
     private static final int READ_TIMEOUT_MS = 10_000;
     /** Hard ceiling on a response body; anything larger is a clean failure, never an allocation. */
     private static final int MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
-    /** Mirrors the editor's and the controller's existing ~1 MiB lyrics ceiling. */
-    public static final int MAX_LYRICS_LENGTH = 1024 * 1024;
+    /**
+     * The ceiling the editor's Import path already enforces: 1 MiB of <em>UTF-8 bytes</em> read
+     * from the source, not a UTF-16 character count. A character count would let a multi-byte
+     * document through at up to three or four times that size, so the same byte limit is applied
+     * here to whatever LRCLIB returns.
+     */
+    public static final int MAX_LYRICS_BYTES = 1024 * 1024;
     /** Query fields are user-editable; keep the URL bounded. */
     private static final int MAX_QUERY_FIELD_LENGTH = 200;
     /** LRCLIB's documented duration validation range, in seconds. */
@@ -498,7 +503,7 @@ public final class LyricsOnlineSearch {
         if (lyrics == null || lyrics.trim().isEmpty()) {
             return null;
         }
-        if (lyrics.length() > MAX_LYRICS_LENGTH) {
+        if (exceedsUtf8Bytes(lyrics, MAX_LYRICS_BYTES)) {
             return null;
         }
         return lyrics;
@@ -555,37 +560,46 @@ public final class LyricsOnlineSearch {
         if (value == null) {
             return "";
         }
-        StringBuilder builder = new StringBuilder(value.length());
+        StringBuilder builder = new StringBuilder(Math.min(value.length(), MAX_QUERY_FIELD_LENGTH));
         boolean pendingSpace = false;
-        for (int a = 0; a < value.length(); a++) {
-            char c = value.charAt(a);
+        for (int a = 0; a < value.length(); ) {
+            final int codePoint = value.codePointAt(a);
+            a += Character.charCount(codePoint);
             // Control characters are dropped outright; every flavour of space (including
             // NBSP and the other Unicode space characters) collapses to one plain space.
-            if (Character.isISOControl(c) || Character.isWhitespace(c) || Character.isSpaceChar(c)) {
+            if (Character.isISOControl(codePoint) || Character.isWhitespace(codePoint) || Character.isSpaceChar(codePoint)) {
                 pendingSpace = builder.length() > 0;
                 continue;
+            }
+            final int needed = Character.charCount(codePoint) + (pendingSpace ? 1 : 0);
+            if (builder.length() + needed > MAX_QUERY_FIELD_LENGTH) {
+                // Stop on a whole code point. Cutting between a surrogate pair would put a lone
+                // surrogate into the query, which is not valid text in any encoding.
+                break;
             }
             if (pendingSpace) {
                 builder.append(' ');
                 pendingSpace = false;
             }
-            builder.append(c);
-            if (builder.length() >= MAX_QUERY_FIELD_LENGTH) {
-                break;
-            }
+            builder.appendCodePoint(codePoint);
         }
         return builder.toString();
     }
 
     /**
-     * Client-side mirror of LRCLIB's {@code prepare_input}
-     * ({@code server/src/utils.rs}): de-accent, map its punctuation set to spaces, drop
-     * apostrophes, lowercase, collapse whitespace. Used only to decide whether a row is an "exact"
-     * match for ranking - never to build a query.
+     * Closely approximates LRCLIB's {@code prepare_input} ({@code server/src/utils.rs}):
+     * de-accent, map its punctuation set to spaces, drop apostrophes, lowercase, collapse
+     * whitespace. Used only to decide whether a row is an "exact" match for ranking - never to
+     * build a query.
      *
-     * <p>The de-accenting step is script-agnostic: it folds any combining mark, so an Arabic hamza
-     * folds just as a Latin umlaut does. That only ever makes ranking slightly more permissive, and
-     * what is actually sent to LRCLIB is the user's text untouched - see {@link #sanitize(String)}.
+     * <p>It is an approximation, not an identity. The server de-accents with {@code secular}'s
+     * {@code lower_lay_string}, whereas this uses NFD plus combining-mark removal; the two agree on
+     * the Latin accents and the punctuation, apostrophe, case and whitespace rules that ranking
+     * actually leans on, but they are not guaranteed to produce the same output for every code
+     * point. Mark removal is also script-agnostic, so an Arabic hamza folds just as a Latin umlaut
+     * does. Any divergence can only make ranking slightly more or less permissive; it can never
+     * change the request, because what is sent to LRCLIB is the user's text untouched - see
+     * {@link #sanitize(String)}.
      */
     private static String normalize(String value) {
         if (TextUtils.isEmpty(value)) {
@@ -630,6 +644,35 @@ public final class LyricsOnlineSearch {
             default:
                 return false;
         }
+    }
+
+    /**
+     * True when the UTF-8 encoding of {@code text} would exceed {@code limit} bytes. Counts the
+     * encoded width per code point and stops at the first byte over the limit, so it never
+     * allocates a second multi-megabyte buffer just to measure one that is already in memory.
+     *
+     * <p>An unpaired surrogate is counted as three bytes even though the encoder substitutes a
+     * single '?' for it, which errs towards rejecting rather than accepting an oversize document.
+     */
+    private static boolean exceedsUtf8Bytes(String text, int limit) {
+        long total = 0;
+        for (int a = 0; a < text.length(); ) {
+            final int codePoint = text.codePointAt(a);
+            a += Character.charCount(codePoint);
+            if (codePoint < 0x80) {
+                total += 1;
+            } else if (codePoint < 0x800) {
+                total += 2;
+            } else if (codePoint < 0x10000) {
+                total += 3;
+            } else {
+                total += 4;
+            }
+            if (total > limit) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** Whole seconds where possible, so the URL stays stable and locale-independent. */
