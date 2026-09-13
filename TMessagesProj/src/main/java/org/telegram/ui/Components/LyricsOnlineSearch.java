@@ -8,6 +8,7 @@ import android.net.Uri;
 import android.text.TextUtils;
 
 import org.json.JSONArray;
+import org.json.JSONException;
 import org.json.JSONObject;
 import org.json.JSONTokener;
 import org.telegram.messenger.AndroidUtilities;
@@ -445,10 +446,9 @@ public final class LyricsOnlineSearch {
      * Parses the body as exactly one JSON object.
      *
      * <p>{@code nextValue()} alone stops as soon as it has read one complete value, so
-     * {@code {"plainLyrics":"x"} garbage} would otherwise be accepted. {@code nextClean()} skips
-     * JSON whitespace and answers 0 only at end of input - in both Android's {@code org.json} and
-     * the reference implementation - which proves the tokener consumed the whole body;
-     * {@link #endsWithTerminator} then proves the body really ends with the document.
+     * {@code {"plainLyrics":"x"} garbage} would otherwise be accepted.
+     * {@link #hasOnlyTrailingJsonWhitespace} then requires that nothing but JSON whitespace
+     * follows it.
      */
     private static Track parseTrack(String body) {
         if (body == null) {
@@ -457,7 +457,7 @@ public final class LyricsOnlineSearch {
         try {
             JSONTokener tokener = new JSONTokener(body);
             Object parsed = tokener.nextValue();
-            if (!(parsed instanceof JSONObject) || tokener.nextClean() != 0 || !endsWithTerminator(body, '}')) {
+            if (!(parsed instanceof JSONObject) || !hasOnlyTrailingJsonWhitespace(tokener)) {
                 return null;
             }
             return readTrack((JSONObject) parsed);
@@ -471,6 +471,8 @@ public final class LyricsOnlineSearch {
      * contract: at most {@link #MAX_SEARCH_RESULTS} rows, every row an object, every field the type
      * the server declares. A row that breaks it fails the whole response rather than being skipped,
      * because silently dropping rows would turn a broken contract into an ordinary "not found".
+     *
+     * <p>As in {@link #parseTrack}, nothing but JSON whitespace may follow the array.
      */
     private static ArrayList<Track> parseTracks(String body) {
         if (body == null) {
@@ -479,7 +481,7 @@ public final class LyricsOnlineSearch {
         try {
             JSONTokener tokener = new JSONTokener(body);
             Object parsed = tokener.nextValue();
-            if (!(parsed instanceof JSONArray) || tokener.nextClean() != 0 || !endsWithTerminator(body, ']')) {
+            if (!(parsed instanceof JSONArray) || !hasOnlyTrailingJsonWhitespace(tokener)) {
                 return null;
             }
             JSONArray array = (JSONArray) parsed;
@@ -504,24 +506,29 @@ public final class LyricsOnlineSearch {
     }
 
     /**
-     * True when the last non-whitespace character of {@code body} is {@code terminator}.
+     * True when everything left in {@code tokener} after the parsed value is JSON whitespace.
      *
-     * <p>{@code nextClean()} proves the tokener reached the end of the input, but Android's
-     * implementation also skips block, line and hash comments on its way there, so on that platform
-     * trailing comment text would pass as clean end-of-input. Requiring the body to actually end
-     * with the document's own closing brace or bracket closes that without reaching into any
-     * tokener internals, and can never reject a well-formed document: JSON objects and arrays
-     * always end with their closer.
+     * <p>Deliberately reads the raw remainder with {@code more()} and {@code next()} rather than
+     * asking {@code nextClean()} whether the tokener is at the end. Android's {@code nextClean()}
+     * also skips block, line and hash comments, so on that platform it reports clean end-of-input
+     * for a body whose document is followed by a hash comment ending in a closing brace - trailing
+     * content that JSON does not allow, and which also defeats any check based on the body's last
+     * non-whitespace character. The raw reader skips nothing, so a comment is seen for what it is:
+     * a character that is not one of the four whitespace characters JSON permits between tokens.
+     *
+     * <p>{@code JSONException} is declared rather than caught because the reference
+     * {@code org.json} declares it on these methods and Android's does not; catching it here would
+     * not compile against Android. Both callers already funnel every throwable into a clean
+     * malformed-response result.
      */
-    private static boolean endsWithTerminator(String body, char terminator) {
-        for (int a = body.length() - 1; a >= 0; a--) {
-            final char c = body.charAt(a);
-            if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
-                continue; // the only whitespace JSON allows between tokens
+    private static boolean hasOnlyTrailingJsonWhitespace(JSONTokener tokener) throws JSONException {
+        while (tokener.more()) {
+            final char c = tokener.next();
+            if (c != ' ' && c != '\t' && c != '\n' && c != '\r') {
+                return false;
             }
-            return c == terminator;
         }
-        return false;
+        return true;
     }
 
     /**
