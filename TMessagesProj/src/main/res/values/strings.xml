@@ -11208,6 +11208,17 @@
     <string name="ShowPlaylist">Show playlist</string>
     <string name="LyricsSaveFailed">Lyrics could not be saved.</string>
     <string name="LyricsDeleteFailed">Lyrics could not be deleted.</string>
+    <string name="LyricsOnlineSearch">Search online</string>
+    <string name="LyricsOnlineSearchArtist">Artist</string>
+    <string name="LyricsOnlineSearchTitle">Title</string>
+    <string name="LyricsOnlineSearchSynced">Synced</string>
+    <string name="LyricsOnlineSearchPlain">Normal</string>
+    <string name="LyricsOnlineSearchNotFound">No lyrics were found for this artist and title.</string>
+    <string name="LyricsOnlineSearchTypeUnavailable">This track was found, but not with the type of lyrics you asked for.</string>
+    <string name="LyricsOnlineSearchNetworkError">Could not reach the lyrics service. Check your connection and try again.</string>
+    <string name="LyricsOnlineSearchBusy">The lyrics service is busy. Please try again in a moment.</string>
+    <string name="LyricsOnlineSearchServerError">The lyrics service could not answer right now.</string>
+    <string name="LyricsOnlineSearchInvalidResponse">The lyrics service returned an unexpected response.</string>
     <string name="DiscardLyricsChanges">Discard your changes to these lyrics?</string>
     <string name="ArticleAIAddToPage">Add to Page</string>
 

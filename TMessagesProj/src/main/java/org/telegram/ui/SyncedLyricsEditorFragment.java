@@ -21,11 +21,14 @@ import android.text.TextPaint;
 import android.text.TextWatcher;
 import android.text.style.CharacterStyle;
 import android.text.style.UpdateAppearance;
+import android.util.TypedValue;
 import android.view.GestureDetector;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
+import android.view.inputmethod.EditorInfo;
 import android.widget.FrameLayout;
+import android.widget.LinearLayout;
 import android.widget.OverScroller;
 import android.widget.TextView;
 
@@ -50,6 +53,7 @@ import org.telegram.ui.ActionBar.ThemeDescription;
 import org.telegram.ui.Components.EditTextBoldCursor;
 import org.telegram.ui.Components.AudioPlayerAlert;
 import org.telegram.ui.Components.LayoutHelper;
+import org.telegram.ui.Components.LyricsOnlineSearch;
 import org.telegram.ui.Components.RadialProgressView;
 
 import java.io.ByteArrayOutputStream;
@@ -71,6 +75,7 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
     private static final int DELETE = 4;
     private static final int UNDO = 5;
     private static final int REDO = 6;
+    private static final int ONLINE_SEARCH = 7;
     private static final int PICK_LRC = 41;
     private static final int MAX_SIZE = 1024 * 1024;
 
@@ -88,11 +93,16 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
     private boolean changedByUser;
     private boolean saving;
     private boolean importing;
+    private boolean searching;
     private boolean editorReady;
     private boolean readErrorShown;
     private boolean ignoreTextChange;
     private Boolean lastCanUndo;
     private Boolean lastCanRedo;
+    private LyricsOnlineSearch.Request onlineRequest;
+    private AlertDialog onlineProgressDialog;
+    private String searchArtist;
+    private String searchTitle;
 
     public SyncedLyricsEditorFragment(MessageObject messageObject) {
         super(new Bundle());
@@ -110,6 +120,8 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
     public void onFragmentDestroy() {
         getNotificationCenter().removeObserver(this, NotificationCenter.syncedLyricsChanged);
         if (history != null) history.detach();
+        // The search owns a background request and a dialog that showDialog() does not manage.
+        cancelOnlineSearch();
         super.onFragmentDestroy();
     }
 
@@ -299,6 +311,8 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
                     redo();
                 } else if (id == IMPORT) {
                     importFile();
+                } else if (id == ONLINE_SEARCH) {
+                    showOnlineSearch();
                 } else if (id == DELETE) {
                     confirmDelete();
                 }
@@ -448,6 +462,7 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
         if (otherButton == null) return;
         otherButton.removeAllSubItems();
         otherButton.addSubItem(IMPORT, R.drawable.msg_openin, LocaleController.getString(R.string.ImportLyrics));
+        otherButton.addSubItem(ONLINE_SEARCH, R.drawable.msg_search, LocaleController.getString(R.string.LyricsOnlineSearch));
         if (!initialSource.isEmpty()) {
             ActionBarMenuSubItem delete = otherButton.addSubItem(DELETE, R.drawable.msg_delete, LocaleController.getString(R.string.DeleteLyrics));
             delete.setColors(getThemedColor(Theme.key_text_RedRegular), getThemedColor(Theme.key_text_RedRegular));
@@ -497,7 +512,7 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
 
     @Override
     public void didReceivedNotification(int id, int account, Object... args) {
-        if (id == NotificationCenter.syncedLyricsChanged && editText != null && !saving && !importing) {
+        if (id == NotificationCenter.syncedLyricsChanged && editText != null && !saving && !importing && !searching) {
             applyControllerState(!changedByUser);
         }
     }
@@ -593,6 +608,212 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
                 }
             });
         });
+    }
+
+    /**
+     * Opens the online lookup. Artist and Title are prefilled from the track's own metadata but are
+     * only ever search parameters: nothing here writes back to the message, and the user picks the
+     * lyric flavour explicitly - there is no automatic mode.
+     */
+    private void showOnlineSearch() {
+        if (searching || saving || importing || !editorReady) return;
+        final Activity activity = getParentActivity();
+        if (activity == null) return;
+        if (searchArtist == null) searchArtist = defaultSearchArtist();
+        if (searchTitle == null) searchTitle = defaultSearchTitle();
+
+        final LinearLayout container = new LinearLayout(activity);
+        container.setOrientation(LinearLayout.VERTICAL);
+        final EditTextBoldCursor artistField = createSearchField(activity, searchArtist, EditorInfo.IME_ACTION_NEXT);
+        final EditTextBoldCursor titleField = createSearchField(activity, searchTitle, EditorInfo.IME_ACTION_DONE);
+        container.addView(createSearchLabel(activity, R.string.LyricsOnlineSearchArtist), LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
+        container.addView(artistField, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 36, Gravity.TOP | Gravity.START, 24, 2, 24, 0));
+        container.addView(createSearchLabel(activity, R.string.LyricsOnlineSearchTitle), LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
+        container.addView(titleField, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 36, Gravity.TOP | Gravity.START, 24, 2, 24, 0));
+
+        AlertDialog dialog = new AlertDialog.Builder(activity, getResourceProvider())
+                .setTitle(LocaleController.getString(R.string.LyricsOnlineSearch))
+                .setView(container)
+                .setPositiveButton(LocaleController.getString(R.string.LyricsOnlineSearchSynced),
+                        (ignored, which) -> startOnlineSearch(LyricsOnlineSearch.Type.SYNCED, artistField, titleField))
+                .setNegativeButton(LocaleController.getString(R.string.LyricsOnlineSearchPlain),
+                        (ignored, which) -> startOnlineSearch(LyricsOnlineSearch.Type.PLAIN, artistField, titleField))
+                .setNeutralButton(LocaleController.getString(R.string.Cancel), null)
+                // Remembering what was typed is what keeps the fields alive across a failed search.
+                .setOnDismissListener(ignored -> rememberSearchFields(artistField, titleField))
+                .create();
+        showDialog(dialog);
+        artistField.requestFocus();
+    }
+
+    private TextView createSearchLabel(Context context, int label) {
+        TextView view = new TextView(context);
+        view.setText(LocaleController.getString(label));
+        view.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14);
+        view.setTextColor(getThemedColor(Theme.key_dialogTextGray2));
+        view.setPadding(AndroidUtilities.dp(24), AndroidUtilities.dp(12), AndroidUtilities.dp(24), 0);
+        return view;
+    }
+
+    /** Same single-line dialog input treatment Telegram uses for its own name/title dialogs. */
+    private EditTextBoldCursor createSearchField(Context context, String value, int imeOptions) {
+        EditTextBoldCursor field = new EditTextBoldCursor(context);
+        field.setBackground(null);
+        field.setLineColors(getThemedColor(Theme.key_dialogInputField), getThemedColor(Theme.key_dialogInputFieldActivated), getThemedColor(Theme.key_text_RedBold));
+        field.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16);
+        field.setTextColor(getThemedColor(Theme.key_dialogTextBlack));
+        field.setCursorColor(getThemedColor(Theme.key_dialogTextBlack));
+        field.setCursorSize(AndroidUtilities.dp(20));
+        field.setCursorWidth(1.5f);
+        field.setSingleLine(true);
+        field.setMaxLines(1);
+        field.setLines(1);
+        field.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES);
+        field.setImeOptions(imeOptions);
+        field.setGravity(Gravity.START | Gravity.TOP);
+        field.setTextDirection(View.TEXT_DIRECTION_FIRST_STRONG);
+        field.setPadding(0, AndroidUtilities.dp(4), 0, 0);
+        field.setText(value == null ? "" : value);
+        field.setSelection(field.length());
+        return field;
+    }
+
+    private void rememberSearchFields(EditTextBoldCursor artistField, EditTextBoldCursor titleField) {
+        if (artistField != null) searchArtist = artistField.getText().toString();
+        if (titleField != null) searchTitle = titleField.getText().toString();
+    }
+
+    private void startOnlineSearch(LyricsOnlineSearch.Type type, EditTextBoldCursor artistField, EditTextBoldCursor titleField) {
+        rememberSearchFields(artistField, titleField);
+        if (searching || saving || importing || !editorReady) return;
+        final Activity activity = getParentActivity();
+        if (activity == null) return;
+        AndroidUtilities.hideKeyboard(artistField);
+        AndroidUtilities.hideKeyboard(titleField);
+
+        searching = true;
+        final AlertDialog progress = new AlertDialog(activity, AlertDialog.ALERT_TYPE_SPINNER, getResourceProvider());
+        // Cancelling the spinner abandons the request; a delayed show keeps a fast answer from
+        // flashing a spinner on screen.
+        progress.setOnCancelListener(ignored -> cancelOnlineSearch());
+        progress.showDelayed(180);
+        onlineProgressDialog = progress;
+
+        final LyricsOnlineSearch.Request[] started = new LyricsOnlineSearch.Request[1];
+        started[0] = LyricsOnlineSearch.search(searchArtist, searchTitle, messageObject.getDuration(), type, (lyrics, error) -> {
+            // Only the search that still owns the editor may act. A cancelled request never calls
+            // back at all; this also rejects a result whose search has been superseded.
+            if (started[0] == null || onlineRequest != started[0]) return;
+            onlineRequest = null;
+            searching = false;
+            dismissOnlineProgress();
+            if (isFinished || getParentActivity() == null || editText == null) return;
+            if (lyrics != null) {
+                applyOnlineLyrics(lyrics);
+            } else {
+                showError(onlineSearchErrorMessage(error));
+            }
+        });
+        onlineRequest = started[0];
+    }
+
+    private void cancelOnlineSearch() {
+        searching = false;
+        LyricsOnlineSearch.Request request = onlineRequest;
+        onlineRequest = null;
+        if (request != null) request.cancel();
+        dismissOnlineProgress();
+    }
+
+    private void dismissOnlineProgress() {
+        AlertDialog progress = onlineProgressDialog;
+        onlineProgressDialog = null;
+        if (progress == null) return;
+        try {
+            progress.dismiss();
+        } catch (Exception e) {
+            FileLog.e(e);
+        }
+    }
+
+    /**
+     * A fetched result is an editor import and nothing more: it is deliberately not handed to
+     * {@link SyncedLyricsController}, so Save remains the only thing that persists lyrics. The
+     * transaction below is the Import transaction verbatim, which is what makes the replacement a
+     * single undo step.
+     */
+    private void applyOnlineLyrics(String lyrics) {
+        if (editText == null) return;
+        // Commit what is on screen first so the replacement is a single undo step.
+        if (history != null) history.flush();
+        editText.setText(lyrics);
+        editText.setSelection(editText.length());
+        restyleAllTimestamps();
+        changedByUser = true;
+        if (history != null) history.record();
+        updateOtherMenu();
+        updateHistoryButtons();
+    }
+
+    private int onlineSearchErrorMessage(LyricsOnlineSearch.Error error) {
+        if (error == null) return R.string.LyricsOnlineSearchServerError;
+        switch (error) {
+            case NOT_FOUND:
+                return R.string.LyricsOnlineSearchNotFound;
+            case TYPE_UNAVAILABLE:
+                return R.string.LyricsOnlineSearchTypeUnavailable;
+            case NETWORK:
+                return R.string.LyricsOnlineSearchNetworkError;
+            case RATE_LIMITED:
+                return R.string.LyricsOnlineSearchBusy;
+            case MALFORMED:
+                return R.string.LyricsOnlineSearchInvalidResponse;
+            case SERVER:
+            default:
+                return R.string.LyricsOnlineSearchServerError;
+        }
+    }
+
+    /**
+     * {@code getMusicAuthor(false)} still ends at the localized "unknown artist" placeholder, which
+     * must never be sent as a query term.
+     */
+    private String defaultSearchArtist() {
+        String artist = messageObject.getMusicAuthor(false);
+        if (artist == null) return "";
+        artist = artist.trim();
+        if (artist.isEmpty() || artist.equals(LocaleController.getString(R.string.AudioUnknownArtist))) return "";
+        return artist;
+    }
+
+    /**
+     * {@code getMusicTitle(false)} falls back to the document file name before it falls back to the
+     * localized placeholder, so only an actual audio file extension is trimmed here. Anything else
+     * is left alone: a legitimate title must not be rewritten.
+     */
+    private String defaultSearchTitle() {
+        String title = messageObject.getMusicTitle(false);
+        if (title == null) return "";
+        title = title.trim();
+        if (title.isEmpty() || title.equals(LocaleController.getString(R.string.AudioUnknownTitle))) return "";
+        return stripAudioFileExtension(title);
+    }
+
+    private static final String[] AUDIO_EXTENSIONS = {
+            "mp3", "m4a", "m4b", "mp4", "aac", "flac", "ogg", "oga", "opus", "wav", "wma", "aiff", "aif", "alac", "ape", "mka"
+    };
+
+    private static String stripAudioFileExtension(String title) {
+        final int dot = title.lastIndexOf('.');
+        if (dot <= 0 || dot == title.length() - 1) return title;
+        final String extension = title.substring(dot + 1).toLowerCase(Locale.US);
+        for (String known : AUDIO_EXTENSIONS) {
+            if (known.equals(extension)) {
+                final String stripped = title.substring(0, dot).trim();
+                return stripped.isEmpty() ? title : stripped;
+            }
+        }
+        return title;
     }
 
     private void confirmDelete() {
