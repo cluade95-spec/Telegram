@@ -107,6 +107,10 @@ public final class LyricsOnlineSearch {
     /** LRCLIB's documented duration validation range, in seconds. */
     private static final double MIN_DURATION_SECONDS = 1.0;
     private static final double MAX_DURATION_SECONDS = 3600.0;
+    /** No usable duration: absent, null, NaN or infinite. Never compares as close to anything. */
+    private static final double INVALID_DURATION = -1;
+    /** The server's own cap on /api/search output ({@code SEARCH_RESULT_LIMIT} in search_index.rs). */
+    private static final int MAX_SEARCH_RESULTS = 20;
     /** A retry is only worth making when the server asks for a short wait. */
     private static final long MAX_RETRY_AFTER_MS = 5_000;
 
@@ -414,22 +418,46 @@ public final class LyricsOnlineSearch {
 
     // region parsing
 
+    /**
+     * Signals that a 200 body does not match LRCLIB's documented shape: trailing content after the
+     * JSON document, a row that is not an object, more rows than the server can return, a field
+     * carrying the wrong JSON type, or lyrics that are not well-formed UTF-16.
+     *
+     * <p>The message names the offending field only. Nothing here ever carries lyrics or query text,
+     * and nothing in this class is logged.
+     */
+    private static final class MalformedResponseException extends Exception {
+        MalformedResponseException(String field) {
+            super(field);
+        }
+    }
+
     private static final class Track {
         String trackName;
         String artistName;
-        double duration = -1;
+        double duration = INVALID_DURATION;
         boolean instrumental;
         String plainLyrics;
         String syncedLyrics;
     }
 
+    /**
+     * Parses the body as exactly one JSON object.
+     *
+     * <p>{@code nextValue()} alone stops as soon as it has read one complete value, so
+     * {@code {"plainLyrics":"x"} garbage} would otherwise be accepted. {@code nextClean()} skips
+     * JSON whitespace and answers 0 only at end of input - in both Android's {@code org.json} and
+     * the reference implementation - which proves the tokener consumed the whole body;
+     * {@link #endsWithTerminator} then proves the body really ends with the document.
+     */
     private static Track parseTrack(String body) {
         if (body == null) {
             return null;
         }
         try {
-            Object parsed = new JSONTokener(body).nextValue();
-            if (!(parsed instanceof JSONObject)) {
+            JSONTokener tokener = new JSONTokener(body);
+            Object parsed = tokener.nextValue();
+            if (!(parsed instanceof JSONObject) || tokener.nextClean() != 0 || !endsWithTerminator(body, '}')) {
                 return null;
             }
             return readTrack((JSONObject) parsed);
@@ -438,23 +466,36 @@ public final class LyricsOnlineSearch {
         }
     }
 
+    /**
+     * Parses the body as exactly one JSON array of track objects, applying the server's own
+     * contract: at most {@link #MAX_SEARCH_RESULTS} rows, every row an object, every field the type
+     * the server declares. A row that breaks it fails the whole response rather than being skipped,
+     * because silently dropping rows would turn a broken contract into an ordinary "not found".
+     */
     private static ArrayList<Track> parseTracks(String body) {
         if (body == null) {
             return null;
         }
         try {
-            Object parsed = new JSONTokener(body).nextValue();
-            if (!(parsed instanceof JSONArray)) {
+            JSONTokener tokener = new JSONTokener(body);
+            Object parsed = tokener.nextValue();
+            if (!(parsed instanceof JSONArray) || tokener.nextClean() != 0 || !endsWithTerminator(body, ']')) {
                 return null;
             }
             JSONArray array = (JSONArray) parsed;
-            ArrayList<Track> tracks = new ArrayList<>(array.length());
-            for (int a = 0; a < array.length(); a++) {
-                JSONObject object = array.optJSONObject(a);
-                if (object == null) {
-                    continue;
+            final int length = array.length();
+            // Checked before allocating, so a server-supplied length can never size the list.
+            if (length > MAX_SEARCH_RESULTS) {
+                return null;
+            }
+            ArrayList<Track> tracks = new ArrayList<>(length);
+            for (int a = 0; a < length; a++) {
+                Object row = array.get(a);
+                if (!(row instanceof JSONObject)) {
+                    // null, number, string, boolean or a nested array: not a TrackResponse.
+                    return null;
                 }
-                tracks.add(readTrack(object));
+                tracks.add(readTrack((JSONObject) row));
             }
             return tracks;
         } catch (Throwable e) {
@@ -462,28 +503,127 @@ public final class LyricsOnlineSearch {
         }
     }
 
-    /** Unknown and newly added fields (such as {@code lyricsfile}) are simply not read. */
-    private static Track readTrack(JSONObject object) {
+    /**
+     * True when the last non-whitespace character of {@code body} is {@code terminator}.
+     *
+     * <p>{@code nextClean()} proves the tokener reached the end of the input, but Android's
+     * implementation also skips block, line and hash comments on its way there, so on that platform
+     * trailing comment text would pass as clean end-of-input. Requiring the body to actually end
+     * with the document's own closing brace or bracket closes that without reaching into any
+     * tokener internals, and can never reject a well-formed document: JSON objects and arrays
+     * always end with their closer.
+     */
+    private static boolean endsWithTerminator(String body, char terminator) {
+        for (int a = body.length() - 1; a >= 0; a--) {
+            final char c = body.charAt(a);
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+                continue; // the only whitespace JSON allows between tokens
+            }
+            return c == terminator;
+        }
+        return false;
+    }
+
+    /**
+     * Reads one row against the server's declared types. In {@code TrackResponse}, every string
+     * field and {@code duration} are {@code Option}, so absent and null are both valid, while
+     * {@code instrumental} is a plain {@code bool} and cannot be null. Unknown and newly added
+     * fields (such as {@code lyricsfile}) are simply not read, so the parser stays
+     * forward-compatible.
+     */
+    private static Track readTrack(JSONObject object) throws MalformedResponseException {
         Track track = new Track();
-        track.trackName = optText(object, "trackName");
+        track.trackName = readString(object, "trackName", false);
         if (track.trackName == null) {
-            track.trackName = optText(object, "name");
+            track.trackName = readString(object, "name", false);
         }
-        track.artistName = optText(object, "artistName");
-        if (object.has("duration") && !object.isNull("duration")) {
-            track.duration = object.optDouble("duration", -1);
-        }
-        track.instrumental = object.optBoolean("instrumental", false);
-        track.plainLyrics = optText(object, "plainLyrics");
-        track.syncedLyrics = optText(object, "syncedLyrics");
+        track.artistName = readString(object, "artistName", false);
+        track.duration = readDuration(object);
+        track.instrumental = readInstrumental(object);
+        track.plainLyrics = readString(object, "plainLyrics", true);
+        track.syncedLyrics = readString(object, "syncedLyrics", true);
         return track;
     }
 
-    private static String optText(JSONObject object, String name) {
-        if (object == null || !object.has(name) || object.isNull(name)) {
+    /**
+     * Accepts a JSON string, or absent/null. Any other JSON type is a malformed row: a number must
+     * never be coerced into lyrics text.
+     *
+     * @param requireWellFormedText true for the two lyric fields, whose value becomes editor text
+     *                              and is later serialized to UTF-8 by Save
+     */
+    private static String readString(JSONObject object, String name, boolean requireWellFormedText) throws MalformedResponseException {
+        if (object == null || !object.has(name)) {
             return null;
         }
-        return object.optString(name, null);
+        Object value = object.opt(name);
+        if (value == null || value == JSONObject.NULL) {
+            return null;
+        }
+        if (!(value instanceof String)) {
+            throw new MalformedResponseException(name);
+        }
+        String text = (String) value;
+        if (requireWellFormedText && !isWellFormedUtf16(text)) {
+            throw new MalformedResponseException(name);
+        }
+        return text;
+    }
+
+    /** {@code duration} is {@code Option<f64>}: absent and null are valid, anything non-numeric is not. */
+    private static double readDuration(JSONObject object) throws MalformedResponseException {
+        if (!object.has("duration")) {
+            return INVALID_DURATION;
+        }
+        Object value = object.opt("duration");
+        if (value == null || value == JSONObject.NULL) {
+            return INVALID_DURATION;
+        }
+        if (!(value instanceof Number)) {
+            throw new MalformedResponseException("duration");
+        }
+        final double duration = ((Number) value).doubleValue();
+        // NaN and infinity are not a broken document, but they must never reach ranking: every
+        // comparison against NaN is false, which would make the winner depend on iteration order.
+        return Double.isNaN(duration) || Double.isInfinite(duration) ? INVALID_DURATION : duration;
+    }
+
+    /**
+     * {@code instrumental} is a plain {@code bool} on the server, so it is either absent (older or
+     * trimmed payloads) or a real JSON boolean. The string {@code "false"} is not a boolean and is
+     * never quietly read as one.
+     */
+    private static boolean readInstrumental(JSONObject object) throws MalformedResponseException {
+        if (!object.has("instrumental")) {
+            return false;
+        }
+        Object value = object.opt("instrumental");
+        if (!(value instanceof Boolean)) {
+            throw new MalformedResponseException("instrumental");
+        }
+        return (Boolean) value;
+    }
+
+    /**
+     * True when every surrogate in {@code text} is part of a complete pair. JSON can spell a lone
+     * surrogate with a single six-character escape for a high or low surrogate code unit, and such
+     * a string cannot round-trip: Java's UTF-8 encoder replaces it with '?', so what Save would
+     * write to disk would differ from what the editor was shown. Legitimate supplementary
+     * characters - emoji and the like - are whole pairs and pass untouched.
+     */
+    private static boolean isWellFormedUtf16(String text) {
+        for (int a = 0; a < text.length(); a++) {
+            final char c = text.charAt(a);
+            if (Character.isHighSurrogate(c)) {
+                if (a + 1 >= text.length() || !Character.isLowSurrogate(text.charAt(a + 1))) {
+                    return false;
+                }
+                a++;
+            } else if (Character.isLowSurrogate(c)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     // endregion
