@@ -2,6 +2,9 @@ name: Build Telegram APK
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - codex/add-true-karaoke-support-to-lyrics-feature
 
 jobs:
   build:
@@ -23,6 +26,8 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
 
       - name: Install Android dependencies
         run: |
