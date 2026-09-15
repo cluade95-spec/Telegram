@@ -5,6 +5,7 @@
 package org.telegram.ui.Components;
 
 import android.net.Uri;
+import android.os.SystemClock;
 import android.text.TextUtils;
 
 import org.json.JSONArray;
@@ -181,7 +182,7 @@ public final class LyricsOnlineSearch {
         final String cleanAlbum = sanitize(album);
         Utilities.externalNetworkQueue.postRunnable(() -> {
             if (type == Type.KARAOKE && provider == Provider.MUSIXMATCH) {
-                runMusixmatch(request, cleanArtist, cleanTitle, cleanAlbum, durationSeconds, callback);
+                runMusixmatch(request, cleanArtist, cleanTitle, cleanAlbum, durationSeconds, callback, false);
             } else if (type == Type.KARAOKE && provider == Provider.SYNCLRC) {
                 runSyncLrc(request, cleanArtist, cleanTitle, cleanAlbum, durationSeconds, callback);
             } else {
@@ -322,49 +323,129 @@ public final class LyricsOnlineSearch {
     // Isolated unofficial providers. Neither path falls through to LRCLIB or another lyric type.
     private static final String MUSIXMATCH_HOST = "https://apic-desktop.musixmatch.com/ws/1.1/";
     private static final String MUSIXMATCH_APP_ID = "web-desktop-app-v1.0";
-    private static final String SYNCLRC_HOST = "https://synclrc.com/api/lyrics";
+    private static final String SYNCLRC_HOST = "https://api.synclrc.dev/lyrics";
+    private static final long MUSIXMATCH_TOKEN_TTL_MS = 10 * 60 * 1000L;
+    private static final Object musixmatchTokenLock = new Object();
+    private static volatile String musixmatchToken;
+    private static volatile long musixmatchTokenExpiresAt;
 
     private static void runMusixmatch(Request request, String artist, String title, String album,
-                                      double durationSeconds, Callback callback) {
+                                      double durationSeconds, Callback callback, boolean tokenRetried) {
         if (TextUtils.isEmpty(artist) || TextUtils.isEmpty(title)) {
             deliver(request, callback, null, Error.NOT_FOUND);
             return;
         }
-        Response tokenResponse = fetch(request, MUSIXMATCH_HOST + "token.get?app_id=" + MUSIXMATCH_APP_ID);
-        if (tokenResponse.error != null || tokenResponse.status != 200) {
-            deliver(request, callback, null, tokenResponse.error != null ? tokenResponse.error : statusError(tokenResponse.status));
-            return;
-        }
-        String token = nestedString(tokenResponse.body, "message", "body", "user_token");
+        String token = getMusixmatchToken(request);
+        if (request.isCancelled()) return;
         if (TextUtils.isEmpty(token)) {
-            deliver(request, callback, null, Error.MALFORMED);
+            deliver(request, callback, null, Error.SERVER);
             return;
         }
-        StringBuilder search = new StringBuilder(MUSIXMATCH_HOST).append("track.search?app_id=").append(MUSIXMATCH_APP_ID)
+        StringBuilder macroUrl = new StringBuilder(MUSIXMATCH_HOST).append("macro.subtitles.get?app_id=").append(MUSIXMATCH_APP_ID)
                 .append("&usertoken=").append(Uri.encode(token)).append("&q_track=").append(Uri.encode(title))
-                .append("&q_artist=").append(Uri.encode(artist)).append("&f_has_richsync=1&s_track_rating=desc&page_size=10");
-        if (!TextUtils.isEmpty(album)) search.append("&q_album=").append(Uri.encode(album));
-        Response tracksResponse = fetch(request, search.toString());
-        if (tracksResponse.error != null || tracksResponse.status != 200) {
-            deliver(request, callback, null, tracksResponse.error != null ? tracksResponse.error : statusError(tracksResponse.status));
+                .append("&q_artist=").append(Uri.encode(artist)).append("&namespace=lyrics_richsynched&subtitle_format=lrc");
+        if (!TextUtils.isEmpty(album)) macroUrl.append("&q_album=").append(Uri.encode(album));
+        if (durationSeconds >= MIN_DURATION_SECONDS && durationSeconds <= MAX_DURATION_SECONDS) {
+            macroUrl.append("&q_duration=").append(formatDuration(durationSeconds));
+        }
+        Response macro = fetch(request, macroUrl.toString(), RequestProfile.MUSIXMATCH);
+        int macroStatus = musixmatchStatus(macro);
+        if (macroStatus == 401 && !tokenRetried) {
+            invalidateMusixmatchToken(token);
+            runMusixmatch(request, artist, title, album, durationSeconds, callback, true);
             return;
         }
-        long commonTrackId = pickMusixmatchTrack(tracksResponse.body, title, artist, durationSeconds);
+        if (macro.error != null || macro.status != 200 || macroStatus != 200) {
+            deliver(request, callback, null, musixmatchError(macro, macroStatus));
+            return;
+        }
+        JSONObject track = musixmatchMacroTrack(macro.body);
+        long commonTrackId = usableMusixmatchTrack(track, title, artist, durationSeconds);
         if (commonTrackId <= 0) {
             deliver(request, callback, null, Error.TYPE_UNAVAILABLE);
             return;
         }
         Response rich = fetch(request, MUSIXMATCH_HOST + "track.richsync.get?app_id=" + MUSIXMATCH_APP_ID
-                + "&usertoken=" + Uri.encode(token) + "&commontrack_id=" + commonTrackId);
+                + "&usertoken=" + Uri.encode(token) + "&commontrack_id=" + commonTrackId, RequestProfile.MUSIXMATCH);
+        int richStatus = musixmatchStatus(rich);
+        if (richStatus == 401 && !tokenRetried) {
+            invalidateMusixmatchToken(token);
+            runMusixmatch(request, artist, title, album, durationSeconds, callback, true);
+            return;
+        }
+        if (rich.error != null || rich.status != 200 || richStatus != 200) {
+            deliver(request, callback, null, musixmatchError(rich, richStatus));
+            return;
+        }
         String body = nestedString(rich.body, "message", "body", "richsync", "richsync_body");
         String enhanced = richSyncToEnhancedLrc(body);
-        if (rich.error != null || rich.status != 200) {
-            deliver(request, callback, null, rich.error != null ? rich.error : statusError(rich.status));
-        } else if (!SyncedLyricsController.hasKaraokeTiming(enhanced)) {
+        if (!SyncedLyricsController.hasKaraokeTiming(enhanced)) {
             deliver(request, callback, null, Error.TYPE_UNAVAILABLE);
         } else {
             deliver(request, callback, enhanced, null);
         }
+    }
+
+    private static String getMusixmatchToken(Request request) {
+        long now = SystemClock.elapsedRealtime();
+        String cached = musixmatchToken;
+        if (!TextUtils.isEmpty(cached) && now < musixmatchTokenExpiresAt) return cached;
+        synchronized (musixmatchTokenLock) {
+            now = SystemClock.elapsedRealtime();
+            if (!TextUtils.isEmpty(musixmatchToken) && now < musixmatchTokenExpiresAt) return musixmatchToken;
+            Response response = fetch(request, MUSIXMATCH_HOST + "token.get?app_id=" + MUSIXMATCH_APP_ID, RequestProfile.MUSIXMATCH);
+            if (response.error != null || response.status != 200 || musixmatchStatus(response) != 200) return null;
+            String token = nestedString(response.body, "message", "body", "user_token");
+            if (TextUtils.isEmpty(token)) return null;
+            musixmatchToken = token;
+            musixmatchTokenExpiresAt = now + MUSIXMATCH_TOKEN_TTL_MS;
+            return token;
+        }
+    }
+
+    private static void invalidateMusixmatchToken(String token) {
+        synchronized (musixmatchTokenLock) {
+            if (TextUtils.equals(token, musixmatchToken)) {
+                musixmatchToken = null;
+                musixmatchTokenExpiresAt = 0;
+            }
+        }
+    }
+
+    private static int musixmatchStatus(Response response) {
+        if (response == null || TextUtils.isEmpty(response.body)) return 0;
+        try {
+            return new JSONObject(response.body).getJSONObject("message").getJSONObject("header").getInt("status_code");
+        } catch (Throwable e) {
+            return 0;
+        }
+    }
+
+    private static Error musixmatchError(Response response, int apiStatus) {
+        if (response != null && response.error != null) return response.error;
+        if (apiStatus == 404) return Error.NOT_FOUND;
+        if (apiStatus == 401 || apiStatus == 402 || apiStatus == 429) return Error.RATE_LIMITED;
+        return response == null ? Error.SERVER : statusError(response.status);
+    }
+
+    private static JSONObject musixmatchMacroTrack(String body) {
+        try {
+            return new JSONObject(body).getJSONObject("message").getJSONObject("body")
+                    .getJSONObject("macro_calls").getJSONObject("matcher.track.get")
+                    .getJSONObject("message").getJSONObject("body").getJSONObject("track");
+        } catch (Throwable e) {
+            return null;
+        }
+    }
+
+    private static long usableMusixmatchTrack(JSONObject track, String title, String artist, double durationSeconds) {
+        if (track == null || !track.optBoolean("has_richsync", false) && track.optInt("has_richsync", 0) != 1) return -1;
+        if (!normalize(title).equals(normalize(track.optString("track_name")))) return -1;
+        if (!normalize(artist).equals(normalize(track.optString("artist_name")))) return -1;
+        double length = track.optDouble("track_length", INVALID_DURATION);
+        if (durationSeconds >= MIN_DURATION_SECONDS && length >= MIN_DURATION_SECONDS
+                && Math.abs(length - durationSeconds) > 12) return -1;
+        return track.optLong("commontrack_id", -1);
     }
 
     private static void runSyncLrc(Request request, String artist, String title, String album,
@@ -379,7 +460,7 @@ public final class LyricsOnlineSearch {
         if (durationSeconds >= MIN_DURATION_SECONDS && durationSeconds <= MAX_DURATION_SECONDS) {
             url.append("&duration=").append(formatDuration(durationSeconds));
         }
-        Response response = fetch(request, url.toString());
+        Response response = fetch(request, url.toString(), RequestProfile.SYNCLRC);
         if (response.error != null || response.status != 200) {
             deliver(request, callback, null, response.error != null ? response.error : response.status == 404 ? Error.NOT_FOUND : statusError(response.status));
             return;
@@ -415,33 +496,7 @@ public final class LyricsOnlineSearch {
         }
     }
 
-    private static long pickMusixmatchTrack(String body, String title, String artist, double durationSeconds) {
-        try {
-            JSONArray list = new JSONObject(body).getJSONObject("message").getJSONObject("body").getJSONArray("track_list");
-            long bestId = -1;
-            double bestDelta = Double.MAX_VALUE;
-            for (int i = 0; i < Math.min(10, list.length()); i++) {
-                JSONObject track = list.getJSONObject(i).getJSONObject("track");
-                if (!track.optBoolean("has_richsync", false) && track.optInt("has_richsync", 0) != 1) continue;
-                if (!normalize(title).equals(normalize(track.optString("track_name")))) continue;
-                if (!normalize(artist).equals(normalize(track.optString("artist_name")))) continue;
-                double length = track.optDouble("track_length", INVALID_DURATION);
-                double delta = durationSeconds >= MIN_DURATION_SECONDS && length >= MIN_DURATION_SECONDS
-                        ? Math.abs(length - durationSeconds) : 0;
-                // RichSync belongs to a recording; a strong duration disagreement is not a match.
-                if (delta > 12) continue;
-                if (delta < bestDelta) {
-                    bestDelta = delta;
-                    bestId = track.optLong("commontrack_id", -1);
-                }
-            }
-            return bestId;
-        } catch (Throwable e) {
-            return -1;
-        }
-    }
-
-    private static String richSyncToEnhancedLrc(String body) {
+    static String richSyncToEnhancedLrc(String body) {
         if (TextUtils.isEmpty(body)) return null;
         try {
             JSONArray lines = new JSONArray(body);
@@ -449,14 +504,33 @@ public final class LyricsOnlineSearch {
             for (int i = 0; i < lines.length(); i++) {
                 JSONObject line = lines.getJSONObject(i);
                 double lineStart = line.getDouble("ts");
+                if (Double.isNaN(lineStart) || Double.isInfinite(lineStart) || lineStart < 0) return null;
+                String lineText = line.getString("x");
                 JSONArray segments = line.getJSONArray("l");
                 if (segments.length() == 0) continue;
-                result.append(formatLrcTime(lineStart));
+                StringBuilder reconstructed = new StringBuilder(lineText.length());
+                StringBuilder enhancedLine = new StringBuilder(lineText.length() + segments.length() * 12);
+                boolean hasTextTiming = false;
                 for (int j = 0; j < segments.length(); j++) {
                     JSONObject segment = segments.getJSONObject(j);
-                    result.append(formatWordTime(lineStart + segment.getDouble("o")));
-                    result.append(segment.getString("c"));
+                    String chunk = segment.getString("c");
+                    reconstructed.append(chunk);
+                    // RichSync may split spacing into independent chunks. Preserve it verbatim,
+                    // but never advertise whitespace as a timed lyric segment.
+                    if (!chunk.trim().isEmpty()) {
+                        double offset = segment.getDouble("o");
+                        if (Double.isNaN(offset) || Double.isInfinite(offset) || offset < 0) return null;
+                        enhancedLine.append(formatWordTime(lineStart + offset));
+                        hasTextTiming = true;
+                    }
+                    enhancedLine.append(chunk);
                 }
+                // x is the provider's displayed line source of truth. Refuse a payload whose
+                // chunks would alter it rather than trying to reconstruct or normalize the line.
+                if (!lineText.contentEquals(reconstructed)) return null;
+                result.append(formatLrcTime(lineStart));
+                if (hasTextTiming) result.append(enhancedLine);
+                else result.append(lineText);
                 result.append('\n');
             }
             return result.toString();
@@ -483,7 +557,15 @@ public final class LyricsOnlineSearch {
         long retryAfterMs;
     }
 
+    private enum RequestProfile {
+        LRCLIB, MUSIXMATCH, SYNCLRC
+    }
+
     private static Response fetch(Request request, String url) {
+        return fetch(request, url, RequestProfile.LRCLIB);
+    }
+
+    private static Response fetch(Request request, String url, RequestProfile profile) {
         Response result = new Response();
         HttpURLConnection connection = null;
         InputStream stream = null;
@@ -497,7 +579,16 @@ public final class LyricsOnlineSearch {
             connection.setConnectTimeout(CONNECT_TIMEOUT_MS);
             connection.setReadTimeout(READ_TIMEOUT_MS);
             connection.setRequestProperty("Accept", "application/json");
-            connection.setRequestProperty("Lrclib-Client", CLIENT_ID);
+            if (profile == RequestProfile.LRCLIB) {
+                connection.setRequestProperty("Lrclib-Client", CLIENT_ID);
+            } else if (profile == RequestProfile.MUSIXMATCH) {
+                // Match the public desktop-client flow without leaking LRCLIB's private header to
+                // another service. This is a static product identity, never an account identity.
+                connection.setRequestProperty("User-Agent", "Mozilla/5.0 Musixmatch-Desktop/3.0.0");
+                connection.setRequestProperty("Origin", "https://www.musixmatch.com");
+            } else {
+                connection.setRequestProperty("User-Agent", CLIENT_ID);
+            }
             request.attach(connection);
             if (request.isCancelled()) {
                 return result;
