@@ -7,6 +7,19 @@ import org.junit.Test
 import org.telegram.messenger.SyncedLyricsController
 
 class LyricsOnlineSearchTest {
+    @Test fun eitherHttpOrJson401IsATokenFailure() {
+        assertEquals(true, LyricsOnlineSearch.isMusixmatchTokenFailure(401, 0))
+        assertEquals(true, LyricsOnlineSearch.isMusixmatchTokenFailure(200, 401))
+        assertEquals(false, LyricsOnlineSearch.isMusixmatchTokenFailure(200, 200))
+    }
+
+    @Test fun upgradeOnlyAndBlankTokensAreRejected() {
+        assertEquals(false, LyricsOnlineSearch.isUsableMusixmatchToken(null))
+        assertEquals(false, LyricsOnlineSearch.isUsableMusixmatchToken("  "))
+        assertEquals(false, LyricsOnlineSearch.isUsableMusixmatchToken("UpgradeOnly-token"))
+        assertEquals(true, LyricsOnlineSearch.isUsableMusixmatchToken("anonymous-token"))
+    }
+
     @Test fun richSyncPreservesLineAndDoesNotTimeWhitespaceChunks() {
         val richSync = """[{"ts":10.0,"te":12.0,"x":"hello world","l":[{"c":"hello","o":0.0},{"c":" ","o":0.3},{"c":"world","o":0.5}]}]"""
 

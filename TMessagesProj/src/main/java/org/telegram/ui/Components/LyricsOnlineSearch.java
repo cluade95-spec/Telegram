@@ -341,7 +341,7 @@ public final class LyricsOnlineSearch {
             deliver(request, callback, null, Error.SERVER);
             return;
         }
-        StringBuilder macroUrl = new StringBuilder(MUSIXMATCH_HOST).append("macro.subtitles.get?app_id=").append(MUSIXMATCH_APP_ID)
+        StringBuilder macroUrl = new StringBuilder(MUSIXMATCH_HOST).append("macro.subtitles.get?format=json&app_id=").append(MUSIXMATCH_APP_ID)
                 .append("&usertoken=").append(Uri.encode(token)).append("&q_track=").append(Uri.encode(title))
                 .append("&q_artist=").append(Uri.encode(artist)).append("&namespace=lyrics_richsynched&subtitle_format=lrc");
         if (!TextUtils.isEmpty(album)) macroUrl.append("&q_album=").append(Uri.encode(album));
@@ -350,7 +350,7 @@ public final class LyricsOnlineSearch {
         }
         Response macro = fetch(request, macroUrl.toString(), RequestProfile.MUSIXMATCH);
         int macroStatus = musixmatchStatus(macro);
-        if (macroStatus == 401 && !tokenRetried) {
+        if (isMusixmatchTokenFailure(macro.status, macroStatus) && !tokenRetried) {
             invalidateMusixmatchToken(token);
             runMusixmatch(request, artist, title, album, durationSeconds, callback, true);
             return;
@@ -365,10 +365,10 @@ public final class LyricsOnlineSearch {
             deliver(request, callback, null, Error.TYPE_UNAVAILABLE);
             return;
         }
-        Response rich = fetch(request, MUSIXMATCH_HOST + "track.richsync.get?app_id=" + MUSIXMATCH_APP_ID
+        Response rich = fetch(request, MUSIXMATCH_HOST + "track.richsync.get?format=json&app_id=" + MUSIXMATCH_APP_ID
                 + "&usertoken=" + Uri.encode(token) + "&commontrack_id=" + commonTrackId, RequestProfile.MUSIXMATCH);
         int richStatus = musixmatchStatus(rich);
-        if (richStatus == 401 && !tokenRetried) {
+        if (isMusixmatchTokenFailure(rich.status, richStatus) && !tokenRetried) {
             invalidateMusixmatchToken(token);
             runMusixmatch(request, artist, title, album, durationSeconds, callback, true);
             return;
@@ -393,14 +393,23 @@ public final class LyricsOnlineSearch {
         synchronized (musixmatchTokenLock) {
             now = SystemClock.elapsedRealtime();
             if (!TextUtils.isEmpty(musixmatchToken) && now < musixmatchTokenExpiresAt) return musixmatchToken;
-            Response response = fetch(request, MUSIXMATCH_HOST + "token.get?app_id=" + MUSIXMATCH_APP_ID, RequestProfile.MUSIXMATCH);
+            Response response = fetch(request, MUSIXMATCH_HOST + "token.get?format=json&app_id=" + MUSIXMATCH_APP_ID
+                    + "&t=" + System.currentTimeMillis(), RequestProfile.MUSIXMATCH);
             if (response.error != null || response.status != 200 || musixmatchStatus(response) != 200) return null;
             String token = nestedString(response.body, "message", "body", "user_token");
-            if (TextUtils.isEmpty(token)) return null;
+            if (!isUsableMusixmatchToken(token)) return null;
             musixmatchToken = token;
             musixmatchTokenExpiresAt = now + MUSIXMATCH_TOKEN_TTL_MS;
             return token;
         }
+    }
+
+    static boolean isMusixmatchTokenFailure(int httpStatus, int apiStatus) {
+        return httpStatus == HttpURLConnection.HTTP_UNAUTHORIZED || apiStatus == HttpURLConnection.HTTP_UNAUTHORIZED;
+    }
+
+    static boolean isUsableMusixmatchToken(String token) {
+        return !TextUtils.isEmpty(token) && !token.trim().isEmpty() && !token.startsWith("UpgradeOnly");
     }
 
     private static void invalidateMusixmatchToken(String token) {
@@ -424,7 +433,8 @@ public final class LyricsOnlineSearch {
     private static Error musixmatchError(Response response, int apiStatus) {
         if (response != null && response.error != null) return response.error;
         if (apiStatus == 404) return Error.NOT_FOUND;
-        if (apiStatus == 401 || apiStatus == 402 || apiStatus == 429) return Error.RATE_LIMITED;
+        if ((response != null && response.status == HttpURLConnection.HTTP_UNAUTHORIZED)
+                || apiStatus == 401 || apiStatus == 402 || apiStatus == 429) return Error.RATE_LIMITED;
         return response == null ? Error.SERVER : statusError(response.status);
     }
 
@@ -584,7 +594,8 @@ public final class LyricsOnlineSearch {
             } else if (profile == RequestProfile.MUSIXMATCH) {
                 // Match the public desktop-client flow without leaking LRCLIB's private header to
                 // another service. This is a static product identity, never an account identity.
-                connection.setRequestProperty("User-Agent", "Mozilla/5.0 Musixmatch-Desktop/3.0.0");
+                connection.setRequestProperty("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36");
+                connection.setRequestProperty("Cookie", "x-mxm-token-guid=");
                 connection.setRequestProperty("Origin", "https://www.musixmatch.com");
             } else {
                 connection.setRequestProperty("User-Agent", CLIENT_ID);
