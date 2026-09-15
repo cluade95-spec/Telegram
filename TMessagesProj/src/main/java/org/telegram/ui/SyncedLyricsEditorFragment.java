@@ -676,16 +676,37 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
         AlertDialog dialog = new AlertDialog.Builder(activity, getResourceProvider())
                 .setTitle(LocaleController.getString(R.string.LyricsOnlineSearch))
                 .setView(container)
-                .setPositiveButton(LocaleController.getString(R.string.LyricsOnlineSearchSynced),
-                        (ignored, which) -> startOnlineSearch(LyricsOnlineSearch.Type.SYNCED, artistField, titleField))
-                .setNegativeButton(LocaleController.getString(R.string.LyricsOnlineSearchPlain),
-                        (ignored, which) -> startOnlineSearch(LyricsOnlineSearch.Type.PLAIN, artistField, titleField))
-                .setNeutralButton(LocaleController.getString(R.string.Cancel), null)
+                .setPositiveButton(LocaleController.getString(R.string.LyricsOnlineSearchKaraoke),
+                        (ignored, which) -> showKaraokeProviders(artistField, titleField))
+                .setNegativeButton(LocaleController.getString(R.string.LyricsOnlineSearchSynced),
+                        (ignored, which) -> startOnlineSearch(LyricsOnlineSearch.Type.SYNCED, LyricsOnlineSearch.Provider.LRCLIB, artistField, titleField))
+                .setNeutralButton(LocaleController.getString(R.string.LyricsOnlineSearchPlain),
+                        (ignored, which) -> startOnlineSearch(LyricsOnlineSearch.Type.PLAIN, LyricsOnlineSearch.Provider.LRCLIB, artistField, titleField))
                 // Remembering what was typed is what keeps the fields alive across a failed search.
                 .setOnDismissListener(ignored -> rememberSearchFields(artistField, titleField))
                 .create();
         showDialog(dialog);
         artistField.requestFocus();
+    }
+
+    private void showKaraokeProviders(EditTextBoldCursor artistField, EditTextBoldCursor titleField) {
+        rememberSearchFields(artistField, titleField);
+        Activity activity = getParentActivity();
+        if (activity == null) return;
+        CharSequence[] providers = {
+                LocaleController.getString(R.string.LyricsOnlineSearchMusixmatch),
+                LocaleController.getString(R.string.LyricsOnlineSearchSyncLRC),
+                LocaleController.getString(R.string.LyricsOnlineSearchLRCLIB)
+        };
+        AlertDialog dialog = new AlertDialog.Builder(activity, getResourceProvider())
+                .setTitle(LocaleController.getString(R.string.LyricsOnlineSearchKaraoke))
+                .setItems(providers, (ignored, which) -> {
+                    LyricsOnlineSearch.Provider provider = which == 0 ? LyricsOnlineSearch.Provider.MUSIXMATCH
+                            : which == 1 ? LyricsOnlineSearch.Provider.SYNCLRC : LyricsOnlineSearch.Provider.LRCLIB;
+                    startOnlineSearch(LyricsOnlineSearch.Type.KARAOKE, provider, artistField, titleField);
+                })
+                .create();
+        showDialog(dialog);
     }
 
     private TextView createSearchLabel(Context context, int label) {
@@ -725,7 +746,8 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
         if (titleField != null) searchTitle = titleField.getText().toString();
     }
 
-    private void startOnlineSearch(LyricsOnlineSearch.Type type, EditTextBoldCursor artistField, EditTextBoldCursor titleField) {
+    private void startOnlineSearch(LyricsOnlineSearch.Type type, LyricsOnlineSearch.Provider provider,
+                                   EditTextBoldCursor artistField, EditTextBoldCursor titleField) {
         rememberSearchFields(artistField, titleField);
         if (searching || saving || importing || !editorReady) return;
         final Activity activity = getParentActivity();
@@ -745,7 +767,7 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
         onlineProgressDialog = progress;
 
         final LyricsOnlineSearch.Request[] started = new LyricsOnlineSearch.Request[1];
-        started[0] = LyricsOnlineSearch.search(searchArtist, searchTitle, messageObject.getDuration(), type, (lyrics, error) -> {
+        started[0] = LyricsOnlineSearch.search(searchArtist, searchTitle, "", messageObject.getDuration(), type, provider, (lyrics, error) -> {
             // Only the search that still owns the editor may act. A cancelled request never calls
             // back at all; this also rejects a result whose search has been superseded.
             if (started[0] == null || onlineRequest != started[0]) return;
@@ -761,7 +783,9 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
             if (lyrics != null) {
                 applyOnlineLyrics(lyrics);
             } else {
-                showError(onlineSearchErrorMessage(error));
+                showError(type == LyricsOnlineSearch.Type.KARAOKE && (error == LyricsOnlineSearch.Error.NOT_FOUND
+                        || error == LyricsOnlineSearch.Error.TYPE_UNAVAILABLE)
+                        ? R.string.LyricsOnlineSearchKaraokeNotFound : onlineSearchErrorMessage(error));
             }
         });
         onlineRequest = started[0];

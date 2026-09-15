@@ -12,6 +12,7 @@ import org.json.JSONException;
 import org.json.JSONObject;
 import org.json.JSONTokener;
 import org.telegram.messenger.AndroidUtilities;
+import org.telegram.messenger.SyncedLyricsController;
 import org.telegram.messenger.Utilities;
 
 import java.io.ByteArrayOutputStream;
@@ -54,10 +55,16 @@ public final class LyricsOnlineSearch {
 
     /** Which lyric flavour the user explicitly asked for. There is deliberately no automatic mode. */
     public enum Type {
+        /** Only genuine word-timed Enhanced LRC is acceptable. */
+        KARAOKE,
         /** Only {@code syncedLyrics} is acceptable. */
         SYNCED,
         /** Only {@code plainLyrics} is acceptable. */
         PLAIN
+    }
+
+    public enum Provider {
+        MUSIXMATCH, SYNCLRC, LRCLIB
     }
 
     /** Distinguishable failure reasons, so the UI never has to collapse everything into "failed". */
@@ -163,10 +170,24 @@ public final class LyricsOnlineSearch {
      * @param type            the flavour the user explicitly chose
      */
     public static Request search(String artist, String title, double durationSeconds, Type type, Callback callback) {
+        return search(artist, title, "", durationSeconds, type, Provider.LRCLIB, callback);
+    }
+
+    public static Request search(String artist, String title, String album, double durationSeconds,
+                                 Type type, Provider provider, Callback callback) {
         final Request request = new Request();
         final String cleanArtist = sanitize(artist);
         final String cleanTitle = sanitize(title);
-        Utilities.externalNetworkQueue.postRunnable(() -> run(request, cleanArtist, cleanTitle, durationSeconds, type, callback, false));
+        final String cleanAlbum = sanitize(album);
+        Utilities.externalNetworkQueue.postRunnable(() -> {
+            if (type == Type.KARAOKE && provider == Provider.MUSIXMATCH) {
+                runMusixmatch(request, cleanArtist, cleanTitle, cleanAlbum, durationSeconds, callback);
+            } else if (type == Type.KARAOKE && provider == Provider.SYNCLRC) {
+                runSyncLrc(request, cleanArtist, cleanTitle, cleanAlbum, durationSeconds, callback);
+            } else {
+                run(request, cleanArtist, cleanTitle, durationSeconds, type, callback, false);
+            }
+        });
         return request;
     }
 
@@ -296,6 +317,160 @@ public final class LyricsOnlineSearch {
             }
             callback.onResult(lyrics, error);
         });
+    }
+
+    // Isolated unofficial providers. Neither path falls through to LRCLIB or another lyric type.
+    private static final String MUSIXMATCH_HOST = "https://apic-desktop.musixmatch.com/ws/1.1/";
+    private static final String MUSIXMATCH_APP_ID = "web-desktop-app-v1.0";
+    private static final String SYNCLRC_HOST = "https://synclrc.com/api/lyrics";
+
+    private static void runMusixmatch(Request request, String artist, String title, String album,
+                                      double durationSeconds, Callback callback) {
+        if (TextUtils.isEmpty(artist) || TextUtils.isEmpty(title)) {
+            deliver(request, callback, null, Error.NOT_FOUND);
+            return;
+        }
+        Response tokenResponse = fetch(request, MUSIXMATCH_HOST + "token.get?app_id=" + MUSIXMATCH_APP_ID);
+        if (tokenResponse.error != null || tokenResponse.status != 200) {
+            deliver(request, callback, null, tokenResponse.error != null ? tokenResponse.error : statusError(tokenResponse.status));
+            return;
+        }
+        String token = nestedString(tokenResponse.body, "message", "body", "user_token");
+        if (TextUtils.isEmpty(token)) {
+            deliver(request, callback, null, Error.MALFORMED);
+            return;
+        }
+        StringBuilder search = new StringBuilder(MUSIXMATCH_HOST).append("track.search?app_id=").append(MUSIXMATCH_APP_ID)
+                .append("&usertoken=").append(Uri.encode(token)).append("&q_track=").append(Uri.encode(title))
+                .append("&q_artist=").append(Uri.encode(artist)).append("&f_has_richsync=1&s_track_rating=desc&page_size=10");
+        if (!TextUtils.isEmpty(album)) search.append("&q_album=").append(Uri.encode(album));
+        Response tracksResponse = fetch(request, search.toString());
+        if (tracksResponse.error != null || tracksResponse.status != 200) {
+            deliver(request, callback, null, tracksResponse.error != null ? tracksResponse.error : statusError(tracksResponse.status));
+            return;
+        }
+        long commonTrackId = pickMusixmatchTrack(tracksResponse.body, title, artist, durationSeconds);
+        if (commonTrackId <= 0) {
+            deliver(request, callback, null, Error.TYPE_UNAVAILABLE);
+            return;
+        }
+        Response rich = fetch(request, MUSIXMATCH_HOST + "track.richsync.get?app_id=" + MUSIXMATCH_APP_ID
+                + "&usertoken=" + Uri.encode(token) + "&commontrack_id=" + commonTrackId);
+        String body = nestedString(rich.body, "message", "body", "richsync", "richsync_body");
+        String enhanced = richSyncToEnhancedLrc(body);
+        if (rich.error != null || rich.status != 200) {
+            deliver(request, callback, null, rich.error != null ? rich.error : statusError(rich.status));
+        } else if (!SyncedLyricsController.hasKaraokeTiming(enhanced)) {
+            deliver(request, callback, null, Error.TYPE_UNAVAILABLE);
+        } else {
+            deliver(request, callback, enhanced, null);
+        }
+    }
+
+    private static void runSyncLrc(Request request, String artist, String title, String album,
+                                   double durationSeconds, Callback callback) {
+        if (TextUtils.isEmpty(artist) && TextUtils.isEmpty(title)) {
+            deliver(request, callback, null, Error.NOT_FOUND);
+            return;
+        }
+        StringBuilder url = new StringBuilder(SYNCLRC_HOST).append("?type=karaoke&track=").append(Uri.encode(title))
+                .append("&artist=").append(Uri.encode(artist));
+        if (!TextUtils.isEmpty(album)) url.append("&album=").append(Uri.encode(album));
+        if (durationSeconds >= MIN_DURATION_SECONDS && durationSeconds <= MAX_DURATION_SECONDS) {
+            url.append("&duration=").append(formatDuration(durationSeconds));
+        }
+        Response response = fetch(request, url.toString());
+        if (response.error != null || response.status != 200) {
+            deliver(request, callback, null, response.error != null ? response.error : response.status == 404 ? Error.NOT_FOUND : statusError(response.status));
+            return;
+        }
+        String lyrics = syncLrcKaraoke(response.body);
+        boolean karaoke = SyncedLyricsController.hasKaraokeTiming(lyrics);
+        deliver(request, callback, karaoke ? lyrics : null, karaoke ? null : Error.TYPE_UNAVAILABLE);
+    }
+
+    private static String syncLrcKaraoke(String body) {
+        try {
+            Object value = new JSONTokener(body).nextValue();
+            if (!(value instanceof JSONObject)) return null;
+            JSONObject object = (JSONObject) value;
+            String type = object.optString("type", object.optString("resultType", ""));
+            if (!TextUtils.isEmpty(type) && !"karaoke".equalsIgnoreCase(type)) return null;
+            String lyrics = object.optString("karaoke", null);
+            if (TextUtils.isEmpty(lyrics)) lyrics = object.optString("lyrics", null);
+            if (TextUtils.isEmpty(lyrics)) lyrics = object.optString("syncedLyrics", null);
+            return lyrics;
+        } catch (Throwable e) {
+            return null;
+        }
+    }
+
+    private static String nestedString(String body, String... path) {
+        try {
+            Object value = new JSONTokener(body).nextValue();
+            for (int i = 0; i < path.length - 1; i++) value = ((JSONObject) value).getJSONObject(path[i]);
+            return ((JSONObject) value).optString(path[path.length - 1], null);
+        } catch (Throwable e) {
+            return null;
+        }
+    }
+
+    private static long pickMusixmatchTrack(String body, String title, String artist, double durationSeconds) {
+        try {
+            JSONArray list = new JSONObject(body).getJSONObject("message").getJSONObject("body").getJSONArray("track_list");
+            long bestId = -1;
+            double bestDelta = Double.MAX_VALUE;
+            for (int i = 0; i < Math.min(10, list.length()); i++) {
+                JSONObject track = list.getJSONObject(i).getJSONObject("track");
+                if (!track.optBoolean("has_richsync", false) && track.optInt("has_richsync", 0) != 1) continue;
+                if (!normalize(title).equals(normalize(track.optString("track_name")))) continue;
+                if (!normalize(artist).equals(normalize(track.optString("artist_name")))) continue;
+                double length = track.optDouble("track_length", INVALID_DURATION);
+                double delta = durationSeconds >= MIN_DURATION_SECONDS && length >= MIN_DURATION_SECONDS
+                        ? Math.abs(length - durationSeconds) : 0;
+                // RichSync belongs to a recording; a strong duration disagreement is not a match.
+                if (delta > 12) continue;
+                if (delta < bestDelta) {
+                    bestDelta = delta;
+                    bestId = track.optLong("commontrack_id", -1);
+                }
+            }
+            return bestId;
+        } catch (Throwable e) {
+            return -1;
+        }
+    }
+
+    private static String richSyncToEnhancedLrc(String body) {
+        if (TextUtils.isEmpty(body)) return null;
+        try {
+            JSONArray lines = new JSONArray(body);
+            StringBuilder result = new StringBuilder();
+            for (int i = 0; i < lines.length(); i++) {
+                JSONObject line = lines.getJSONObject(i);
+                double lineStart = line.getDouble("ts");
+                JSONArray segments = line.getJSONArray("l");
+                if (segments.length() == 0) continue;
+                result.append(formatLrcTime(lineStart));
+                for (int j = 0; j < segments.length(); j++) {
+                    JSONObject segment = segments.getJSONObject(j);
+                    result.append(formatWordTime(lineStart + segment.getDouble("o")));
+                    result.append(segment.getString("c"));
+                }
+                result.append('\n');
+            }
+            return result.toString();
+        } catch (Throwable e) {
+            return null;
+        }
+    }
+
+    private static String formatLrcTime(double seconds) {
+        return String.format(Locale.US, "[%02d:%05.2f]", (int) (seconds / 60), seconds % 60);
+    }
+
+    private static String formatWordTime(double seconds) {
+        return String.format(Locale.US, "<%02d:%05.2f>", (int) (seconds / 60), seconds % 60);
     }
 
     // region networking
@@ -646,11 +821,14 @@ public final class LyricsOnlineSearch {
         if (track == null || track.instrumental) {
             return null;
         }
-        String lyrics = type == Type.SYNCED ? track.syncedLyrics : track.plainLyrics;
+        String lyrics = type == Type.PLAIN ? track.plainLyrics : track.syncedLyrics;
         if (lyrics == null || lyrics.trim().isEmpty()) {
             return null;
         }
         if (exceedsUtf8Bytes(lyrics, MAX_LYRICS_BYTES)) {
+            return null;
+        }
+        if (type == Type.KARAOKE && !SyncedLyricsController.hasKaraokeTiming(lyrics)) {
             return null;
         }
         return lyrics;

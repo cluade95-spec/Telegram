@@ -11186,6 +11186,11 @@
     <string name="ArticleInsertLeft">Insert Left</string>
     <string name="ArticleInsertRight">Insert Right</string>
     <string name="ArticleInsertAbove">Insert Above</string>
+    <string name="LyricsOnlineSearchKaraoke">Karaoke</string>
+    <string name="LyricsOnlineSearchMusixmatch">Musixmatch (Unofficial)</string>
+    <string name="LyricsOnlineSearchSyncLRC">SyncLRC</string>
+    <string name="LyricsOnlineSearchLRCLIB">LRCLIB</string>
+    <string name="LyricsOnlineSearchKaraokeNotFound">Karaoke lyrics not found</string>
     <string name="ArticleInsertBelow">Insert Below</string>
     <string name="ArticleDeleteColumn">Delete Column</string>
     <string name="ArticleDeleteRow">Delete Row</string>

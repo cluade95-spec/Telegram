@@ -26,7 +26,7 @@ import java.util.regex.Pattern;
 public final class SyncedLyricsController implements NotificationCenter.NotificationCenterDelegate {
     private static final Pattern TIMESTAMP = Pattern.compile("\\[(\\d{1,3}):(\\d{1,2})(?:[\\.:](\\d{1,3}))?\\]");
     private static final Pattern OFFSET = Pattern.compile("(?i)\\[offset\\s*:\\s*([+-]?\\d+)\\s*\\]");
-    private static final Pattern WORD_TIMESTAMP = Pattern.compile("<\\d{1,3}:\\d{1,2}(?:[\\.:]\\d{1,3})?>");
+    private static final Pattern WORD_TIMESTAMP = Pattern.compile("<(\\d{1,3}):(\\d{1,2})(?:[\\.:](\\d{1,3}))?>");
     private static final Pattern METADATA = Pattern.compile("(?i)^\\[[a-z][a-z0-9_-]{0,31}\\s*:.*]$");
     private static final Pattern LOOKS_TIMED = Pattern.compile("^\\s*(?:\\[\\d{1,3}:|<\\d{1,3}:).*");
     private static final SyncedLyricsController[] instances = new SyncedLyricsController[UserConfig.MAX_ACCOUNT_COUNT];
@@ -79,11 +79,31 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
         public final long timeMs;
         public final String text;
         public final boolean timed;
+        /** Optional Enhanced-LRC timing inside this line; offsets address {@link #text} in UTF-16. */
+        public final java.util.List<KaraokeSegment> karaokeSegments;
 
         private Line(long timeMs, String text, boolean timed) {
+            this(timeMs, text, timed, Collections.emptyList());
+        }
+
+        private Line(long timeMs, String text, boolean timed, java.util.List<KaraokeSegment> karaokeSegments) {
             this.timeMs = timeMs;
             this.text = text;
             this.timed = timed;
+            this.karaokeSegments = karaokeSegments == null || karaokeSegments.isEmpty()
+                    ? Collections.emptyList() : Collections.unmodifiableList(new ArrayList<>(karaokeSegments));
+        }
+    }
+
+    public static final class KaraokeSegment {
+        public final int startOffsetUtf16;
+        public final int endOffsetUtf16;
+        public final long startTimeMs;
+
+        private KaraokeSegment(int startOffsetUtf16, int endOffsetUtf16, long startTimeMs) {
+            this.startOffsetUtf16 = startOffsetUtf16;
+            this.endOffsetUtf16 = endOffsetUtf16;
+            this.startTimeMs = startTimeMs;
         }
     }
 
@@ -194,8 +214,8 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
                 }
             }
             if (times.isEmpty()) continue;
-            String text = WORD_TIMESTAMP.matcher(sourceLine.substring(end)).replaceAll("").trim();
-            for (Long time : times) parsed.add(new ParsedLine(time, text, order++));
+            ParsedText parsedText = parseTimedText(sourceLine.substring(end), offset);
+            for (Long time : times) parsed.add(new ParsedLine(time, parsedText.text, parsedText.segments, order++));
         }
         for (String sourceLine : sourceLines) {
             String text = sourceLine.trim();
@@ -222,7 +242,11 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
                     combined.append(text);
                 }
             }
-            result.add(new Line(parsed.get(i).timeMs, combined.toString(), true));
+            // Multiple source rows at the same timestamp are combined by the existing parser.
+            // Karaoke ranges are retained only for the ordinary one-source-row case, where every
+            // range still addresses the displayed text without inventing cross-row timing.
+            java.util.List<KaraokeSegment> segments = j == i + 1 ? parsed.get(i).segments : Collections.emptyList();
+            result.add(new Line(parsed.get(i).timeMs, combined.toString(), true, segments));
             i = j;
         }
         if (!result.isEmpty() && !hasUntimedContent) {
@@ -250,13 +274,76 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
     private static final class ParsedLine {
         final long timeMs;
         final String text;
+        final java.util.List<KaraokeSegment> segments;
         final int order;
 
-        ParsedLine(long timeMs, String text, int order) {
+        ParsedLine(long timeMs, String text, java.util.List<KaraokeSegment> segments, int order) {
             this.timeMs = timeMs;
             this.text = text;
+            this.segments = segments;
             this.order = order;
         }
+    }
+
+    private static final class ParsedText {
+        final String text;
+        final java.util.List<KaraokeSegment> segments;
+
+        ParsedText(String text, java.util.List<KaraokeSegment> segments) {
+            this.text = text;
+            this.segments = segments;
+        }
+    }
+
+    /** Removes Enhanced-LRC markers without reconstructing its text, retaining genuine ranges. */
+    private static ParsedText parseTimedText(String source, long offset) {
+        Matcher matcher = WORD_TIMESTAMP.matcher(source);
+        StringBuilder text = new StringBuilder(source.length());
+        ArrayList<Long> starts = new ArrayList<>();
+        ArrayList<Integer> offsets = new ArrayList<>();
+        int previous = 0;
+        boolean valid = true;
+        long lastTime = -1;
+        while (matcher.find()) {
+            text.append(source, previous, matcher.start());
+            try {
+                long seconds = Long.parseLong(matcher.group(2));
+                if (seconds >= 60) throw new NumberFormatException();
+                String fraction = matcher.group(3);
+                long millis = fraction == null ? 0 : Long.parseLong(fraction) * (fraction.length() == 1 ? 100 : fraction.length() == 2 ? 10 : 1);
+                long time = Math.max(0, (Long.parseLong(matcher.group(1)) * 60 + seconds) * 1000 + millis + offset);
+                if (time < lastTime) valid = false;
+                offsets.add(text.length());
+                starts.add(time);
+                lastTime = time;
+            } catch (RuntimeException e) {
+                valid = false;
+            }
+            previous = matcher.end();
+        }
+        text.append(source, previous, source.length());
+        int trimStart = 0, trimEnd = text.length();
+        while (trimStart < trimEnd && Character.isWhitespace(text.charAt(trimStart))) trimStart++;
+        while (trimEnd > trimStart && Character.isWhitespace(text.charAt(trimEnd - 1))) trimEnd--;
+        String displayed = text.substring(trimStart, trimEnd);
+        if (!valid || starts.isEmpty()) return new ParsedText(displayed, Collections.emptyList());
+        ArrayList<KaraokeSegment> segments = new ArrayList<>(starts.size());
+        for (int i = 0; i < starts.size(); i++) {
+            int start = Math.max(0, offsets.get(i) - trimStart);
+            int end = i + 1 < offsets.size() ? offsets.get(i + 1) - trimStart : displayed.length();
+            start = Math.min(start, displayed.length());
+            end = Math.max(start, Math.min(end, displayed.length()));
+            if (end > start) segments.add(new KaraokeSegment(start, end, starts.get(i)));
+        }
+        return new ParsedText(displayed, segments);
+    }
+
+    /** True only for a parseable synced document containing at least one real timed text range. */
+    public static boolean hasKaraokeTiming(String source) {
+        Lyrics lyrics = parse(source);
+        if (lyrics.kind != Kind.SYNCED) return false;
+        for (Line line : lyrics.lines) if (!line.karaokeSegments.isEmpty()) return true;
+        return false;
     }
 
     private static boolean hasValidLeadingTimestamp(String sourceLine) {

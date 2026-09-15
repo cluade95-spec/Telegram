@@ -2603,6 +2603,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         // The visual follow is re-evaluated on every tick so pause, seek and track changes always
         // recompute from the real playback position instead of from a stale schedule.
         updateLyricsFollow(true);
+        updateKaraokeProgress(index, SyncedLyricsController.positionMs(message));
         if (index == activeLyricsLine) return;
         int oldRow = activeLyricsRow;
         activeLyricsLine = index;
@@ -2615,6 +2616,16 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         }
         // No notifyItemChanged here: the timestamp changes the LOGICAL active line only. The
         // visual transition is already in flight from the pre-roll and owns the presentation.
+    }
+
+    /** Updates only the attached active row; text/layout/spans and the adapter remain untouched. */
+    private void updateKaraokeProgress(int line, long positionMs) {
+        int row = rowForLyricsLine(line);
+        View child = row == RecyclerView.NO_POSITION ? null : lyricsLayoutManager.findViewByPosition(row);
+        KaraokeLyricsTextView next = child instanceof KaraokeLyricsTextView ? (KaraokeLyricsTextView) child : null;
+        if (activeKaraokeView != next && activeKaraokeView != null) activeKaraokeView.setKaraokePosition(0, false);
+        activeKaraokeView = next;
+        if (next != null) next.setKaraokePosition(positionMs, true);
     }
 
     private void setShowingLyrics(boolean show, boolean animated) {
@@ -3171,6 +3182,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
     private int lyricsEmphasisFromRow = RecyclerView.NO_POSITION;
     private int lyricsEmphasisToRow = RecyclerView.NO_POSITION;
     private float lyricsEmphasisProgress = 1f;
+    private KaraokeLyricsTextView activeKaraokeView;
     private final Runnable advanceLyricsFollow = () -> updateLyricsFollow(true);
 
     private void cancelLyricsFollow() {
@@ -3692,7 +3704,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
 
         @Override
         public RecyclerView.ViewHolder onCreateViewHolder(ViewGroup parent, int viewType) {
-            TextView textView = new TextView(context);
+            TextView textView = new KaraokeLyricsTextView(context);
             textView.setLayoutParams(new RecyclerView.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
             textView.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
             textView.setTextDirection(View.TEXT_DIRECTION_FIRST_STRONG);
@@ -3708,6 +3720,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             int line = visibleLyrics.get(position);
             final boolean synced = currentLyrics.isSynced();
             textView.setText(currentLyrics.lines.get(line).text);
+            ((KaraokeLyricsTextView) textView).setLine(currentLyrics.lines.get(line));
             boolean stanzaSpace = !synced && TextUtils.isEmpty(currentLyrics.lines.get(line).text);
             // Identical viewport, typography, sizes, spacing and margins for timed and untimed
             // lyrics; only the timed visual hierarchy is synced-only.
@@ -3727,6 +3740,59 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 textView.setScaleY(1f);
             }
             textView.setBackground(stanzaSpace || !synced ? null : Theme.createSelectorDrawable(getThemedColor(Theme.key_listSelector), 2));
+        }
+    }
+
+    /** One ordinary lyric row with a clipped, no-allocation foreground pass for timed text. */
+    private class KaraokeLyricsTextView extends TextView {
+        private SyncedLyricsController.Line line;
+        private int completedOffset;
+        private boolean active;
+        private final android.graphics.Path completedPath = new android.graphics.Path();
+
+        KaraokeLyricsTextView(Context context) {
+            super(context);
+        }
+
+        void setLine(SyncedLyricsController.Line value) {
+            line = value;
+            completedOffset = 0;
+            active = false;
+        }
+
+        void setKaraokePosition(long positionMs, boolean isActive) {
+            int offset = 0;
+            if (line != null && isActive) {
+                for (int i = 0; i < line.karaokeSegments.size(); i++) {
+                    SyncedLyricsController.KaraokeSegment segment = line.karaokeSegments.get(i);
+                    if (segment.startTimeMs > positionMs) break;
+                    offset = segment.endOffsetUtf16;
+                }
+            }
+            if (completedOffset != offset || active != isActive) {
+                completedOffset = offset;
+                active = isActive;
+                invalidate();
+            }
+        }
+
+        @Override
+        protected void onDraw(Canvas canvas) {
+            super.onDraw(canvas);
+            if (!active || completedOffset <= 0 || getLayout() == null || line == null
+                    || line.karaokeSegments.isEmpty()) return;
+            final android.text.Layout layout = getLayout();
+            final int end = Math.min(completedOffset, length());
+            final int save = canvas.save();
+            canvas.translate(getTotalPaddingLeft() - getScrollX(), getExtendedPaddingTop() - getScrollY());
+            final int oldColor = layout.getPaint().getColor();
+            layout.getPaint().setColor(getThemedColor(Theme.key_player_actionBarTitle));
+            completedPath.reset();
+            layout.getSelectionPath(0, end, completedPath);
+            canvas.clipPath(completedPath);
+            layout.draw(canvas);
+            layout.getPaint().setColor(oldColor);
+            canvas.restoreToCount(save);
         }
     }
 
