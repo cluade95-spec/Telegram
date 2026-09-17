@@ -3537,7 +3537,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 // so a word catches the light quickly and settles rather than sliding. Only the
                 // colour is eased: the boundary it applies to is the one the source stated, and
                 // KARAOKE_TRANSITION_MS cannot move it.
-                final float arrived = CubicBezierInterpolator.EASE_OUT.getInterpolation(rowKaraoke.fadeProgress);
+                final float arrived = CubicBezierInterpolator.EASE_OUT.getInterpolation(
+                        Math.max(0f, Math.min(1f, rowKaraoke.fadeProgress)));
                 textView.setTextColor(unsungColor);
                 textView.applyKaraoke(rowKaraoke.fadeStart, rowKaraoke.sungEnd, sungColor,
                         ColorUtils.blendARGB(unsungColor, sungColor, arrived));
@@ -3824,6 +3825,9 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         private Spannable karaokeText;
         private int spanStart = -1;
         private int spanEnd = -1;
+        /** The last offsets asked for, before snapping, so an unchanged frame rescans nothing. */
+        private int requestedStart = -1;
+        private int requestedEnd = -1;
 
         LyricsTextView(Context context) {
             super(context);
@@ -3856,15 +3860,21 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
          */
         void applyKaraoke(int arrivingStart, int sungEnd, int sungColor, int arrivingColor) {
             if (karaokeText == null) return;
-            final int start = clusterEnd(karaokeText, arrivingStart);
-            final int end = Math.max(start, clusterEnd(karaokeText, sungEnd));
             boolean changed = false;
-            if (spanStart != start || spanEnd != end) {
-                spanStart = start;
-                spanEnd = end;
-                setRange(sungSpan, 0, start);
-                setRange(arrivingSpan, start, end);
-                changed = true;
+            // A settled line is repainted for its colours alone on every emphasis frame, and the
+            // boundaries it asks for are then identical; there is nothing to look at again.
+            if (requestedStart != arrivingStart || requestedEnd != sungEnd) {
+                requestedStart = arrivingStart;
+                requestedEnd = sungEnd;
+                final int start = clusterEnd(karaokeText, arrivingStart);
+                final int end = Math.max(start, clusterEnd(karaokeText, sungEnd));
+                if (spanStart != start || spanEnd != end) {
+                    spanStart = start;
+                    spanEnd = end;
+                    setRange(sungSpan, 0, start);
+                    setRange(arrivingSpan, start, end);
+                    changed = true;
+                }
             }
             changed |= sungSpan.setColor(sungColor);
             changed |= arrivingSpan.setColor(arrivingColor);
@@ -3957,6 +3967,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             }
             spanStart = -1;
             spanEnd = -1;
+            requestedStart = -1;
+            requestedEnd = -1;
         }
     }
 

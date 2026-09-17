@@ -758,9 +758,10 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
             cell.setBackground(Theme.createSelectorDrawable(getThemedColor(Theme.key_listSelector), Theme.RIPPLE_MASK_ALL));
             cell.setOnClickListener(ignored -> {
                 searchType = type;
-                rememberSearchFields(artistField, titleField);
-                if (dialogRef[0] != null) dialogRef[0].dismiss();
+                // Started before the dialog goes away, as the buttons this replaced did: the
+                // fields are still attached, so hiding the keyboard still has a window to act on.
                 startOnlineSearch(type, artistField, titleField);
+                if (dialogRef[0] != null) dialogRef[0].dismiss();
             });
             container.addView(cell, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 50));
         }
@@ -769,11 +770,12 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
                 .setTitle(LocaleController.getString(R.string.LyricsOnlineSearch))
                 .setView(container)
                 .setNegativeButton(LocaleController.getString(R.string.Cancel), null)
-                // Remembering what was typed is what keeps the fields alive across a failed search.
-                .setOnDismissListener(ignored -> rememberSearchFields(artistField, titleField))
                 .create();
         dialogRef[0] = dialog;
-        showDialog(dialog);
+        // Remembering what was typed is what keeps the fields alive across a cancelled or failed
+        // search. It has to be handed to showDialog(): BaseFragment installs its own dismiss
+        // listener on whatever it shows, which would replace one set through the builder.
+        showDialog(dialog, ignored -> rememberSearchFields(artistField, titleField));
         artistField.requestFocus();
     }
 

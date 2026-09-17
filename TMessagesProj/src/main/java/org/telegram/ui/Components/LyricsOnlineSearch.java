@@ -1045,8 +1045,9 @@ public final class LyricsOnlineSearch {
      * are about what the source states rather than what would look good:
      * <ol>
      *   <li>{@code type} claims word or syllable granularity;</li>
-     *   <li>at least one line carries two or more stated words, so the response genuinely
-     *       subdivides a line rather than restating its own line timestamp once;</li>
+     *   <li>at least one line carries two or more stated words <em>at different stated times</em>,
+     *       so the response genuinely subdivides a line in time rather than restating one
+     *       timestamp across it;</li>
      *   <li>the document, re-read by {@link SyncedLyricsController#parse}, really is line-synced
      *       and really does carry captured inline timing.</li>
      * </ol>
@@ -1279,6 +1280,8 @@ public final class LyricsOnlineSearch {
             }
             final StringBuilder body = new StringBuilder();
             int words = 0;
+            String firstWordStamp = null;
+            String lastWordStamp = null;
             if (line.wordTimes != null) {
                 for (int b = 0; b < line.wordTimes.length; b++) {
                     final String wordStamp = formatLrcTime(line.wordTimes[b]);
@@ -1287,8 +1290,18 @@ public final class LyricsOnlineSearch {
                         break;
                     }
                     body.append('<').append(wordStamp).append('>').append(line.wordTexts[b]);
+                    if (words == 0) {
+                        firstWordStamp = wordStamp;
+                    }
+                    lastWordStamp = wordStamp;
                     words++;
                 }
+            }
+            if (out.length() > MAX_LYRICS_BYTES) {
+                // Already past the ceiling the result will be measured against, and one UTF-16
+                // char is at least one UTF-8 byte, so this can only be rejected. Stop building
+                // rather than grow a buffer several times the size of the response.
+                return null;
             }
             if (out.length() > 0) {
                 out.append('\n');
@@ -1296,16 +1309,22 @@ public final class LyricsOnlineSearch {
             out.append('[').append(stamp).append(']');
             if (words > 0) {
                 out.append(body);
-                if (words > 1) {
+                // Two or more words is not enough on its own: a converter with nothing but line
+                // timing to work from can split a line's text into words and stamp every one of
+                // them with the line's own time, which states no more than the line timestamp
+                // already did and would light the whole line at once. A line only counts as
+                // genuinely subdivided when the times it states for its words actually differ as
+                // written - which also rules out words so close together that they collapse onto
+                // one centisecond in the document.
+                if (words > 1 && !firstWordStamp.equals(lastWordStamp)) {
                     subdivided++;
                 }
             } else {
                 out.append(line.text);
             }
         }
-        // One tag covering a whole line says no more than the line's own timestamp already says,
-        // and a document made only of those is line timing wearing word timing's clothes. It is
-        // not what the user asked for, so it is reported as unavailable rather than served.
+        // A document with no subdivided line at all is line timing wearing word timing's clothes.
+        // It is not what the user asked for, so it is reported as unavailable rather than served.
         return subdivided > 0 ? out.toString() : null;
     }
 

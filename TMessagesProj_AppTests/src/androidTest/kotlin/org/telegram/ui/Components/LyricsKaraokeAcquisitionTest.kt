@@ -95,6 +95,43 @@ class LyricsKaraokeAcquisitionTest {
     }
 
     @Test
+    fun wordsThatAllStateTheLinesOwnTimeAreNotWordTiming() {
+        // What a converter emits when all it has is line timing: the text split into words, every
+        // one stamped with the line's own time. Two or more words, but nothing subdivided in time,
+        // so it would light the whole line at once - and it is refused rather than served.
+        assertNull(convert("{'type':'Word','lyrics':[{'time':1000,'text':'a b c','syllabus':[" +
+            "{'time':1000,'text':'a '},{'time':1000,'text':'b '},{'time':1000,'text':'c'}]}]}"))
+        assertNull(convert("{'type':'Word','lyrics':[" +
+            "{'time':1000,'text':'a b','syllabus':[{'time':1000,'text':'a '},{'time':1000,'text':'b'}]}," +
+            "{'time':5000,'text':'c d','syllabus':[{'time':5000,'text':'c '},{'time':5000,'text':'d'}]}]}"))
+        // Words so close together that the document can only state one centisecond for both are
+        // the same thing once written down.
+        assertNull(convert("{'type':'Word','lyrics':[{'time':1000,'text':'a b','syllabus':[" +
+            "{'time':1000,'text':'a '},{'time':1005,'text':'b'}]}]}"))
+    }
+
+    @Test
+    fun oneWordAtADifferentTimeIsEnoughToBeGenuine() {
+        assertEquals(
+            "[00:01.00]<00:01.00>a <00:01.00>b <00:01.60>c",
+            convert("{'type':'Word','lyrics':[{'time':1000,'text':'a b c','syllabus':[" +
+                "{'time':1000,'text':'a '},{'time':1000,'text':'b '},{'time':1600,'text':'c'}]}]}")
+        )
+    }
+
+    @Test
+    fun aFlatLineRidesAlongWithAGenuineOneRatherThanBeingDiscarded() {
+        // The gate is about the document, not the line: a line that only restates its own time
+        // keeps exactly the tags the source gave it, because that is what the source said.
+        assertEquals(
+            "[00:01.00]<00:01.00>a <00:01.00>b\n[00:05.00]<00:05.00>c <00:05.60>d",
+            convert("{'type':'Word','lyrics':[" +
+                "{'time':1000,'text':'a b','syllabus':[{'time':1000,'text':'a '},{'time':1000,'text':'b'}]}," +
+                "{'time':5000,'text':'c d','syllabus':[{'time':5000,'text':'c '},{'time':5600,'text':'d'}]}]}")
+        )
+    }
+
+    @Test
     fun malformedBodiesAreRefused() {
         assertNull(convert(""))
         assertNull(convert("hello"))
