@@ -231,6 +231,43 @@ class SyncedLyricsKaraokeTest {
         assertEquals("-", row(blank, 1, 1, 2000L))
     }
 
+    @Test
+    fun playingAWholeDocumentThroughOnlyEverMovesForward() {
+        // The property that matters once several lines are on screen at once: whatever the position
+        // is, every row reports a boundary the source stated, and no row ever un-sings text it has
+        // already sung while the position advances.
+        val document = "[00:01.00]<00:01.00>one <00:01.40>two\n" +
+            "[00:05.00]an ordinary line\n" +
+            "[00:09.00]<00:09.20>three <00:09.60>four <00:10.00>five"
+        val lyrics = parse(document)
+        val highest = IntArray(lyrics.lines.size)
+        var position = 0L
+        while (position <= 12000L) {
+            val current = lyrics.lineAt(position)
+            for (index in lyrics.lines.indices) {
+                val line = lyrics.lines[index]
+                if (!karaoke.resolveRow(line, index, current, position, TRANSITION)) continue
+                assertTrue(karaoke.sungEnd >= highest[index])
+                highest[index] = karaoke.sungEnd
+                assertTrue(karaoke.fadeStart <= karaoke.sungEnd)
+                assertTrue(statesOffset(line, karaoke.sungEnd))
+            }
+            position += 10L
+        }
+        assertEquals(lyrics.lines[0].text.length, highest[0])
+        assertEquals(0, highest[1]) // the ordinary line never reports anything at all
+        assertEquals(lyrics.lines[2].text.length, highest[2])
+    }
+
+    /** True when [offset] is one the source stated for this line, or one of its two ends. */
+    private fun statesOffset(line: Line, offset: Int): Boolean {
+        if (offset == 0 || offset == line.text.length) return true
+        val segments = line.segments ?: return false
+        return (0 until segments.size()).any {
+            offset == segments.startOffset(it) || offset == segments.endOffset(it)
+        }
+    }
+
     // ------------------------------------------------------------------ text integrity
 
     @Test

@@ -41,7 +41,6 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.SystemClock;
 import android.text.Spannable;
-import android.text.SpannableString;
 import android.text.SpannableStringBuilder;
 import android.text.Spanned;
 import android.text.TextPaint;
@@ -3794,6 +3793,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
      * line is never re-measured, never re-wrapped and never moves while it is being sung.
      */
     private static class LyricsTextView extends TextView {
+        private static final int ZERO_WIDTH_JOINER = 0x200D;
+
         private final KaraokeSpan sungSpan = new KaraokeSpan();
         private final KaraokeSpan arrivingSpan = new KaraokeSpan();
         /** The view's own mutable copy of the text, or null for a line with no inline timing. */
@@ -3812,7 +3813,9 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         void setLyricText(CharSequence text, boolean wordTimed) {
             detachSpans();
             if (wordTimed) {
-                setText(new SpannableString(text), BufferType.SPANNABLE);
+                // TextView always makes its own spannable copy here, so the one to colour is the
+                // one it ends up holding, not the one handed in.
+                setText(text, BufferType.SPANNABLE);
                 final CharSequence bound = getText();
                 karaokeText = bound instanceof Spannable ? (Spannable) bound : null;
             } else {
@@ -3825,13 +3828,13 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
          * Paints {@code [0, arrivingStart)} as sung, {@code [arrivingStart, sungEnd)} in the
          * colour the caller has eased for the range that is currently arriving, and leaves the
          * rest to the view's own text colour. Both offsets come from the parser, so they are
-         * always on a character boundary.
+         * always on a character boundary; {@link #clusterEnd} then keeps them off the inside of a
+         * grapheme cluster as well.
          */
         void applyKaraoke(int arrivingStart, int sungEnd, int sungColor, int arrivingColor) {
             if (karaokeText == null) return;
-            final int length = karaokeText.length();
-            final int start = Math.max(0, Math.min(length, arrivingStart));
-            final int end = Math.max(start, Math.min(length, sungEnd));
+            final int start = clusterEnd(karaokeText, arrivingStart);
+            final int end = Math.max(start, clusterEnd(karaokeText, sungEnd));
             boolean changed = false;
             if (spanStart != start || spanEnd != end) {
                 spanStart = start;
@@ -3842,8 +3845,70 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             }
             changed |= sungSpan.setColor(sungColor);
             changed |= arrivingSpan.setColor(arrivingColor);
-            // A span whose colour changed in place is not a change the text itself can report.
+            // SpannableString does not report span changes to a SpanWatcher, and a colour changed
+            // in place is not a change the text could report anyway, so every repaint here is this
+            // one. It is also the reason nothing in this class can trigger a re-measure.
             if (changed) invalidate();
+        }
+
+        /**
+         * Moves a highlight boundary off the inside of a grapheme cluster, forward to its end.
+         *
+         * <p>A stated offset is always a whole character - the parser will not split a surrogate
+         * pair - but a whole character can still be the middle of something that has to be drawn
+         * as one unit: a base and its combining marks, the two halves of a ZWJ emoji sequence, a
+         * variation selector, a flag. Colouring half of one would show a lit letter under a dim
+         * accent, so the whole cluster takes the colour of whichever range reached it first.
+         *
+         * <p>This is a rendering adjustment and nothing else: it moves what is painted, never a
+         * timestamp, and for the way real files are tagged - at word boundaries - it changes
+         * nothing at all.
+         */
+        private static int clusterEnd(CharSequence text, int offset) {
+            final int length = text.length();
+            int end = Math.max(0, Math.min(length, offset));
+            while (end > 0 && end < length) {
+                final int next = Character.codePointAt(text, end);
+                final int previous = Character.codePointBefore(text, end);
+                if (previous == ZERO_WIDTH_JOINER || isMark(next) || isVariationSelector(next)) {
+                    end += Character.charCount(next);
+                } else if (next == ZERO_WIDTH_JOINER) {
+                    end++; // the joiner itself; the next pass takes whatever it joins on
+                } else if (isRegionalIndicator(next) && regionalIndicatorsBefore(text, end) % 2 == 1) {
+                    end += Character.charCount(next); // the second half of a flag
+                } else {
+                    break;
+                }
+            }
+            return end;
+        }
+
+        private static boolean isMark(int codePoint) {
+            final int type = Character.getType(codePoint);
+            return type == Character.NON_SPACING_MARK || type == Character.ENCLOSING_MARK
+                    || type == Character.COMBINING_SPACING_MARK;
+        }
+
+        private static boolean isVariationSelector(int codePoint) {
+            return codePoint >= 0xFE00 && codePoint <= 0xFE0F
+                    || codePoint >= 0xE0100 && codePoint <= 0xE01EF;
+        }
+
+        private static boolean isRegionalIndicator(int codePoint) {
+            return codePoint >= 0x1F1E6 && codePoint <= 0x1F1FF;
+        }
+
+        /** Length of the run of regional indicators ending at {@code offset}, in code points. */
+        private static int regionalIndicatorsBefore(CharSequence text, int offset) {
+            int count = 0;
+            int index = offset;
+            while (index > 0) {
+                final int codePoint = Character.codePointBefore(text, index);
+                if (!isRegionalIndicator(codePoint)) break;
+                index -= Character.charCount(codePoint);
+                count++;
+            }
+            return count;
         }
 
         /** Returns the row to plain, uniformly coloured text. */

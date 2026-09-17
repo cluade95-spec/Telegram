@@ -99,8 +99,9 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
      * inside a ZWJ emoji sequence, or mid-run in bidirectional text. Whoever renders these ranges
      * has to decide what to do about that; storing them faithfully is this layer's job.
      *
-     * <p>Instances are immutable and hold parallel primitive arrays: a whole song is a few hundred
-     * segments, and a per-frame consumer must not chase objects or allocate to read one.
+     * <p>Instances are immutable, never empty - a line with nothing to state carries no Segments at
+     * all rather than an empty one - and hold parallel primitive arrays: a whole song is a few
+     * hundred segments, and a per-frame consumer must not chase objects or allocate to read one.
      */
     public static final class Segments {
         private final int[] startOffsets;

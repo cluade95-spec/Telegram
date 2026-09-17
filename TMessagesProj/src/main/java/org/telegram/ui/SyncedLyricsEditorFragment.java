@@ -303,17 +303,16 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
         if (lineEnd <= start) return;
         final Matcher matcher = WORD_TIMESTAMP_TOKEN.matcher(text);
         matcher.region(start, lineEnd);
-        final ArrayList<int[]> found = new ArrayList<>();
         while (matcher.find()) {
             try {
                 if (Long.parseLong(matcher.group(2)) >= 60) return;
             } catch (RuntimeException ignore) {
                 return;
             }
-            found.add(new int[]{matcher.start(), matcher.end()});
         }
-        for (int a = 0; a < found.size(); a++) {
-            text.setSpan(new TimestampSpan(color), found.get(a)[0], found.get(a)[1], Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        matcher.region(start, lineEnd); // resets the matcher; every tag on this line is known good
+        while (matcher.find()) {
+            text.setSpan(new TimestampSpan(color), matcher.start(), matcher.end(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
         }
     }
 
