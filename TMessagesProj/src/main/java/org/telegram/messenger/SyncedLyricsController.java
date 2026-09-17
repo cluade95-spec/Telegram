@@ -81,16 +81,23 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
      * own visible {@link Line#text}.
      *
      * <p>The unit is a <em>timed segment</em>, not a word: Enhanced LRC tags may sit mid-word, and
-     * other word-timed formats are syllable-granular. A segment carries only what the source
-     * actually stated - a genuine start time and the range of visible text it introduces. There is
+     * other word-timed formats are syllable-granular. A segment count is therefore not a word
+     * count, and two tags on a line do not mean the line has two words. A segment carries only what
+     * the source actually stated - a genuine start time and the range of visible text it
+     * introduces, however the author chose to divide the line. There is
      * deliberately no end time: Enhanced LRC states starts only, and the end of the last segment on
      * a line is not stated anywhere. A consumer that needs an end can derive one from the next
      * segment's start; this model never invents one.
      *
      * <p>Offsets are UTF-16 indices into {@link Line#text}, which is what every Android text
      * consumer ({@code String}, {@code Spannable}, {@code Layout}, {@code Canvas}) already indexes,
-     * so emoji, Amharic, combining marks, RTL and CJK need no special handling. No offset is ever
-     * allowed to fall between a surrogate pair.
+     * so the text needs no rewriting or normalisation to be addressed. An offset is never allowed
+     * to fall between a surrogate pair, so no single character is ever cut in half.
+     *
+     * <p>That is an integrity guarantee, not a typographic one. A boundary can be valid UTF-16 and
+     * still be a poor place to split visually - between a base character and its combining mark,
+     * inside a ZWJ emoji sequence, or mid-run in bidirectional text. Whoever renders these ranges
+     * has to decide what to do about that; storing them faithfully is this layer's job.
      *
      * <p>Instances are immutable and hold parallel primitive arrays: a whole song is a few hundred
      * segments, and a per-frame consumer must not chase objects or allocate to read one.
@@ -131,9 +138,15 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
         public final String text;
         public final boolean timed;
         /**
-         * Genuine inline timing for this line, or null when the source stated none. Null is the
-         * overwhelmingly common case and the only one that existed before word timing: a line
-         * without inline timing carries no empty arrays and no placeholder segments.
+         * The timed ranges the source stated inline for this line, or null when it stated none.
+         *
+         * <p>This records only what was captured. It is not a claim that the line is fully
+         * word-timed, that every word has its own timestamp, or that there is enough here to
+         * animate: a line may carry one segment, or a few covering part of its text, with the rest
+         * legitimately untimed. A consumer decides what it can do with that.
+         *
+         * <p>Null is the overwhelmingly common case and the only one that existed before inline
+         * timing was captured: such a line carries no empty arrays and no placeholder segments.
          */
         public final Segments segments;
 
@@ -352,13 +365,6 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
         }
     }
 
-    /**
-     * Fraction of a line's non-whitespace text that inline timing must actually address before the
-     * line counts as word-timed. Two tagged words in a nine-word line are not karaoke, and calling
-     * them karaoke would force a consumer to invent timing for the rest.
-     */
-    private static final float MIN_SEGMENT_COVERAGE = 0.8f;
-
     /** A line's visible text, plus whatever genuine inline timing was stripped out of it. */
     private static final class Stripped {
         final String text;
@@ -463,11 +469,17 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
     }
 
     /**
-     * Decides whether captured tags are genuine timing for the line they landed on. Everything here
-     * either accepts what the source stated or discards it: no time is adjusted, reordered, or
-     * filled in. Failing any rule costs the line its optional timing and nothing else - the line,
-     * its timestamp and its text are untouched, so a broken karaoke extension can never damage
-     * otherwise valid line-synced lyrics.
+     * Keeps the captured tags that this line can represent faithfully, and discards the rest.
+     *
+     * <p>Every rule here is about integrity, not usefulness: whether a time can belong to this line
+     * at all, and whether an offset addresses its text safely. How much of a line is timed, and
+     * whether that is enough to animate, is not decided here - that is a judgement for whatever
+     * eventually consumes the metadata, and making it here would throw away timing the source
+     * genuinely stated.
+     *
+     * <p>Nothing is adjusted, reordered or filled in. Failing a rule costs the line its optional
+     * timing and nothing else - the line, its timestamp and its text are untouched, so a broken
+     * karaoke extension can never damage otherwise valid line-synced lyrics.
      */
     private static Segments qualify(Candidate candidate, String text, long lineTimeMs, long nextTimeMs) {
         if (candidate == null || candidate.malformed || candidate.count == 0) return null;
@@ -487,7 +499,6 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
         int[] endOffsets = new int[count];
         long[] startTimes = new long[count];
         int kept = 0;
-        int covered = 0;
         for (int a = 0; a < count; a++) {
             final int start = candidate.offsets[a];
             final int end = a + 1 < count ? candidate.offsets[a + 1] : length;
@@ -499,15 +510,8 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
             endOffsets[kept] = end;
             startTimes[kept] = candidate.times[a];
             kept++;
-            covered += visible;
         }
-        // One segment spanning the whole line says no more than the line's own timestamp does, and
-        // is exactly what a converter emits when it only ever had line timing. Word timing has to
-        // subdivide the line to be word timing at all, so a single segment is discarded rather than
-        // presented as something it is not.
-        if (kept < 2) return null;
-        final int total = countNonWhitespace(text, 0, length);
-        if (total == 0 || covered < total * MIN_SEGMENT_COVERAGE) return null;
+        if (kept == 0) return null;
         return new Segments(
                 kept == count ? startOffsets : Arrays.copyOf(startOffsets, kept),
                 kept == count ? endOffsets : Arrays.copyOf(endOffsets, kept),

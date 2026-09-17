@@ -13,9 +13,13 @@ import org.telegram.messenger.SyncedLyricsController.parse
  *
  * Two things are asserted throughout. First, that the visible text, line count, timestamps and kind
  * are exactly what they were before inline timing was captured - the metadata is additive and
- * nothing else may move. Second, that timing is only ever reported when the source actually stated
- * it: every malformed, partial, out-of-order or out-of-range case loses its optional metadata and
+ * nothing else may move. Second, that timing is reported exactly when, and only when, the source
+ * actually stated it: whatever the source timed is preserved verbatim, however little of the line
+ * that is, while every malformed, out-of-order or out-of-range case loses its optional metadata and
  * keeps its line.
+ *
+ * Nothing here asserts that a line is fully word-timed. Segments record what the source stated, not
+ * how complete or how animatable that statement is - that judgement belongs to a later phase.
  */
 class SyncedLyricsWordTimingTest {
 
@@ -203,24 +207,47 @@ class SyncedLyricsWordTimingTest {
     }
 
     @Test
-    fun aLoneTagSpanningTheWholeLineIsNotWordTiming() {
-        // It states nothing the line timestamp does not already state, and it is exactly what a
-        // converter emits when it only ever had line timing.
-        assertNull(lineAt("[00:01.00]<00:01.10>a whole line under one tag", 0).segments)
+    fun aSingleValidInlineSegmentIsPreserved() {
+        // One tag covering the whole line states less than a fully timed line does, but it is still
+        // something the source said. It is captured as stated; judging it too coarse to animate is
+        // not the parser's decision to make.
+        val source = "[00:01.00]<00:01.10>a whole line under one tag"
+        assertEquals("a whole line under one tag", lineAt(source, 0).text)
+        assertEquals("0-26@1100:[a whole line under one tag]", segments(lineAt(source, 0)))
     }
 
     @Test
-    fun partialTimingBelowTheCoverageFloorIsRejected() {
+    fun partialInlineTimingIsPreserved() {
+        // Most of the line carries no timing at all. The two ranges the source did time survive; the
+        // rest stays untimed rather than costing the line its metadata.
         val source = "[00:01.00]eight untimed words lead this line <00:01.50>then <00:01.70>two"
         assertEquals("eight untimed words lead this line then two", lineAt(source, 0).text)
-        assertNull(lineAt(source, 0).segments)
+        assertEquals("35-40@1500:[then ] 40-43@1700:[two]", segments(lineAt(source, 0)))
     }
 
     @Test
-    fun aSmallUntimedLeadInStaysAboveTheFloor() {
+    fun untimedTextBeforeTheFirstSegmentGetsNoFabricatedTimestamp() {
+        val source = "[00:01.00]I <00:01.20>see <00:01.40>the <00:01.60>trees"
+        val line = lineAt(source, 0)
+        assertEquals("I see the trees", line.text)
+        assertEquals("2-6@1200:[see ] 6-10@1400:[the ] 10-15@1600:[trees]", segments(line))
+        // The lead-in "I " precedes the first tag, so no segment starts before offset 2 and no
+        // segment claims the line's own timestamp on its behalf.
+        assertEquals(2, line.segments!!.startOffset(0))
+        assertEquals(1200L, line.segments!!.startTimeMs(0))
+    }
+
+    @Test
+    fun twoInlineTagsDoNotImplyEveryWordIsTimed() {
+        // Five words, two tags. The first segment spans four of them because that is the range the
+        // source actually timed - a segment is a timed range, never a promise of one word.
+        val source = "[00:12.50]<00:12.50>two tags but four words here <00:13.40>ok"
+        val line = lineAt(source, 0)
+        assertEquals("two tags but four words here ok", line.text)
+        assertEquals(2, line.segments!!.size())
         assertEquals(
-            "2-6@1200:[see ] 6-10@1400:[the ] 10-15@1600:[trees]",
-            segments(lineAt("[00:01.00]I <00:01.20>see <00:01.40>the <00:01.60>trees", 0))
+            "0-29@12500:[two tags but four words here ] 29-31@13400:[ok]",
+            segments(line)
         )
     }
 
@@ -279,12 +306,14 @@ class SyncedLyricsWordTimingTest {
             "[00:01.00]<00:01.00>na <00:01.20>na <00:01.40>na",
             "[00:01.00]<00:01.00>love <00:01.50>\ud83d\udc9c",
             "[00:01.00]<00:01.00>\u12a0\u1263 <00:01.50>\u12cd",
-            "[00:01.00]I <00:01.20>see <00:01.40>the <00:01.60>trees"
+            "[00:01.00]I <00:01.20>see <00:01.40>the <00:01.60>trees",
+            "[00:01.00]<00:01.10>a whole line under one tag",
+            "[00:01.00]eight untimed words lead this line <00:01.50>then <00:01.70>two"
         )
         for (source in sources) {
             for (line in parse(source).lines) {
                 val segments = line.segments ?: continue
-                assertTrue(segments.size() >= 2)
+                assertTrue(segments.size() >= 1)
                 assertTrue(line.text.isNotEmpty())
                 for (i in 0 until segments.size()) {
                     assertTrue(segments.startOffset(i) >= 0)
