@@ -5,6 +5,7 @@
 package org.telegram.ui.Components;
 
 import android.net.Uri;
+import android.os.SystemClock;
 import android.text.TextUtils;
 
 import org.json.JSONArray;
@@ -12,6 +13,7 @@ import org.json.JSONException;
 import org.json.JSONObject;
 import org.json.JSONTokener;
 import org.telegram.messenger.AndroidUtilities;
+import org.telegram.messenger.SyncedLyricsController;
 import org.telegram.messenger.Utilities;
 
 import java.io.ByteArrayOutputStream;
@@ -22,11 +24,21 @@ import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.text.Normalizer;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Locale;
+import java.util.regex.Pattern;
 
 /**
- * Read-only client for LRCLIB (<a href="https://lrclib.net">lrclib.net</a>), used as an input
- * source for the lyrics editor.
+ * Read-only client for the two lyric sources the editor can import from.
+ *
+ * <p>{@link Type#SYNCED} and {@link Type#PLAIN} come from LRCLIB, whose contract is documented
+ * below. {@link Type#KARAOKE} comes from LyricsPlus, which is the only one of the two that states
+ * word timing, and is documented at {@link #KARAOKE_HOSTS} and {@link #toEnhancedLrc(String)}. The
+ * two are kept strictly apart: line timestamps can never answer a request for word timing, and
+ * neither source is ever substituted for the other.
+ *
+ * <p>Everything here is read-only for both providers. No write endpoint is reachable, nothing is
+ * uploaded, no credential is sent, and no request carries account, chat or message identity.
  *
  * <p>The contract implemented here is taken from the current LRCLIB server implementation
  * (<a href="https://github.com/tranxuanthang/lrclib">tranxuanthang/lrclib</a>):
@@ -54,10 +66,17 @@ public final class LyricsOnlineSearch {
 
     /** Which lyric flavour the user explicitly asked for. There is deliberately no automatic mode. */
     public enum Type {
-        /** Only {@code syncedLyrics} is acceptable. */
+        /** LRCLIB {@code syncedLyrics}: line timestamps. Only {@code syncedLyrics} is acceptable. */
         SYNCED,
-        /** Only {@code plainLyrics} is acceptable. */
-        PLAIN
+        /** LRCLIB {@code plainLyrics}: no timing at all. Only {@code plainLyrics} is acceptable. */
+        PLAIN,
+        /**
+         * Genuine word-level timing, from a provider that actually states it. Never satisfied by
+         * line timestamps from any source: a LRCLIB row can never answer this request, and a
+         * word-level provider that has only line timing for the track is reported as unavailable
+         * rather than downgraded.
+         */
+        KARAOKE
     }
 
     /** Distinguishable failure reasons, so the UI never has to collapse everything into "failed". */
@@ -115,6 +134,50 @@ public final class LyricsOnlineSearch {
     /** A retry is only worth making when the server asks for a short wait. */
     private static final long MAX_RETRY_AFTER_MS = 5_000;
 
+    /**
+     * LyricsPlus mirrors, the read-only word-timing provider. All five run the same open-source
+     * backend (<a href="https://github.com/ibratabian17/lyricsplus">ibratabian17/lyricsplus</a>)
+     * and are the set that project's clients are told to iterate over; none of them is reliable on
+     * its own, which is why there is a list rather than a host. Observed behaviour at the time of
+     * writing: one answered, one was rate limited, one served a certificate for the wrong name,
+     * and two answered 402. The order puts the one known to answer first, and every one of those
+     * failures simply moves on to the next.
+     *
+     * <p>Each entry is an https origin with no path and no credentials, and a redirect away from it
+     * is never followed.
+     */
+    private static final String[] KARAOKE_HOSTS = {
+            "https://lyricsplus.binimum.org",
+            "https://lyricsplus.atomix.one",
+            "https://lyricsplus.prjktla.workers.dev",
+            "https://lyricsplus-seven.vercel.app",
+            "https://lyrics-plus-backend.vercel.app",
+    };
+    private static final String KARAOKE_PATH = "/v2/lyrics/get";
+    /**
+     * The provider's Apple Music path, which is where its genuine word timing comes from and the
+     * one configuration confirmed to return it. {@code duration} and {@code album} are deliberately
+     * not sent: they are optional, they are only used by the provider to narrow matching, and a
+     * duration that disagrees with its catalogue by a second would turn a hit into a miss.
+     */
+    private static final String KARAOKE_SOURCE = "apple";
+    /** Per-mirror, so one dead mirror cannot spend the whole budget. */
+    private static final int KARAOKE_CONNECT_TIMEOUT_MS = 5_000;
+    private static final int KARAOKE_READ_TIMEOUT_MS = 8_000;
+    /**
+     * Total wall-clock budget for the whole mirror walk. Mirrors are tried in order until one
+     * answers with genuine word timing or the budget is gone; no mirror is ever tried twice, and
+     * nothing here sleeps or retries. A mirror is only started if a connection could still finish
+     * inside the budget, which bounds the whole search at roughly this plus one read timeout - and
+     * the user can abandon it at any point from the spinner.
+     */
+    private static final long KARAOKE_BUDGET_MS = 15_000;
+    /** Bounds on a word-timed document, checked before anything is allocated from it. */
+    private static final int MAX_KARAOKE_LINES = 2000;
+    private static final int MAX_KARAOKE_WORDS_PER_LINE = 300;
+    /** The largest time the LRC timestamp grammar can express: 999:59.99. */
+    private static final long MAX_KARAOKE_TIME_MS = (999L * 60 + 59) * 1000 + 999;
+
     private LyricsOnlineSearch() {
     }
 
@@ -159,14 +222,19 @@ public final class LyricsOnlineSearch {
      *
      * @param artist          user-editable artist field; may be empty
      * @param title           user-editable title field; may be empty
-     * @param durationSeconds track duration in seconds, or any out-of-range value to omit it
+     * @param durationSeconds track duration in seconds, or any out-of-range value to omit it; used
+     *                        only for LRCLIB ranking, and not sent at all for {@link Type#KARAOKE}
      * @param type            the flavour the user explicitly chose
      */
     public static Request search(String artist, String title, double durationSeconds, Type type, Callback callback) {
         final Request request = new Request();
         final String cleanArtist = sanitize(artist);
         final String cleanTitle = sanitize(title);
-        Utilities.externalNetworkQueue.postRunnable(() -> run(request, cleanArtist, cleanTitle, durationSeconds, type, callback, false));
+        if (type == Type.KARAOKE) {
+            Utilities.externalNetworkQueue.postRunnable(() -> runKaraoke(request, cleanArtist, cleanTitle, callback));
+        } else {
+            Utilities.externalNetworkQueue.postRunnable(() -> run(request, cleanArtist, cleanTitle, durationSeconds, type, callback, false));
+        }
         return request;
     }
 
@@ -308,21 +376,37 @@ public final class LyricsOnlineSearch {
         long retryAfterMs;
     }
 
+    /** Which read-only provider a request is going to, which decides its headers and timeouts. */
+    private enum Provider {
+        LRCLIB,
+        LYRICS_PLUS
+    }
+
     private static Response fetch(Request request, String url) {
+        return fetch(request, url, Provider.LRCLIB);
+    }
+
+    private static Response fetch(Request request, String url, Provider provider) {
         Response result = new Response();
         HttpURLConnection connection = null;
         InputStream stream = null;
         try {
             connection = (HttpURLConnection) new URL(url).openConnection();
-            // The host is fixed and the scheme is https; never follow a redirect off it.
+            // The host of every request is one of a fixed set and the scheme is https; never
+            // follow a redirect off it.
             connection.setInstanceFollowRedirects(false);
             connection.setRequestMethod("GET");
             connection.setDoInput(true);
             connection.setUseCaches(false);
-            connection.setConnectTimeout(CONNECT_TIMEOUT_MS);
-            connection.setReadTimeout(READ_TIMEOUT_MS);
+            connection.setConnectTimeout(provider == Provider.LRCLIB ? CONNECT_TIMEOUT_MS : KARAOKE_CONNECT_TIMEOUT_MS);
+            connection.setReadTimeout(provider == Provider.LRCLIB ? READ_TIMEOUT_MS : KARAOKE_READ_TIMEOUT_MS);
             connection.setRequestProperty("Accept", "application/json");
-            connection.setRequestProperty("Lrclib-Client", CLIENT_ID);
+            if (provider == Provider.LRCLIB) {
+                connection.setRequestProperty("Lrclib-Client", CLIENT_ID);
+            } else {
+                // The same static, non-identifying string, under the header this provider reads.
+                connection.setRequestProperty("User-Agent", CLIENT_ID);
+            }
             request.attach(connection);
             if (request.isCancelled()) {
                 return result;
@@ -646,6 +730,12 @@ public final class LyricsOnlineSearch {
         if (track == null || track.instrumental) {
             return null;
         }
+        if (type != Type.SYNCED && type != Type.PLAIN) {
+            // LRCLIB states line timestamps and nothing finer. Presenting one of its rows as an
+            // answer to any other request would be exactly the downgrade this must never make, so
+            // no row is a candidate - not even as a fallback when the real provider fails.
+            return null;
+        }
         String lyrics = type == Type.SYNCED ? track.syncedLyrics : track.plainLyrics;
         if (lyrics == null || lyrics.trim().isEmpty()) {
             return null;
@@ -829,6 +919,407 @@ public final class LyricsOnlineSearch {
             return Long.toString(rounded);
         }
         return String.format(Locale.US, "%.3f", seconds);
+    }
+
+    // endregion
+
+    // region karaoke
+
+    /**
+     * Genuine word timing, or nothing.
+     *
+     * <p>Walks the mirrors in order within one wall-clock budget. A mirror that cannot be reached,
+     * answers a status other than 200, returns something that is not the documented shape, or has
+     * only line timing for this track is recorded and skipped; the next one is tried. The first
+     * mirror that returns real word timing wins and the walk stops there.
+     *
+     * <p>Nothing is ever synthesised on the way. If no mirror states word timing, this reports the
+     * most informative failure it saw and returns no lyrics at all - it never falls back to LRCLIB,
+     * never divides a line among its words, and never presents line timestamps as word timestamps.
+     */
+    private static void runKaraoke(Request request, String artist, String title, Callback callback) {
+        if (request.isCancelled()) {
+            return;
+        }
+        if (TextUtils.isEmpty(artist) && TextUtils.isEmpty(title)) {
+            deliver(request, callback, null, Error.NOT_FOUND);
+            return;
+        }
+        final long deadline = SystemClock.elapsedRealtime() + KARAOKE_BUDGET_MS;
+        final String query = KARAOKE_PATH
+                + "?title=" + Uri.encode(title)
+                + "&artist=" + Uri.encode(artist)
+                + "&source=" + KARAOKE_SOURCE;
+        Error worst = null;
+        for (int a = 0; a < KARAOKE_HOSTS.length; a++) {
+            if (request.isCancelled()) {
+                return;
+            }
+            if (SystemClock.elapsedRealtime() + KARAOKE_CONNECT_TIMEOUT_MS >= deadline) {
+                // Not enough budget left for another connection to even succeed. Report what has
+                // been seen so far rather than keep a user waiting on a provider that is not
+                // answering, and never start an attempt whose timeout would run past the budget.
+                break;
+            }
+            final Response response = fetch(request, KARAOKE_HOSTS[a] + query, Provider.LYRICS_PLUS);
+            if (request.isCancelled()) {
+                return;
+            }
+            if (response.error != null) {
+                worst = worse(worst, response.error);
+                continue;
+            }
+            if (response.status != 200) {
+                // 404 is a definitive miss on this mirror, 402/5xx is a mirror that is not
+                // serving, 429/503 is one that is throttling. None of them is retried here: the
+                // next mirror is the retry, and Retry-After is deliberately not honoured.
+                worst = worse(worst, response.status == 404 ? Error.NOT_FOUND : statusError(response.status));
+                continue;
+            }
+            final String enhanced = toEnhancedLrc(response.body);
+            if (enhanced == null) {
+                // Either the body is not the documented shape, or it is line-only for this track.
+                // Both are "this mirror cannot answer a karaoke request"; the walk continues.
+                worst = worse(worst, Error.TYPE_UNAVAILABLE);
+                continue;
+            }
+            deliver(request, callback, enhanced, null);
+            return;
+        }
+        deliver(request, callback, null, worst == null ? Error.NETWORK : worst);
+    }
+
+    /**
+     * Keeps whichever of two failures tells the user more. A definitive answer from any mirror
+     * outranks a mirror that simply did not work.
+     */
+    private static Error worse(Error current, Error candidate) {
+        if (candidate == null) {
+            return current;
+        }
+        return current == null || karaokeRank(candidate) < karaokeRank(current) ? candidate : current;
+    }
+
+    private static int karaokeRank(Error error) {
+        switch (error) {
+            case TYPE_UNAVAILABLE: return 0;
+            case NOT_FOUND: return 1;
+            case MALFORMED: return 2;
+            case RATE_LIMITED: return 3;
+            case SERVER: return 4;
+            default: return 5;
+        }
+    }
+
+    /**
+     * Anything in a lyric line that our own parser would read as timing rather than as text. A word
+     * tag would be stripped out of the visible text and shift every offset after it; a leading line
+     * tag would be read as a second timestamp for the line. Neither can be escaped in LRC, so a
+     * line whose text contains one is dropped instead of being written out corrupted. Ordinary text
+     * that merely looks similar - "see &lt;3 you", "[chorus]" - matches neither.
+     */
+    private static final Pattern LOOKS_LIKE_WORD_TAG = Pattern.compile("<\\d{1,3}:\\d{1,2}(?:[\\.:]\\d{1,3})?>");
+    private static final Pattern LOOKS_LIKE_LINE_TAG = Pattern.compile("^\\s*\\[\\d{1,3}:\\d{1,2}(?:[\\.:]\\d{1,3})?]");
+
+    /** One line of a word-timed response, after validation. */
+    private static final class KaraokeLine {
+        long timeMs;
+        /** Exactly the text the emitted line will carry. */
+        String text;
+        /** Stated word start times, or null when the source stated none for this line. */
+        long[] wordTimes;
+        /** Parallel to {@link #wordTimes}; concatenating these gives {@link #text}. */
+        String[] wordTexts;
+    }
+
+    /**
+     * Converts a LyricsPlus body into the Enhanced LRC this app already parses, or returns null.
+     *
+     * <p>Null means "this is not a karaoke answer", for every reason: not the documented shape, a
+     * field of the wrong JSON type, a {@code type} that does not claim word granularity, no line
+     * that actually carries more than one stated word, or a document that ends up too large. The
+     * caller treats all of them the same way, because from the user's point of view they are the
+     * same thing: this provider does not have word timing for this track.
+     *
+     * <p>The three conditions for a non-null result are deliberately independent, and all of them
+     * are about what the source states rather than what would look good:
+     * <ol>
+     *   <li>{@code type} claims word or syllable granularity;</li>
+     *   <li>at least one line carries two or more stated words, so the response genuinely
+     *       subdivides a line rather than restating its own line timestamp once;</li>
+     *   <li>the document, re-read by {@link SyncedLyricsController#parse}, really is line-synced
+     *       and really does carry captured inline timing.</li>
+     * </ol>
+     *
+     * <p>Public because it is the whole of the genuineness decision and is worth testing on its
+     * own: it is a pure function of the response body, touches no network and keeps no state.
+     */
+    public static String toEnhancedLrc(String body) {
+        if (body == null) {
+            return null;
+        }
+        final ArrayList<KaraokeLine> lines;
+        try {
+            final JSONTokener tokener = new JSONTokener(body);
+            final Object parsed = tokener.nextValue();
+            if (!(parsed instanceof JSONObject) || !hasOnlyTrailingJsonWhitespace(tokener)) {
+                return null;
+            }
+            final JSONObject root = (JSONObject) parsed;
+            if (!claimsWordTiming(readString(root, "type", false))) {
+                // The provider itself says this is line-level or plain. Believe it, and do not go
+                // looking for word timing to salvage out of a response that does not claim any.
+                return null;
+            }
+            lines = readKaraokeLines(root);
+        } catch (Throwable e) {
+            return null;
+        }
+        if (lines == null) {
+            return null;
+        }
+        final String enhanced = writeEnhancedLrc(lines);
+        if (enhanced == null || exceedsUtf8Bytes(enhanced, MAX_LYRICS_BYTES)) {
+            return null;
+        }
+        // Last gate, and the only one that cannot be fooled by a hand-written check: read the
+        // result back with the parser that will actually play it. Unless that parser agrees the
+        // document is line-synced AND finds genuine inline timing in it, this is not karaoke and
+        // the caller is told so.
+        final SyncedLyricsController.Lyrics played = SyncedLyricsController.parse(enhanced);
+        if (played.kind != SyncedLyricsController.Kind.SYNCED) {
+            return null;
+        }
+        for (int a = 0; a < played.lines.size(); a++) {
+            if (played.lines.get(a).segments != null) {
+                return enhanced;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * True when the provider's own {@code type} claims word or syllable granularity. The backend
+     * normalises this field to upper case, older deployments answer in mixed case, and the
+     * comparison is case-insensitive for both. Anything else - {@code LINE}, {@code PLAIN}, absent,
+     * or a value this client has never heard of - is not a claim of word timing.
+     */
+    private static boolean claimsWordTiming(String type) {
+        return "word".equalsIgnoreCase(type) || "syllable".equalsIgnoreCase(type);
+    }
+
+    /**
+     * Reads the {@code lyrics} array against the documented shape: {@code time} and
+     * {@code duration} in milliseconds, {@code text}, and an optional {@code syllabus} array of
+     * {@code {time, duration, text}} words. {@code duration} is read only to be ignored - an end
+     * time is never emitted, because Enhanced LRC cannot state one and inventing it is exactly
+     * what this must not do.
+     *
+     * <p>Returns null when the array itself breaks the contract, and drops a single line when only
+     * that line does. A line keeps its text and its own timestamp even when its word timing has to
+     * be dropped, so a broken word list costs word timing and nothing else.
+     */
+    private static ArrayList<KaraokeLine> readKaraokeLines(JSONObject root) throws MalformedResponseException, JSONException {
+        if (!root.has("lyrics")) {
+            return null;
+        }
+        final Object raw = root.opt("lyrics");
+        if (!(raw instanceof JSONArray)) {
+            throw new MalformedResponseException("lyrics");
+        }
+        final JSONArray array = (JSONArray) raw;
+        final int length = array.length();
+        // Checked before allocating, so a server-supplied length can never size the list.
+        if (length == 0 || length > MAX_KARAOKE_LINES) {
+            return null;
+        }
+        final ArrayList<KaraokeLine> lines = new ArrayList<>(length);
+        for (int a = 0; a < length; a++) {
+            final Object row = array.get(a);
+            if (!(row instanceof JSONObject)) {
+                throw new MalformedResponseException("lyrics[]");
+            }
+            final KaraokeLine line = readKaraokeLine((JSONObject) row);
+            if (line != null) {
+                lines.add(line);
+            }
+        }
+        return lines.isEmpty() ? null : lines;
+    }
+
+    private static KaraokeLine readKaraokeLine(JSONObject row) throws MalformedResponseException, JSONException {
+        final long timeMs = readTimeMs(row);
+        if (timeMs < 0) {
+            return null; // no stated start: there is nowhere to put this line
+        }
+        final KaraokeLine line = new KaraokeLine();
+        line.timeMs = timeMs;
+        final String rowText = readString(row, "text", true);
+        readWords(row, line);
+        if (line.wordTimes == null) {
+            line.text = rowText == null ? "" : rowText;
+        } else {
+            // The words are what the offsets will address, so their concatenation is the text -
+            // not the row's own copy of it, which may differ in whitespace.
+            final StringBuilder text = new StringBuilder();
+            for (int a = 0; a < line.wordTexts.length; a++) {
+                text.append(line.wordTexts[a]);
+            }
+            line.text = text.toString();
+            // A word cannot start before the line it belongs to. Where the source disagrees with
+            // itself, the line starts at the earlier of the two times it stated, which keeps every
+            // word time exactly as given instead of discarding the line's timing.
+            line.timeMs = Math.min(line.timeMs, line.wordTimes[0]);
+        }
+        if (!isRepresentableLyricLine(line.text)) {
+            return null;
+        }
+        return line;
+    }
+
+    /** {@code time} is milliseconds. Absent, null, non-numeric, negative or beyond LRC: unusable. */
+    private static long readTimeMs(JSONObject object) throws MalformedResponseException {
+        if (!object.has("time")) {
+            return -1;
+        }
+        final Object value = object.opt("time");
+        if (value == null || value == JSONObject.NULL) {
+            return -1;
+        }
+        if (!(value instanceof Number)) {
+            throw new MalformedResponseException("time");
+        }
+        final double ms = ((Number) value).doubleValue();
+        if (Double.isNaN(ms) || Double.isInfinite(ms) || ms < 0 || ms > MAX_KARAOKE_TIME_MS) {
+            return -1;
+        }
+        return (long) ms;
+    }
+
+    /**
+     * Reads one line's {@code syllabus}, leaving {@code wordTimes} null unless the source states
+     * usable word timing for it.
+     *
+     * <p>A word with no text contributes no range and is skipped along with its time; a
+     * whitespace-only word is kept, because it is what separates the words around it. Times must
+     * not run backwards: a line whose stated words are out of order keeps its text and loses only
+     * its word timing, exactly as the parser would decide for the same data.
+     */
+    private static void readWords(JSONObject row, KaraokeLine line) throws MalformedResponseException, JSONException {
+        if (!row.has("syllabus")) {
+            return;
+        }
+        final Object raw = row.opt("syllabus");
+        if (raw == null || raw == JSONObject.NULL) {
+            return;
+        }
+        if (!(raw instanceof JSONArray)) {
+            throw new MalformedResponseException("syllabus");
+        }
+        final JSONArray array = (JSONArray) raw;
+        final int length = array.length();
+        if (length == 0 || length > MAX_KARAOKE_WORDS_PER_LINE) {
+            return;
+        }
+        final long[] times = new long[length];
+        final String[] texts = new String[length];
+        int count = 0;
+        for (int a = 0; a < length; a++) {
+            final Object word = array.get(a);
+            if (!(word instanceof JSONObject)) {
+                throw new MalformedResponseException("syllabus[]");
+            }
+            final long timeMs = readTimeMs((JSONObject) word);
+            final String text = readString((JSONObject) word, "text", true);
+            if (timeMs < 0 || text == null) {
+                return; // a word without a stated time or text is not word timing
+            }
+            if (text.isEmpty()) {
+                continue;
+            }
+            if (count > 0 && timeMs < times[count - 1]) {
+                return; // stated out of order; this line keeps its text and loses word timing
+            }
+            times[count] = timeMs;
+            texts[count] = text;
+            count++;
+        }
+        if (count == 0) {
+            return;
+        }
+        line.wordTimes = count == length ? times : Arrays.copyOf(times, count);
+        line.wordTexts = count == length ? texts : Arrays.copyOf(texts, count);
+    }
+
+    /** False when a line's text could not survive being written into an LRC document. */
+    private static boolean isRepresentableLyricLine(String text) {
+        if (text.indexOf('\n') >= 0 || text.indexOf('\r') >= 0) {
+            return false; // one lyric line cannot hold a line break
+        }
+        return !LOOKS_LIKE_WORD_TAG.matcher(text).find() && !LOOKS_LIKE_LINE_TAG.matcher(text).find();
+    }
+
+    /**
+     * Writes the lines out as Enhanced LRC, or returns null when no line ended up carrying more
+     * than one stated word.
+     *
+     * <p>A line the source timed word by word is written with its words inline; a line it timed
+     * only as a whole is written as an ordinary LRC line, which is genuine line timing and is
+     * exactly what the player falls back to for it. No timestamp is interpolated, divided, rounded
+     * up or invented, and no end time is written, because none was stated.
+     */
+    private static String writeEnhancedLrc(ArrayList<KaraokeLine> lines) {
+        final StringBuilder out = new StringBuilder();
+        int subdivided = 0;
+        for (int a = 0; a < lines.size(); a++) {
+            final KaraokeLine line = lines.get(a);
+            final String stamp = formatLrcTime(line.timeMs);
+            if (stamp == null) {
+                continue;
+            }
+            final StringBuilder body = new StringBuilder();
+            int words = 0;
+            if (line.wordTimes != null) {
+                for (int b = 0; b < line.wordTimes.length; b++) {
+                    final String wordStamp = formatLrcTime(line.wordTimes[b]);
+                    if (wordStamp == null) {
+                        words = 0;
+                        break;
+                    }
+                    body.append('<').append(wordStamp).append('>').append(line.wordTexts[b]);
+                    words++;
+                }
+            }
+            if (out.length() > 0) {
+                out.append('\n');
+            }
+            out.append('[').append(stamp).append(']');
+            if (words > 0) {
+                out.append(body);
+                if (words > 1) {
+                    subdivided++;
+                }
+            } else {
+                out.append(line.text);
+            }
+        }
+        // One tag covering a whole line says no more than the line's own timestamp already says,
+        // and a document made only of those is line timing wearing word timing's clothes. It is
+        // not what the user asked for, so it is reported as unavailable rather than served.
+        return subdivided > 0 ? out.toString() : null;
+    }
+
+    /**
+     * Formats an absolute millisecond time as the {@code mm:ss.xx} the LRC grammar states, or null
+     * when it cannot be expressed. Milliseconds are truncated to centiseconds rather than rounded,
+     * so a word can never be written as starting later than the source said it does.
+     */
+    private static String formatLrcTime(long ms) {
+        if (ms < 0 || ms > MAX_KARAOKE_TIME_MS) {
+            return null;
+        }
+        final long centis = ms / 10;
+        return String.format(Locale.US, "%02d:%02d.%02d", centis / 6000, (centis / 100) % 60, centis % 100);
     }
 
     // endregion

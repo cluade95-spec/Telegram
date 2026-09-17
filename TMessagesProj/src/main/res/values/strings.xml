@@ -11213,6 +11213,8 @@
     <string name="LyricsOnlineSearchTitle">Title</string>
     <string name="LyricsOnlineSearchSynced">Synced</string>
     <string name="LyricsOnlineSearchPlain">Normal</string>
+    <string name="LyricsOnlineSearchKaraoke">Karaoke (word by word)</string>
+    <string name="LyricsOnlineSearchType">Lyrics type</string>
     <string name="LyricsOnlineSearchNotFound">No lyrics were found for this artist and title.</string>
     <string name="LyricsOnlineSearchTypeUnavailable">This track was found, but not with the type of lyrics you asked for.</string>
     <string name="LyricsOnlineSearchNetworkError">Could not reach the lyrics service. Check your connection and try again.</string>

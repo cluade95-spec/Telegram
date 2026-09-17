@@ -3228,12 +3228,21 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         updateLyricsDepth();
     }
 
-    /** 0 = fully inactive, 1 = fully active, blended while a transition is in flight. */
+    /**
+     * 0 = fully inactive, 1 = fully active, blended while a transition is in flight.
+     *
+     * <p>The movement and the emphasis share one clock but not one curve: the surface eases in and
+     * out of its move, while the emphasis is eased out, so a line has most of its prominence by
+     * the time it arrives instead of finishing its colour after it has stopped moving. The curve is
+     * applied to the progress once and the two sides derived from it, so a crossfade stays
+     * complementary and the pair can never dip or overshoot in total brightness.
+     */
     private float lyricsEmphasisOf(int row) {
         if (row == RecyclerView.NO_POSITION) return 0f;
-        if (row == lyricsEmphasisToRow) return lyricsEmphasisProgress;
-        if (row == lyricsEmphasisFromRow) return 1f - lyricsEmphasisProgress;
-        return 0f;
+        if (row != lyricsEmphasisToRow && row != lyricsEmphasisFromRow) return 0f;
+        final float eased = CubicBezierInterpolator.EASE_OUT.getInterpolation(
+                Math.max(0f, Math.min(1f, lyricsEmphasisProgress)));
+        return row == lyricsEmphasisToRow ? eased : 1f - eased;
     }
 
     /**
@@ -3417,8 +3426,12 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
      * still be arriving when the next one begins. It never moves a boundary.
      */
     private static final long KARAOKE_TRANSITION_MS = 150;
-    /** How much of the active colour text that has not been sung yet is allowed to take. */
-    private static final float KARAOKE_UNSUNG_EMPHASIS = 0.3f;
+    /**
+     * How much of the active colour text that has not been sung yet is allowed to take. Enough that
+     * the line reads as the current one from the moment it arrives, while still leaving the sung
+     * text unmistakably ahead of it.
+     */
+    private static final float KARAOKE_UNSUNG_EMPHASIS = 0.38f;
 
     private final SyncedLyricsController.Karaoke karaoke = new SyncedLyricsController.Karaoke();
     /** Scratch holder for painting one row; never carries state between two calls. */
@@ -3493,9 +3506,13 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         final float emphasis = lyricsEmphasisOf(row);
         final float center = getLyricsFocusCenter();
         final float distance = Math.abs((child.getTop() + child.getBottom()) / 2f - center) / Math.max(1f, center);
-        final float depth = Math.min(1f, distance);
-        final float restAlpha = 0.86f - depth * .42f;
-        final float restScale = 0.985f - depth * .025f;
+        // Smoothstep rather than the raw distance: the falloff starts gently, so the lines either
+        // side of the active one stay comfortably readable, and deepens further out, where being
+        // subordinate is the point. Linear distance did the opposite of both.
+        final float linear = Math.min(1f, distance);
+        final float depth = linear * linear * (3f - 2f * linear);
+        final float restAlpha = 0.84f - depth * .46f;
+        final float restScale = 0.978f - depth * .03f;
         child.setAlpha(lerp(restAlpha, 1f, emphasis));
         final float scale = lerp(restScale, 1f, emphasis);
         child.setScaleX(scale);
@@ -3516,17 +3533,23 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 // weight, movement - is untouched.
                 final int sungColor = ColorUtils.blendARGB(inactiveColor, activeColor, emphasis);
                 final int unsungColor = ColorUtils.blendARGB(inactiveColor, activeColor, emphasis * KARAOKE_UNSUNG_EMPHASIS);
+                // The range that has just begun eases into its colour instead of ramping linearly,
+                // so a word catches the light quickly and settles rather than sliding. Only the
+                // colour is eased: the boundary it applies to is the one the source stated, and
+                // KARAOKE_TRANSITION_MS cannot move it.
+                final float arrived = CubicBezierInterpolator.EASE_OUT.getInterpolation(rowKaraoke.fadeProgress);
                 textView.setTextColor(unsungColor);
                 textView.applyKaraoke(rowKaraoke.fadeStart, rowKaraoke.sungEnd, sungColor,
-                        ColorUtils.blendARGB(unsungColor, sungColor, rowKaraoke.fadeProgress));
+                        ColorUtils.blendARGB(unsungColor, sungColor, arrived));
             } else {
                 textView.clearKaraoke();
                 textView.setTextColor(ColorUtils.blendARGB(inactiveColor, activeColor, emphasis));
             }
-            // Weight cannot interpolate, so it crosses over mid-transition where colour, alpha and
-            // scale have already carried most of the change and the switch is not perceptible.
-            final Typeface typeface = emphasis >= 0.5f ? AndroidUtilities.bold() : Typeface.DEFAULT;
-            if (textView.getTypeface() != typeface) textView.setTypeface(typeface);
+            // Emphasis is carried by colour, opacity and scale alone. Weight is deliberately not
+            // part of it: a typeface is metric-affecting, so switching it re-measures the row, can
+            // re-wrap a long line into a different height and move every row below it, and it can
+            // only ever cross over at one point rather than interpolate. Scale is a draw-time
+            // transform, so it expresses the same hierarchy continuously and never reflows text.
         }
     }
 
