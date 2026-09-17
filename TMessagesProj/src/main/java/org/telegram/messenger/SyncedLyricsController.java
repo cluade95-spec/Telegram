@@ -131,6 +131,25 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
         public long startTimeMs(int index) {
             return startTimes[index];
         }
+
+        /**
+         * Index of the last segment whose stated start time has been reached at {@code positionMs},
+         * or -1 when none has. Nothing between two stated times is attributed to either of them:
+         * the answer is always a segment the source actually started.
+         */
+        public int indexAt(long positionMs) {
+            int low = 0, high = startTimes.length - 1, result = -1;
+            while (low <= high) {
+                final int middle = (low + high) >>> 1;
+                if (startTimes[middle] <= positionMs) {
+                    result = middle;
+                    low = middle + 1;
+                } else {
+                    high = middle - 1;
+                }
+            }
+            return result;
+        }
     }
 
     public static final class Line {
@@ -163,6 +182,112 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
 
         private Line withSegments(Segments segments) {
             return new Line(timeMs, text, timed, segments);
+        }
+    }
+
+    /**
+     * How much of one line the source says has been sung at a given playback position.
+     *
+     * <p>Everything here is read straight out of {@link Line#segments}: a boundary is always an
+     * offset the source stated, and it moves only when a time the source stated has been reached.
+     * No time is divided, interpolated or inferred from how long a word looks, and a line without
+     * genuine inline timing resolves to inactive so its consumer keeps whatever line-level
+     * behaviour it already had.
+     *
+     * <p>One instance is reused per consumer: this is read on every frame and must not allocate.
+     */
+    public static final class Karaoke {
+        /** True when this line has genuine inline timing to show at the resolved position. */
+        public boolean active;
+        /**
+         * Exclusive UTF-16 end, in {@link Line#text}, of the text the source has reached. Always a
+         * segment boundary, so it never falls inside a surrogate pair.
+         */
+        public int sungEnd;
+        /**
+         * Start of the segment that most recently began, so a consumer can treat that one segment
+         * differently while it arrives. Equals {@link #sungEnd} when no segment has begun yet.
+         */
+        public int fadeStart;
+        /**
+         * 0..1 across the arrival of the segment at {@link #fadeStart}, reaching 1 once it has
+         * settled. This is a fixed-length appearance transition anchored to a stated start time -
+         * a consumer may ease a segment in over it - not an estimate of how long that segment
+         * lasts and not a position within it. The boundaries above never depend on it.
+         */
+        public float fadeProgress;
+
+        public void clear() {
+            active = false;
+            sungEnd = 0;
+            fadeStart = 0;
+            fadeProgress = 1f;
+        }
+
+        /**
+         * Resolves this holder for one line of a document, given which line the position is
+         * currently inside. This is the whole of the decision: a line the position has already
+         * left has had every range it states started, so all of it has been sung; a line the
+         * position has not reached yet states nothing that has happened, so none of it has, even
+         * if a player is already moving it into view. Only the current line is resolved against
+         * the clock.
+         *
+         * <p>Returning false means this line has no genuine inline timing at all, and is the
+         * signal to render it exactly the way it was rendered before word timing existed.
+         */
+        public boolean resolveRow(Line line, int lineIndex, int currentLine, long positionMs, long transitionMs) {
+            clear();
+            if (line == null || line.segments == null || line.text.isEmpty()) return false;
+            if (lineIndex == currentLine) {
+                if (resolve(line, positionMs, transitionMs)) return true;
+                clear(); // the line's own timestamp has not been reached, so nothing has happened
+            } else if (lineIndex < currentLine) {
+                // Already left behind: every range it states has started, so all of it is sung.
+                sungEnd = fadeStart = line.text.length();
+            }
+            // Everything else is a line the position has not reached - including one a player is
+            // already moving into view - and clear() has left both boundaries at zero.
+            active = true;
+            return true;
+        }
+
+        /**
+         * Resolves this holder against one line at one playback position, and reports whether the
+         * line has genuine timing to show. {@code transitionMs} is the consumer's own appearance
+         * transition length; it never changes a boundary.
+         *
+         * <p>Returning false is the fallback path: a line with no inline timing, a line whose own
+         * timestamp has not been reached, and an untimed line all land there, and the consumer is
+         * expected to fall back to line-level behaviour rather than invent anything.
+         */
+        public boolean resolve(Line line, long positionMs, long transitionMs) {
+            clear();
+            if (line == null || line.segments == null || line.text.isEmpty()) return false;
+            if (!line.timed || positionMs < line.timeMs) return false;
+            final Segments segments = line.segments;
+            final int index = segments.indexAt(positionMs);
+            if (index < 0) {
+                // The line is current but its first stated tag has not been reached. Any text
+                // before that tag carries no timing of its own; it belongs to the line and takes
+                // the line's own granularity, which is the only thing stated about it.
+                sungEnd = fadeStart = segments.startOffset(0);
+                active = true;
+                return true;
+            }
+            fadeStart = segments.startOffset(index);
+            sungEnd = segments.endOffset(index);
+            long window = transitionMs;
+            if (index + 1 < segments.size()) {
+                // Bounded by the real gap between two stated starts, so the transition is always
+                // finished before the next segment begins. Closely spaced syllables therefore
+                // arrive crisply instead of overlapping - and the bound comes from stated times,
+                // never from a guess at how long a word lasts.
+                window = Math.min(window, segments.startTimeMs(index + 1) - segments.startTimeMs(index));
+            }
+            final long elapsed = positionMs - segments.startTimeMs(index);
+            fadeProgress = window <= 0 ? 1f : Math.max(0f, Math.min(1f, elapsed / (float) window));
+            active = true;
+            return true;
         }
     }
 

@@ -240,6 +240,9 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
     /** Leading LRC timestamps only, matching what the parser accepts. Metadata tags cannot match. */
     private static final Pattern TIMESTAMP_TOKEN = Pattern.compile("\\[(\\d{1,3}):(\\d{1,2})(?:[\\.:]\\d{1,3})?]");
 
+    /** Inline Enhanced-LRC word timestamps, matching what the parser captures inside a timed line. */
+    private static final Pattern WORD_TIMESTAMP_TOKEN = Pattern.compile("<(\\d{1,3}):(\\d{1,2})(?:[\\.:]\\d{1,3})?>");
+
     /**
      * Re-colours only the lines the last edit touched. Typing re-spans one paragraph; a paste or an
      * import re-spans just the inserted range. Nothing ever walks the whole document per keystroke
@@ -261,16 +264,17 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
             text.removeSpan(span);
         }
         final int color = getThemedColor(Theme.key_windowBackgroundWhiteBlueText);
+        final int wordColor = getThemedColor(Theme.key_windowBackgroundWhiteGrayText);
         int lineStart = start;
         while (lineStart <= end && lineStart < length) {
             int lineEnd = lineStart;
             while (lineEnd < length && text.charAt(lineEnd) != '\n') lineEnd++;
-            styleTimestampsInLine(text, lineStart, lineEnd, color);
+            styleTimestampsInLine(text, lineStart, lineEnd, color, wordColor);
             lineStart = lineEnd + 1;
         }
     }
 
-    private void styleTimestampsInLine(Editable text, int lineStart, int lineEnd, int color) {
+    private void styleTimestampsInLine(Editable text, int lineStart, int lineEnd, int color, int wordColor) {
         if (lineEnd <= lineStart) return;
         final Matcher matcher = TIMESTAMP_TOKEN.matcher(text);
         matcher.region(lineStart, lineEnd);
@@ -284,6 +288,32 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
             }
             text.setSpan(new TimestampSpan(color), matcher.start(), matcher.end(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
             cursor = matcher.end();
+        }
+        // Inline word timestamps are only timing inside a line that already has a leading one; on
+        // any other line the same characters are just text, and colouring them would say otherwise.
+        if (cursor > lineStart) styleWordTimestampsInLine(text, cursor, lineEnd, wordColor);
+    }
+
+    /**
+     * Marks the inline word timestamps of one timed line, all of them or none. The parser discards
+     * a line's inline timing outright when any one tag states an impossible time, so colouring the
+     * well-formed ones next to a broken one would show timing that will not be read back.
+     */
+    private void styleWordTimestampsInLine(Editable text, int start, int lineEnd, int color) {
+        if (lineEnd <= start) return;
+        final Matcher matcher = WORD_TIMESTAMP_TOKEN.matcher(text);
+        matcher.region(start, lineEnd);
+        final ArrayList<int[]> found = new ArrayList<>();
+        while (matcher.find()) {
+            try {
+                if (Long.parseLong(matcher.group(2)) >= 60) return;
+            } catch (RuntimeException ignore) {
+                return;
+            }
+            found.add(new int[]{matcher.start(), matcher.end()});
+        }
+        for (int a = 0; a < found.size(); a++) {
+            text.setSpan(new TimestampSpan(color), found.get(a)[0], found.get(a)[1], Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
         }
     }
 

@@ -40,9 +40,14 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.SystemClock;
+import android.text.Spannable;
+import android.text.SpannableString;
 import android.text.SpannableStringBuilder;
 import android.text.Spanned;
+import android.text.TextPaint;
 import android.text.TextUtils;
+import android.text.style.CharacterStyle;
+import android.text.style.UpdateAppearance;
 import android.util.FloatProperty;
 import android.util.Property;
 import android.util.TypedValue;
@@ -2583,6 +2588,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             updateLyricsPadding();
             activeLyricsLine = Integer.MIN_VALUE;
             activeLyricsRow = RecyclerView.NO_POSITION;
+            resetKaraoke();
             lyricsAdapter.notifyDataSetChanged();
         }
         if (visibleLyrics.isEmpty()) {
@@ -2599,10 +2605,14 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         } else if (lyricsModeRequested && !showingLyrics) {
             setShowingLyrics(true, animated);
         }
-        int index = lyrics.lineAt(SyncedLyricsController.positionMs(message));
+        final long position = SyncedLyricsController.positionMs(message);
+        int index = lyrics.lineAt(position);
         // The visual follow is re-evaluated on every tick so pause, seek and track changes always
         // recompute from the real playback position instead of from a stale schedule.
         updateLyricsFollow(true);
+        // Word highlighting is resolved from the same real position, every tick, so a seek or a
+        // pause lands exactly where the timestamps say it should instead of unwinding an animation.
+        updateKaraoke(index, position);
         if (index == activeLyricsLine) return;
         int oldRow = activeLyricsRow;
         activeLyricsLine = index;
@@ -3394,6 +3404,80 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         }
     }
 
+    // ---------------------------------------------------------------------------------------
+    // Word-level karaoke. Only the line whose OWN timestamp has already passed can show word
+    // highlighting, and inside it a range lights up only once the time the source stated for that
+    // range has passed. Nothing here derives a time from a word's length, from the line's
+    // duration, or from anything other than the timestamps captured out of the source, and a line
+    // that states none simply keeps the whole-line behaviour it always had.
+    // ---------------------------------------------------------------------------------------
+
+    /**
+     * How long a single range takes to reach its full colour once its stated time has passed. It
+     * is an appearance transition, bounded by the gap to the next stated time, so a word can never
+     * still be arriving when the next one begins. It never moves a boundary.
+     */
+    private static final long KARAOKE_TRANSITION_MS = 150;
+    /** How much of the active colour text that has not been sung yet is allowed to take. */
+    private static final float KARAOKE_UNSUNG_EMPHASIS = 0.3f;
+
+    private final SyncedLyricsController.Karaoke karaoke = new SyncedLyricsController.Karaoke();
+    /** Scratch holder for painting one row; never carries state between two calls. */
+    private final SyncedLyricsController.Karaoke rowKaraoke = new SyncedLyricsController.Karaoke();
+    /** The line the playback position is actually inside, whether or not it states word timing. */
+    private int karaokeLine = Integer.MIN_VALUE;
+    private long karaokePositionMs;
+    private int karaokeRow = RecyclerView.NO_POSITION;
+    private int paintedKaraokeEnd = -1;
+    private boolean paintedKaraokeSettled;
+
+    /**
+     * Resolves the word state for the line the position is actually inside, and repaints what
+     * changed. Deliberately driven by the real position rather than by the follow animation: the
+     * follow promotes the next line up to a pre-roll early, and no word of that line may light up
+     * before its own stated time.
+     */
+    private void updateKaraoke(int line, long positionMs) {
+        final boolean resolved = currentLyrics != null && currentLyrics.isSynced()
+                && line >= 0 && line < currentLyrics.lines.size()
+                && karaoke.resolve(currentLyrics.lines.get(line), positionMs, KARAOKE_TRANSITION_MS);
+        if (!resolved) karaoke.clear();
+        karaokePositionMs = positionMs;
+        final boolean lineChanged = line != karaokeLine;
+        final boolean rangeChanged = karaoke.sungEnd != paintedKaraokeEnd || !paintedKaraokeSettled;
+        karaokeLine = line;
+        karaokeRow = resolved ? rowForLyricsLine(line) : RecyclerView.NO_POSITION;
+        paintedKaraokeEnd = karaoke.sungEnd;
+        paintedKaraokeSettled = karaoke.fadeProgress >= 1f;
+        if (lineChanged) {
+            // Every attached row derives its own state from which side of the current line it is
+            // on, so a line change - including a seek across several lines - repaints them all.
+            updateLyricsDepth();
+            return;
+        }
+        // Within one line only that line can change: a settled range repaints nothing until the
+        // next one arrives, so a long word costs no work per tick.
+        if (karaokeRow != RecyclerView.NO_POSITION && rangeChanged) {
+            repaintLyricsRow(karaokeRow);
+        }
+    }
+
+    private void repaintLyricsRow(int row) {
+        if (lyricsListView == null || lyricsLayoutManager == null || row == RecyclerView.NO_POSITION) return;
+        final View child = lyricsLayoutManager.findViewByPosition(row);
+        if (child != null) applyLyricsDepth(child);
+    }
+
+    private void resetKaraoke() {
+        karaoke.clear();
+        rowKaraoke.clear();
+        karaokeLine = Integer.MIN_VALUE;
+        karaokePositionMs = 0;
+        karaokeRow = RecyclerView.NO_POSITION;
+        paintedKaraokeEnd = -1;
+        paintedKaraokeSettled = false;
+    }
+
     private void applyLyricsDepth(View child) {
         if (lyricsListView.getHeight() == 0) return;
         if (currentLyrics == null || !currentLyrics.isSynced()) {
@@ -3417,14 +3501,41 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         final float scale = lerp(restScale, 1f, emphasis);
         child.setScaleX(scale);
         child.setScaleY(scale);
-        if (child instanceof TextView) {
-            final TextView textView = (TextView) child;
-            textView.setTextColor(ColorUtils.blendARGB(getThemedColor(Theme.key_player_time), getThemedColor(Theme.key_player_actionBarTitle), emphasis));
+        if (child instanceof LyricsTextView) {
+            final LyricsTextView textView = (LyricsTextView) child;
+            final int inactiveColor = getThemedColor(Theme.key_player_time);
+            final int activeColor = getThemedColor(Theme.key_player_actionBarTitle);
+            final SyncedLyricsController.Line lyricLine = lineForLyricsRow(row);
+            if (lyricLine != null && rowKaraoke.resolveRow(lyricLine, visibleLyrics.get(row), karaokeLine,
+                    karaokePositionMs, KARAOKE_TRANSITION_MS)) {
+                // Word timing splits what used to be one colour into two: a range takes the active
+                // colour only once the time stated for it has passed, and what is still to come
+                // keeps a hint of it so the line still reads as the current one. A line already
+                // passed is wholly sung and fades out with the emphasis exactly as a whole-line
+                // highlight always did; a line the pre-roll is bringing in early shows nothing lit
+                // until its own time. Every other part of the line's prominence - alpha, scale,
+                // weight, movement - is untouched.
+                final int sungColor = ColorUtils.blendARGB(inactiveColor, activeColor, emphasis);
+                final int unsungColor = ColorUtils.blendARGB(inactiveColor, activeColor, emphasis * KARAOKE_UNSUNG_EMPHASIS);
+                textView.setTextColor(unsungColor);
+                textView.applyKaraoke(rowKaraoke.fadeStart, rowKaraoke.sungEnd, sungColor,
+                        ColorUtils.blendARGB(unsungColor, sungColor, rowKaraoke.fadeProgress));
+            } else {
+                textView.clearKaraoke();
+                textView.setTextColor(ColorUtils.blendARGB(inactiveColor, activeColor, emphasis));
+            }
             // Weight cannot interpolate, so it crosses over mid-transition where colour, alpha and
             // scale have already carried most of the change and the switch is not perceptible.
             final Typeface typeface = emphasis >= 0.5f ? AndroidUtilities.bold() : Typeface.DEFAULT;
             if (textView.getTypeface() != typeface) textView.setTypeface(typeface);
         }
+    }
+
+    /** The lyric line a lyrics row shows, or null when the row is not a lyric line right now. */
+    private SyncedLyricsController.Line lineForLyricsRow(int row) {
+        if (currentLyrics == null || row < 0 || row >= visibleLyrics.size()) return null;
+        final int line = visibleLyrics.get(row);
+        return line < 0 || line >= currentLyrics.lines.size() ? null : currentLyrics.lines.get(line);
     }
 
     /** Inset of the expand control (40dp target + 4dp) reserved at the top of the normal viewport. */
@@ -3670,6 +3781,116 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         }
     }
 
+    /**
+     * A lyrics row. Identical to the plain {@link TextView} it replaces in every layout respect -
+     * same gravity, padding, sizing and text direction - it only adds the two colour spans word
+     * highlighting needs.
+     *
+     * <p>Highlighting is done with character spans rather than by clipping or measuring text.
+     * That hands wrapping, bidirectional reordering and grapheme boundaries back to the platform:
+     * a highlighted range that wraps onto a second visual line, or that is a logical range inside
+     * RTL text and therefore paints as several visual runs, is drawn by exactly the code that
+     * draws a text selection. Both spans change colour only and neither affects metrics, so the
+     * line is never re-measured, never re-wrapped and never moves while it is being sung.
+     */
+    private static class LyricsTextView extends TextView {
+        private final KaraokeSpan sungSpan = new KaraokeSpan();
+        private final KaraokeSpan arrivingSpan = new KaraokeSpan();
+        /** The view's own mutable copy of the text, or null for a line with no inline timing. */
+        private Spannable karaokeText;
+        private int spanStart = -1;
+        private int spanEnd = -1;
+
+        LyricsTextView(Context context) {
+            super(context);
+        }
+
+        /**
+         * Binds the row's text. Only a line that genuinely states inline timing is kept spannable;
+         * every other row is a plain string, exactly as before.
+         */
+        void setLyricText(CharSequence text, boolean wordTimed) {
+            detachSpans();
+            if (wordTimed) {
+                setText(new SpannableString(text), BufferType.SPANNABLE);
+                final CharSequence bound = getText();
+                karaokeText = bound instanceof Spannable ? (Spannable) bound : null;
+            } else {
+                setText(text);
+                karaokeText = null;
+            }
+        }
+
+        /**
+         * Paints {@code [0, arrivingStart)} as sung, {@code [arrivingStart, sungEnd)} in the
+         * colour the caller has eased for the range that is currently arriving, and leaves the
+         * rest to the view's own text colour. Both offsets come from the parser, so they are
+         * always on a character boundary.
+         */
+        void applyKaraoke(int arrivingStart, int sungEnd, int sungColor, int arrivingColor) {
+            if (karaokeText == null) return;
+            final int length = karaokeText.length();
+            final int start = Math.max(0, Math.min(length, arrivingStart));
+            final int end = Math.max(start, Math.min(length, sungEnd));
+            boolean changed = false;
+            if (spanStart != start || spanEnd != end) {
+                spanStart = start;
+                spanEnd = end;
+                setRange(sungSpan, 0, start);
+                setRange(arrivingSpan, start, end);
+                changed = true;
+            }
+            changed |= sungSpan.setColor(sungColor);
+            changed |= arrivingSpan.setColor(arrivingColor);
+            // A span whose colour changed in place is not a change the text itself can report.
+            if (changed) invalidate();
+        }
+
+        /** Returns the row to plain, uniformly coloured text. */
+        void clearKaraoke() {
+            if (spanStart < 0 && spanEnd < 0) return;
+            detachSpans();
+            invalidate();
+        }
+
+        private void setRange(KaraokeSpan span, int start, int end) {
+            if (karaokeText == null) return;
+            if (end > start) {
+                karaokeText.setSpan(span, start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+            } else {
+                karaokeText.removeSpan(span);
+            }
+        }
+
+        private void detachSpans() {
+            if (karaokeText != null) {
+                karaokeText.removeSpan(sungSpan);
+                karaokeText.removeSpan(arrivingSpan);
+            }
+            spanStart = -1;
+            spanEnd = -1;
+        }
+    }
+
+    /**
+     * Colour only, and deliberately not metric-affecting: re-colouring a range can never re-measure
+     * or re-wrap the line it sits in.
+     */
+    private static final class KaraokeSpan extends CharacterStyle implements UpdateAppearance {
+        private int color;
+
+        boolean setColor(int value) {
+            if (color == value) return false;
+            color = value;
+            return true;
+        }
+
+        @Override
+        public void updateDrawState(TextPaint paint) {
+            paint.setColor(color);
+        }
+    }
+
     private class LyricsAdapter extends RecyclerListView.SelectionAdapter {
         private final Context context;
 
@@ -3692,7 +3913,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
 
         @Override
         public RecyclerView.ViewHolder onCreateViewHolder(ViewGroup parent, int viewType) {
-            TextView textView = new TextView(context);
+            LyricsTextView textView = new LyricsTextView(context);
             textView.setLayoutParams(new RecyclerView.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
             textView.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
             textView.setTextDirection(View.TEXT_DIRECTION_FIRST_STRONG);
@@ -3704,11 +3925,14 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
 
         @Override
         public void onBindViewHolder(RecyclerView.ViewHolder holder, int position) {
-            TextView textView = (TextView) holder.itemView;
+            LyricsTextView textView = (LyricsTextView) holder.itemView;
             int line = visibleLyrics.get(position);
             final boolean synced = currentLyrics.isSynced();
-            textView.setText(currentLyrics.lines.get(line).text);
-            boolean stanzaSpace = !synced && TextUtils.isEmpty(currentLyrics.lines.get(line).text);
+            final SyncedLyricsController.Line lyricLine = currentLyrics.lines.get(line);
+            // Only a line the source actually timed inside is bound as spannable text; every other
+            // row stays the plain string it has always been.
+            textView.setLyricText(lyricLine.text, synced && lyricLine.segments != null);
+            boolean stanzaSpace = !synced && TextUtils.isEmpty(lyricLine.text);
             // Identical viewport, typography, sizes, spacing and margins for timed and untimed
             // lyrics; only the timed visual hierarchy is synced-only.
             textView.setMinHeight(dp(stanzaSpace ? 24 : 56));
