@@ -15,6 +15,7 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
@@ -75,15 +76,80 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
         }
     }
 
+    /**
+     * Genuine inline timing captured from an Enhanced LRC line, addressing ranges of the line's
+     * own visible {@link Line#text}.
+     *
+     * <p>The unit is a <em>timed segment</em>, not a word: Enhanced LRC tags may sit mid-word, and
+     * other word-timed formats are syllable-granular. A segment carries only what the source
+     * actually stated - a genuine start time and the range of visible text it introduces. There is
+     * deliberately no end time: Enhanced LRC states starts only, and the end of the last segment on
+     * a line is not stated anywhere. A consumer that needs an end can derive one from the next
+     * segment's start; this model never invents one.
+     *
+     * <p>Offsets are UTF-16 indices into {@link Line#text}, which is what every Android text
+     * consumer ({@code String}, {@code Spannable}, {@code Layout}, {@code Canvas}) already indexes,
+     * so emoji, Amharic, combining marks, RTL and CJK need no special handling. No offset is ever
+     * allowed to fall between a surrogate pair.
+     *
+     * <p>Instances are immutable and hold parallel primitive arrays: a whole song is a few hundred
+     * segments, and a per-frame consumer must not chase objects or allocate to read one.
+     */
+    public static final class Segments {
+        private final int[] startOffsets;
+        private final int[] endOffsets;
+        private final long[] startTimes;
+
+        private Segments(int[] startOffsets, int[] endOffsets, long[] startTimes) {
+            this.startOffsets = startOffsets;
+            this.endOffsets = endOffsets;
+            this.startTimes = startTimes;
+        }
+
+        public int size() {
+            return startTimes.length;
+        }
+
+        /** Inclusive UTF-16 start of this segment's range in {@link Line#text}. */
+        public int startOffset(int index) {
+            return startOffsets[index];
+        }
+
+        /** Exclusive UTF-16 end of this segment's range in {@link Line#text}. */
+        public int endOffset(int index) {
+            return endOffsets[index];
+        }
+
+        /** Absolute start, in the same timebase as {@link Line#timeMs}. Stated by the source. */
+        public long startTimeMs(int index) {
+            return startTimes[index];
+        }
+    }
+
     public static final class Line {
         public final long timeMs;
         public final String text;
         public final boolean timed;
+        /**
+         * Genuine inline timing for this line, or null when the source stated none. Null is the
+         * overwhelmingly common case and the only one that existed before word timing: a line
+         * without inline timing carries no empty arrays and no placeholder segments.
+         */
+        public final Segments segments;
 
         private Line(long timeMs, String text, boolean timed) {
+            this(timeMs, text, timed, null);
+        }
+
+        private Line(long timeMs, String text, boolean timed, Segments segments) {
             this.timeMs = timeMs;
             this.text = text;
             this.timed = timed;
+            this.segments = segments;
+        }
+
+        private Line withSegments(Segments segments) {
+            return new Line(timeMs, text, timed, segments);
         }
     }
 
@@ -194,8 +260,11 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
                 }
             }
             if (times.isEmpty()) continue;
-            String text = WORD_TIMESTAMP.matcher(sourceLine.substring(end)).replaceAll("").trim();
-            for (Long time : times) parsed.add(new ParsedLine(time, text, order++));
+            // Identical visible text to a plain strip-and-trim, plus the positions the stripped
+            // tags occupied in it. The text is what it always was; the timing is what used to be
+            // thrown away here.
+            Stripped stripped = stripWordTimestamps(sourceLine.substring(end), offset);
+            for (Long time : times) parsed.add(new ParsedLine(time, stripped.text, stripped.candidate, order++));
         }
         for (String sourceLine : sourceLines) {
             String text = sourceLine.trim();
@@ -209,6 +278,7 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
         }
         parsed.sort(Comparator.comparingLong((ParsedLine line) -> line.timeMs).thenComparingInt(line -> line.order));
         ArrayList<Line> result = new ArrayList<>();
+        ArrayList<Candidate> candidates = new ArrayList<>();
         for (int i = 0; i < parsed.size();) {
             int j = i + 1;
             while (j < parsed.size() && parsed.get(j).timeMs == parsed.get(i).timeMs) j++;
@@ -222,8 +292,19 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
                     combined.append(text);
                 }
             }
+            // Inline timing survives only when this line came from exactly one source line. A
+            // combined line interleaves two texts, so the captured offsets would no longer address
+            // the text they were measured against; dropping them is the only honest option, and it
+            // leaves the visible text untouched either way.
+            candidates.add(j - i == 1 ? parsed.get(i).candidate : null);
             result.add(new Line(parsed.get(i).timeMs, combined.toString(), true));
             i = j;
+        }
+        for (int i = 0; i < result.size(); i++) {
+            final Line line = result.get(i);
+            final long nextTimeMs = i + 1 < result.size() ? result.get(i + 1).timeMs : Long.MAX_VALUE;
+            final Segments segments = qualify(candidates.get(i), line.text, line.timeMs, nextTimeMs);
+            if (segments != null) result.set(i, line.withSegments(segments));
         }
         if (!result.isEmpty() && !hasUntimedContent) {
             return new Lyrics(result, source, Kind.SYNCED, Source.NONE);
@@ -250,11 +331,13 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
     private static final class ParsedLine {
         final long timeMs;
         final String text;
+        final Candidate candidate;
         final int order;
 
-        ParsedLine(long timeMs, String text, int order) {
+        ParsedLine(long timeMs, String text, Candidate candidate, int order) {
             this.timeMs = timeMs;
             this.text = text;
+            this.candidate = candidate;
             this.order = order;
         }
     }
@@ -267,6 +350,183 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
         } catch (RuntimeException ignore) {
             return false;
         }
+    }
+
+    /**
+     * Fraction of a line's non-whitespace text that inline timing must actually address before the
+     * line counts as word-timed. Two tagged words in a nine-word line are not karaoke, and calling
+     * them karaoke would force a consumer to invent timing for the rest.
+     */
+    private static final float MIN_SEGMENT_COVERAGE = 0.8f;
+
+    /** A line's visible text, plus whatever genuine inline timing was stripped out of it. */
+    private static final class Stripped {
+        final String text;
+        final Candidate candidate;
+
+        Stripped(String text, Candidate candidate) {
+            this.text = text;
+            this.candidate = candidate;
+        }
+    }
+
+    /** Raw captured tags, before they are judged against the line they ended up on. */
+    private static final class Candidate {
+        final int[] offsets;
+        final long[] times;
+        final int count;
+        /** A tag matched the inline shape but stated an impossible time, so nothing here is trusted. */
+        final boolean malformed;
+
+        Candidate(int[] offsets, long[] times, int count, boolean malformed) {
+            this.offsets = offsets;
+            this.times = times;
+            this.count = count;
+            this.malformed = malformed;
+        }
+    }
+
+    /**
+     * Removes inline {@code <mm:ss.xx>} tags exactly as a plain strip-and-trim would, and records
+     * where each removed tag sat in the resulting visible text.
+     *
+     * <p>The returned text is character-for-character what this parser produced before inline
+     * timing was captured: the same tags are removed, and {@link String#trim()}'s own bounds are
+     * reproduced so the captured offsets can be rebased onto it.
+     */
+    private static Stripped stripWordTimestamps(String remainder, long offset) {
+        final Matcher matcher = WORD_TIMESTAMP.matcher(remainder);
+        if (!matcher.find()) {
+            return new Stripped(remainder.trim(), null);
+        }
+        final StringBuilder stripped = new StringBuilder(remainder.length());
+        int[] offsets = new int[8];
+        long[] times = new long[8];
+        int count = 0;
+        boolean malformed = false;
+        int consumed = 0;
+        do {
+            stripped.append(remainder, consumed, matcher.start());
+            consumed = matcher.end();
+            final long time = parseWordTimeMs(matcher.group(), offset);
+            if (time < 0) {
+                // Stripped from the text either way - the visible result must not depend on
+                // whether a tag was well formed - but never recorded as timing.
+                malformed = true;
+                continue;
+            }
+            if (count == offsets.length) {
+                offsets = Arrays.copyOf(offsets, count * 2);
+                times = Arrays.copyOf(times, count * 2);
+            }
+            offsets[count] = stripped.length();
+            times[count] = time;
+            count++;
+        } while (matcher.find());
+        stripped.append(remainder, consumed, remainder.length());
+        // String.trim() drops every character <= ' ' from both ends; reproducing its bounds here
+        // yields the identical string and, unlike trim() itself, tells us how far the text shifted.
+        int begin = 0;
+        int last = stripped.length();
+        while (begin < last && stripped.charAt(begin) <= ' ') begin++;
+        while (last > begin && stripped.charAt(last - 1) <= ' ') last--;
+        final String text = stripped.substring(begin, last);
+        for (int a = 0; a < count; a++) {
+            offsets[a] = Math.max(0, Math.min(text.length(), offsets[a] - begin));
+        }
+        return new Stripped(text, new Candidate(offsets, times, count, malformed));
+    }
+
+    /**
+     * Reads one inline tag. The pattern has already fixed its shape, so only the stated values can
+     * still be out of range. Returns a negative value for a tag that cannot be trusted; the caller
+     * strips it from the text regardless. The arithmetic, including {@code [offset:]}, is the same
+     * as for line timestamps so both live in one timebase.
+     */
+    private static long parseWordTimeMs(String tag, long offset) {
+        try {
+            final int colon = tag.indexOf(':');
+            final long minutes = Long.parseLong(tag.substring(1, colon));
+            int end = colon + 1;
+            while (end < tag.length() && tag.charAt(end) >= '0' && tag.charAt(end) <= '9') end++;
+            final long seconds = Long.parseLong(tag.substring(colon + 1, end));
+            if (seconds >= 60) return -1;
+            long millis = 0;
+            if (end < tag.length() - 1) {
+                final String fraction = tag.substring(end + 1, tag.length() - 1);
+                millis = Long.parseLong(fraction) * (fraction.length() == 1 ? 100 : fraction.length() == 2 ? 10 : 1);
+            }
+            return Math.max(0, (minutes * 60 + seconds) * 1000 + millis + offset);
+        } catch (RuntimeException ignore) {
+            return -1;
+        }
+    }
+
+    /**
+     * Decides whether captured tags are genuine timing for the line they landed on. Everything here
+     * either accepts what the source stated or discards it: no time is adjusted, reordered, or
+     * filled in. Failing any rule costs the line its optional timing and nothing else - the line,
+     * its timestamp and its text are untouched, so a broken karaoke extension can never damage
+     * otherwise valid line-synced lyrics.
+     */
+    private static Segments qualify(Candidate candidate, String text, long lineTimeMs, long nextTimeMs) {
+        if (candidate == null || candidate.malformed || candidate.count == 0) return null;
+        // A timed blank has no text to address, so it has nothing to time.
+        if (text.isEmpty()) return null;
+        final int count = candidate.count;
+        for (int a = 0; a < count; a++) {
+            final long time = candidate.times[a];
+            // Stated out of its own line's interval, or running backwards: not this line's timing.
+            if (time < lineTimeMs || time >= nextTimeMs) return null;
+            if (a > 0 && time < candidate.times[a - 1]) return null;
+            if (a > 0 && candidate.offsets[a] < candidate.offsets[a - 1]) return null;
+            if (splitsSurrogatePair(text, candidate.offsets[a])) return null;
+        }
+        final int length = text.length();
+        int[] startOffsets = new int[count];
+        int[] endOffsets = new int[count];
+        long[] startTimes = new long[count];
+        int kept = 0;
+        int covered = 0;
+        for (int a = 0; a < count; a++) {
+            final int start = candidate.offsets[a];
+            final int end = a + 1 < count ? candidate.offsets[a + 1] : length;
+            // A tag that introduces no visible text - two tags in a row, or one trailing the line -
+            // cannot be highlighted, so it is dropped rather than kept as an empty range.
+            final int visible = countNonWhitespace(text, start, end);
+            if (visible == 0) continue;
+            startOffsets[kept] = start;
+            endOffsets[kept] = end;
+            startTimes[kept] = candidate.times[a];
+            kept++;
+            covered += visible;
+        }
+        // One segment spanning the whole line says no more than the line's own timestamp does, and
+        // is exactly what a converter emits when it only ever had line timing. Word timing has to
+        // subdivide the line to be word timing at all, so a single segment is discarded rather than
+        // presented as something it is not.
+        if (kept < 2) return null;
+        final int total = countNonWhitespace(text, 0, length);
+        if (total == 0 || covered < total * MIN_SEGMENT_COVERAGE) return null;
+        return new Segments(
+                kept == count ? startOffsets : Arrays.copyOf(startOffsets, kept),
+                kept == count ? endOffsets : Arrays.copyOf(endOffsets, kept),
+                kept == count ? startTimes : Arrays.copyOf(startTimes, kept));
+    }
+
+    /** An offset between a high and a low surrogate would cut one character in half. */
+    private static boolean splitsSurrogatePair(String text, int offset) {
+        return offset > 0 && offset < text.length()
+                && Character.isHighSurrogate(text.charAt(offset - 1))
+                && Character.isLowSurrogate(text.charAt(offset));
+    }
+
+    private static int countNonWhitespace(String text, int start, int end) {
+        int count = 0;
+        for (int a = start; a < end; a++) {
+            if (!Character.isWhitespace(text.charAt(a))) count++;
+        }
+        return count;
     }
 
     public State getState(MessageObject message) {
