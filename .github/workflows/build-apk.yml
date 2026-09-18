@@ -21,8 +21,13 @@ jobs:
           java-version: "17"
           cache: gradle
 
+      # packages: '' is kept from d1bc5398, not from the Build #16 workflow: the action's default
+      # package set stopped installing cleanly after that run, and it is redundant here anyway
+      # because the next step installs every package this build needs explicitly.
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: ''
 
       - name: Install Android dependencies
         run: |
