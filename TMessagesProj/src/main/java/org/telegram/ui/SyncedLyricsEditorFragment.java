@@ -865,7 +865,12 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
                             LocaleController.getString(R.string.LyricsOnlineSearchLineSyncOnly), 3).show();
                 }
             } else {
-                showError(onlineSearchErrorMessage(error));
+                // The same compact bottom message the line-sync notice above uses, and for the
+                // same reason: a search that found nothing is information, not a decision to
+                // confirm, and a centred dialog with an OK button interrupts the editor to say so.
+                // All three flavours fail through here, so all three fail the same way.
+                BulletinFactory.of(this).createSimpleBulletin(R.raw.error,
+                        LocaleController.getString(onlineSearchErrorMessage(error)), 3).show();
             }
         });
         onlineRequest = started[0];

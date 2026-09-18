@@ -37,17 +37,37 @@ jobs:
       - name: Make Gradle executable
         run: chmod +x gradlew
 
-      - name: Build debug APK
-        run: ./gradlew :TMessagesProj_App:assembleAfatDebug --no-daemon
+      # The afat flavour crossed with the release build type, which is the variant
+      # TMessagesProj_App/build.gradle already defines: minified, non-debuggable, and signed with
+      # signingConfigs.release - the keystore at TMessagesProj/config/release.keystore with the
+      # credentials already in gradle.properties. Nothing is generated or substituted here.
+      - name: Build release APK
+        run: ./gradlew :TMessagesProj_App:assembleAfatRelease --no-daemon
 
       - name: Collect APK
         run: |
           mkdir -p apk
-          find TMessagesProj_App/build/outputs/apk -name "*.apk" -exec cp {} apk/Telegram-Lyrics-Test.apk \;
+          # The variant writes outputFileName = "app.apk" into its own output directory. Addressed
+          # explicitly rather than by a wildcard find, so this can never pick up some other
+          # variant's output and label it release.
+          RELEASE_APK=TMessagesProj_App/build/outputs/apk/afat/release/app.apk
+          if [ ! -f "$RELEASE_APK" ]; then
+            echo "Release APK not found at $RELEASE_APK"
+            find TMessagesProj_App/build/outputs/apk -name '*.apk' -print
+            exit 1
+          fi
+          cp "$RELEASE_APK" apk/Telegram-Lyrics-Release.apk
           ls -lh apk
+
+      # Proves the artifact is actually signed and therefore installable, rather than assuming it.
+      - name: Verify APK signature
+        run: |
+          APKSIGNER="$ANDROID_HOME/build-tools/36.0.0/apksigner"
+          "$APKSIGNER" verify --verbose --print-certs apk/Telegram-Lyrics-Release.apk
+          "$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging apk/Telegram-Lyrics-Release.apk | head -5
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: Telegram-Android-Debug
-          path: apk/Telegram-Lyrics-Test.apk
+          name: Telegram-Android-Release
+          path: apk/Telegram-Lyrics-Release.apk

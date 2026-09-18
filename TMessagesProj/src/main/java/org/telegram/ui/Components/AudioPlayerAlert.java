@@ -3203,9 +3203,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         cancelLyricsFollowAnimator();
         lyricsFollowRow = RecyclerView.NO_POSITION;
         // Never leave a line half-emphasised behind a cancelled transition: resolve onto whatever
-        // the logical state says is active right now. The hierarchy goes with it - it is keyed on
-        // the clock, and the clock says this row.
-        setLyricsFocus(activeLyricsRow);
+        // the logical state says is active right now. The hierarchy rides the same values, so
+        // resolving the transition resolves the colours with it.
         setLyricsEmphasis(RecyclerView.NO_POSITION, activeLyricsRow, 1f);
     }
 
@@ -3248,9 +3247,9 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
 
     /**
      * Drives the follow's own crossfade bookkeeping. The value is no longer read by the painting -
-     * the visual hierarchy is keyed on the clock, in {@link #lyricsFocusOf} - but the transition
-     * still has to be tracked so a blank interval and a cancelled move can resolve it, and its
-     * every frame still repaints the page, which is what keeps depth and blur tracking the glide.
+     * the visual hierarchy reads it through {@link #lyricsFocusOf}, so the fade and the movement
+     * are one gesture on one clock. Its every frame repaints the page, which is what keeps both
+     * the colours and the depth tracking the glide instead of catching up after it.
      */
     /**
      * Schedules and drives the visual follow. Mirrors the compact player's lead algorithm: the move
@@ -3463,14 +3462,15 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
     /** How much of it text that has not been sung takes, at rest and on the current line. */
     private static final float KARAOKE_MUTED_REST = 0.10f;
     private static final float KARAOKE_MUTED_ACTIVE = 0.30f;
-    /** Amplitude, in dp, of the lift a word with room to make it takes. Draw-time only. */
-    static final float KARAOKE_LIFT_DP = 3f;
     /**
-     * How long the hierarchy takes to move from one line to the next. It starts at the line's
-     * GENUINE timestamp, not at the pre-roll: the list may already be gliding toward the next row,
-     * but the line being sung stays the sharp one until its own time is actually up.
+     * Amplitude, in dp, of the lift a displayed word with room to make it takes. Draw-time only.
+     *
+     * <p>Deliberately small. The lift is decoration, not state: the horizontal fill is what says
+     * which word is being sung, and the fill says it unambiguously. At three times this the eye
+     * started tracking the motion instead of reading the words, and a fast passage read as the
+     * text dancing. It is meant to register as a breath, not as an animation.
      */
-    static final long LYRICS_FOCUS_MS = 260;
+    static final float KARAOKE_LIFT_DP = 1.25f;
     /** How long a paused lift takes to settle back, and a resumed one to come back. Wall clock. */
     static final long KARAOKE_LIFT_SETTLE_MS = 200;
 
@@ -3478,18 +3478,19 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
     private boolean lyricsWordTimed;
 
     // --- Visual current-line hierarchy -----------------------------------------------------
-    // Deliberately NOT the follow target. Three separate ideas share this screen:
-    //   1. where the list is physically moving          -> lyricsFollowRow / lyricsEmphasis*
-    //   2. which line the clock says is being sung      -> karaokeLine / activeLyricsLine
-    //   3. which line is drawn sharp and bright         -> the fields below
-    // The pre-roll owns (1) and is untouched, because its glide is the part that already looks
-    // right. (3) used to be slaved to (1), which retired a line - and swallowed its last word -
-    // up to the whole pre-roll early. It now follows (2) instead and crosses over at the real
-    // timestamp.
-    private int lyricsFocusFromRow = RecyclerView.NO_POSITION;
-    private int lyricsFocusToRow = RecyclerView.NO_POSITION;
-    private float lyricsFocusProgress = 1f;
-    private ValueAnimator lyricsFocusAnimator;
+    // Three separate ideas share this screen:
+    //   1. where the list is physically moving    -> lyricsFollowRow / lyricsEmphasis*
+    //   2. which line the clock says is being sung -> karaokeLine / activeLyricsLine
+    //   3. which line is drawn sharp and bright    -> lyricsFocusOf(), below
+    //
+    // (3) is deliberately driven by (1), because the fade and the movement are one gesture: the
+    // outgoing line has to be dimming WHILE the list carries it away, and the incoming line
+    // brightening over the same travel. Giving the fade a clock of its own made the page move,
+    // stop, and only then change colour, which read as two separate events.
+    //
+    // (2) is what gates the WORDS, and it is untouched by any of this: resolveRow() is asked about
+    // karaokeLine, so no word of a line the pre-roll is merely carrying into place can light up
+    // before its own stated time, however bright the line itself has become.
 
     /**
      * Wall-clock multiplier on the lift alone, so a pause cannot leave a word hanging in the air.
@@ -3532,11 +3533,6 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             karaokeMutedSource = getThemedColor(Theme.key_player_time);
             karaokeSungSource = getThemedColor(Theme.key_player_actionBarTitle);
             karaokeRow = resolvable ? rowForLyricsLine(line) : RecyclerView.NO_POSITION;
-            // The hierarchy changes hands HERE, at the genuine timestamp, and not when the
-            // pre-roll started gliding toward this row some hundreds of milliseconds ago. The
-            // hand-over is also never allowed to outlast the line itself, so a rapid passage
-            // cannot start a second hand-over on top of an unfinished one.
-            moveLyricsFocusTo(rowForLyricsLine(line), lyricsFocusDurationMs(line));
             // Every attached row derives its own state from which side of the current line it is
             // on, so a line change - including a seek across several lines - repaints them all.
             updateLyricsDepth();
@@ -3571,78 +3567,28 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
     }
 
     /**
-     * Hands the visual hierarchy to {@code row} over {@link #LYRICS_FOCUS_MS}. Separate animator,
-     * separate clock, separate rows from the follow: the list can be anywhere in its glide and
-     * this still crosses over exactly when the clock says the line changed.
-     */
-    private void moveLyricsFocusTo(int row, long durationMs) {
-        if (lyricsFocusToRow == row && lyricsFocusAnimator == null && lyricsFocusProgress >= 1f) return;
-        cancelLyricsFocusAnimator();
-        // The row that was becoming current is the one that now holds the focus, so it is the one
-        // that fades out - whether or not its own hand-over had finished.
-        lyricsFocusFromRow = lyricsFocusToRow;
-        lyricsFocusToRow = row;
-        lyricsFocusProgress = 0f;
-        final ValueAnimator animator = ValueAnimator.ofFloat(0f, 1f);
-        animator.addUpdateListener(a -> {
-            if (lyricsFocusAnimator != a) return;
-            lyricsFocusProgress = (float) a.getAnimatedValue();
-            updateLyricsDepth();
-        });
-        animator.addListener(new AnimatorListenerAdapter() {
-            @Override public void onAnimationEnd(Animator animation) {
-                if (lyricsFocusAnimator != animation) return;
-                lyricsFocusAnimator = null;
-                lyricsFocusProgress = 1f;
-                lyricsFocusFromRow = RecyclerView.NO_POSITION;
-                updateLyricsDepth();
-            }
-        });
-        animator.setDuration(durationMs);
-        animator.setInterpolator(CubicBezierInterpolator.EASE_BOTH);
-        lyricsFocusAnimator = animator;
-        animator.start();
-    }
-
-    /**
-     * How long the hand-over onto {@code line} may take: the standard duration, unless the source
-     * says the line itself is shorter than that, in which case it takes the line. A hand-over that
-     * always completes inside its own line is a hand-over that is never interrupted halfway.
-     */
-    private long lyricsFocusDurationMs(int line) {
-        if (currentLyrics == null || line < 0 || line >= currentLyrics.lines.size()) return LYRICS_FOCUS_MS;
-        if (karaokeNextLineTimeMs == Long.MAX_VALUE) return LYRICS_FOCUS_MS;
-        final long gap = karaokeNextLineTimeMs - currentLyrics.lines.get(line).timeMs;
-        return Math.max(80L, Math.min(LYRICS_FOCUS_MS, gap));
-    }
-
-    private void cancelLyricsFocusAnimator() {
-        if (lyricsFocusAnimator == null) return;
-        final ValueAnimator animator = lyricsFocusAnimator;
-        lyricsFocusAnimator = null;
-        animator.cancel();
-    }
-
-    /** Resolves the hierarchy onto one row with no transition, for a seek or a fresh document. */
-    private void setLyricsFocus(int row) {
-        cancelLyricsFocusAnimator();
-        // No transition: used for a fresh document and for a cancelled follow, where there is
-        // nothing to cross-fade from.
-        lyricsFocusFromRow = RecyclerView.NO_POSITION;
-        lyricsFocusToRow = row;
-        lyricsFocusProgress = 1f;
-    }
-
-    /**
-     * 0 = not the line being sung, 1 = the line being sung, blended across the hand-over. Unlike
-     * the follow's own crossfade this is keyed on the CLOCK, so it never promotes a line the
-     * pre-roll is merely moving into place.
+     * 0 = subordinate, 1 = the line being sung, blended continuously across the hand-over.
+     *
+     * <p>The progress is the follow animator's own fraction - the very number that is moving the
+     * list this frame - so at a quarter of the travel the outgoing line is a quarter faded and the
+     * incoming line a quarter arrived. There is no second animator and no post-scroll switch.
+     *
+     * <p>The two sides are derived from one eased value, so the crossfade stays complementary and
+     * the pair can never dip or overshoot in total brightness. The emphasis curve is eased out
+     * while the movement is eased in and out, which is the existing tuning: a line has most of its
+     * prominence by the time it arrives rather than finishing its colour after it has stopped.
      */
     private float lyricsFocusOf(int row) {
+        return lyricsFocusValue(row, lyricsEmphasisFromRow, lyricsEmphasisToRow, lyricsEmphasisProgress);
+    }
+
+    /** The crossfade itself, free of the view state, so it can be asserted directly. */
+    public static float lyricsFocusValue(int row, int fromRow, int toRow, float progress) {
         if (row == RecyclerView.NO_POSITION) return 0f;
-        if (row != lyricsFocusToRow && row != lyricsFocusFromRow) return 0f;
-        final float eased = Math.max(0f, Math.min(1f, lyricsFocusProgress));
-        return row == lyricsFocusToRow ? eased : 1f - eased;
+        if (row != toRow && row != fromRow) return 0f;
+        final float eased = CubicBezierInterpolator.EASE_OUT.getInterpolation(
+                Math.max(0f, Math.min(1f, progress)));
+        return row == toRow ? eased : 1f - eased;
     }
 
     /**
@@ -3703,7 +3649,6 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             karaokeLiftScaleAnimator = null;
         }
         karaokeLiftScale = 1f;
-        setLyricsFocus(RecyclerView.NO_POSITION);
     }
 
     private void applyLyricsDepth(View child) {
@@ -3718,11 +3663,13 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
      *     <li><b>depth</b> comes from where the row physically is. The list's glide - including its
      *     pre-roll toward the next line - moves rows through it continuously, which is what makes
      *     the page feel layered. Untouched.</li>
-     *     <li><b>focus</b> comes from the clock: {@link #lyricsFocusOf}. It is what makes a row
-     *     the sharp, bright, current one, and it changes hands at the line's genuine timestamp.
-     *     A row the pre-roll is already carrying into place is still not focused.</li>
-     *     <li><b>word state</b> comes from the source's own offsets, and only for a document that
-     *     genuinely states them.</li>
+     *     <li><b>focus</b> comes from the follow's own progress: {@link #lyricsFocusOf}. It is
+     *     what makes a row the sharp, bright one, and it crosses over continuously across the
+     *     scroll rather than switching once the scroll has stopped.</li>
+     *     <li><b>word state</b> comes from the source's own offsets and the clock, and only for a
+     *     document that genuinely states them. It is resolved against {@code karaokeLine}, never
+     *     against focus, so a line fading in early still shows nothing lit until its own time -
+     *     and a line fading out keeps painting its real word state the whole way down.</li>
      * </ul>
      */
     private void applyLyricsDepth(View child, int inactiveColor, int activeColor, int sweepColor) {
@@ -4089,14 +4036,16 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         /**
          * The window below which the lift fades out, and the one at and above which it is full.
          *
-         * <p>A 30ms word cannot be given a 3dp rise and settle: the result is not motion, it is a
-         * twitch, and a line of them reads as the text dancing. So the amplitude is a smooth
-         * function of how much room the word actually has - imperceptible for a word that flashes
-         * past, full for one that is held - and the transition between the two is a smoothstep, so
-         * there is no length at which the page visibly changes behaviour.
+         * <p>A word that flashes past cannot be given a rise and settle: the result is not motion,
+         * it is a twitch, and a line of them reads as the text dancing. So the amplitude is a
+         * smooth function of how much room the word actually has - zero for anything quick, full
+         * only for a word that is genuinely held - and the transition between the two is a
+         * smoothstep, so there is no length at which the page visibly changes behaviour. The
+         * window is deliberately wide and the floor deliberately high: in a fast passage the right
+         * amount of vertical movement is none, and the fill still shows the timing exactly.
          */
-        public static final long LIFT_FADE_MIN_MS = 90;
-        public static final long LIFT_FADE_FULL_MS = 340;
+        public static final long LIFT_FADE_MIN_MS = 150;
+        public static final long LIFT_FADE_FULL_MS = 620;
         /** Fraction of the lift spent rising; the rest is the settle back to the normal position. */
         private static final float LIFT_RISE = 0.38f;
 
@@ -4188,9 +4137,17 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             final long elapsed = Math.max(0L, positionMs - start);
             final long sweepMs = sweepWindowMs(segments, index, nextLineTimeMs);
             sweep = sweepMs <= 0 ? 1f : clamp01(elapsed / (float) sweepMs);
-            final long liftMs = liftWindowMs(segments, index, nextLineTimeMs);
+            // The lift belongs to the DISPLAYED word, not to the timed segment. A source that
+            // splits one word across several stated times - be|au|ti|ful - would otherwise lift
+            // and settle once per syllable, which is the single busiest thing on the page. So the
+            // lift is measured from the first segment of the displayed word this segment belongs
+            // to, and spans the whole of it. The fill is untouched and still follows every genuine
+            // segment; only the decoration is grouped.
+            final long liftStart = segments.startTimeMs(lexicalStartIndex(line.text, segments, index));
+            final long liftElapsed = Math.max(0L, positionMs - liftStart);
+            final long liftMs = liftWindowMs(line.text, segments, index, nextLineTimeMs);
             lift = liftMs <= 0 ? 0f
-                    : liftCurve(elapsed / (float) liftMs) * liftAmplitudeScale(liftMs);
+                    : liftCurve(liftElapsed / (float) liftMs) * liftAmplitudeScale(liftMs);
             active = true;
             return true;
         }
@@ -4242,26 +4199,60 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         }
 
         /**
-         * How long the lift takes. It is the word's own interval, exactly like the fill, with one
-         * extra condition that the fill does not need: <b>it can never outlast the word's
-         * ownership</b>.
+         * True when segment {@code index} continues the same DISPLAYED word as the one before it -
+         * that is, when the source split a single written word across several stated times and
+         * there is no whitespace between them.
          *
-         * <p>That is the whole of the hand-over fix. The lift reaches zero at the end of this
-         * window, and this window ends at or before the moment the next word's stated start makes
-         * it current, so the outgoing word is already at rest when it stops being drawn lifted.
-         * There is no minimum: a word with no room simply gets no travel (see
-         * {@link #liftAmplitudeScale}) rather than being forced through a rise it cannot finish,
-         * which is what used to drop it back by up to its full amplitude in one frame.
-         *
-         * <p>It matters for TTML too, where a stated end may legally sit past the next span's
-         * stated start. The stated end still drives the fill; ownership still bounds the lift.
+         * <p>Decided from the text itself, on the offsets the source stated, so it is the real
+         * lexical boundary and not a guess from the timing. A gap of any length between two stated
+         * times inside one written word is still one word on the page, which is the only thing the
+         * decoration cares about.
          */
-        public static long liftWindowMs(SyncedLyricsController.Segments segments, int index, long nextLineTimeMs) {
-            long window = sweepWindowMs(segments, index, nextLineTimeMs);
-            final long ownership = ownershipWindowMs(segments, index, nextLineTimeMs);
-            if (ownership > 0) window = Math.min(window, ownership);
-            if (window <= 0) return 0;
-            return Math.min(window, LIFT_MAX_MS);
+        public static boolean isWordContinuation(CharSequence text, SyncedLyricsController.Segments segments, int index) {
+            if (index <= 0 || index >= segments.size()) return false;
+            final int from = Math.max(0, segments.startOffset(index - 1));
+            final int to = Math.min(text.length(), segments.startOffset(index));
+            if (to <= from) return false;
+            for (int i = from; i < to; i++) {
+                if (Character.isWhitespace(text.charAt(i))) return false;
+            }
+            return true;
+        }
+
+        /** First segment of the displayed word that segment {@code index} belongs to. */
+        public static int lexicalStartIndex(CharSequence text, SyncedLyricsController.Segments segments, int index) {
+            int first = Math.max(0, index);
+            while (first > 0 && isWordContinuation(text, segments, first)) first--;
+            return first;
+        }
+
+        /**
+         * How long the lift takes: the interval the DISPLAYED word occupies, from the stated start
+         * of its first segment to the stated start of the next displayed word - or, for the last
+         * word of a line, the next line's.
+         *
+         * <p>Two consequences, both wanted. A word split into syllables gets one slow lift across
+         * all of them rather than one per syllable. And because the curve is zero at the end of
+         * this window, the decoration is already at rest when the next displayed word begins.
+         *
+         * <p>It bounds nothing else. {@link SyncedLyricsController.Segments#indexAt} still decides
+         * which segment is current the instant its stated time arrives, and the fill still follows
+         * that segment: the lift can never hold a word back, shorten a fill or move a boundary. It
+         * is decoration, and decoration yields.
+         */
+        public static long liftWindowMs(CharSequence text, SyncedLyricsController.Segments segments, int index, long nextLineTimeMs) {
+            final int first = lexicalStartIndex(text, segments, index);
+            final long start = segments.startTimeMs(first);
+            int next = first + 1;
+            while (next < segments.size() && isWordContinuation(text, segments, next)) next++;
+            long bound = -1;
+            if (next < segments.size()) {
+                bound = segments.startTimeMs(next) - start;
+            } else if (nextLineTimeMs != Long.MAX_VALUE) {
+                bound = nextLineTimeMs - start;
+            }
+            if (bound <= 0) bound = SWEEP_DERIVED_FALLBACK_MS;
+            return Math.min(bound, LIFT_MAX_MS);
         }
 
         /**

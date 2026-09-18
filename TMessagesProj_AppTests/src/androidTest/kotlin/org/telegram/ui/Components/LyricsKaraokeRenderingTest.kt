@@ -102,17 +102,46 @@ class LyricsKaraokeRenderingTest {
 
     @Test
     fun aLongWordAlsoMovesForAsLongAsItIsSung() {
-        // The lift shares the word's interval, so the motion is slow on a held note instead of
-        // being the same quick canned gesture on every word.
-        for (duration in longArrayOf(1500, 1000, 800, 500)) {
+        // The lift shares the word's interval, so what movement there is is slow on a held note
+        // instead of being the same quick canned gesture on every word. `lift` is travel as a
+        // fraction of KARAOKE_LIFT_DP, already scaled by how much room the word had.
+        for (duration in longArrayOf(1500, 1000, 800)) {
             val line = pairWithGap(duration)
             val frame = KaraokeFrame()
             frame.resolve(line, 320, Long.MAX_VALUE)
             assertTrue("${duration}ms word is still moving at 320ms: ${frame.lift}", frame.lift > 0.05f)
             // Its peak lands around a third of the way in, not in the first fifth of a second.
             frame.resolve(line, (duration * 0.38f).toLong(), Long.MAX_VALUE)
-            assertTrue("${duration}ms word peaks late: ${frame.lift}", frame.lift > 0.9f)
+            assertEquals("${duration}ms word peaks late", 1f, frame.lift, 0.01f)
         }
+    }
+
+    // ============================================== the lift is decoration, and stays out of sight
+    // Device QA: "the words move up/down too much - in fast lyrics it feels like the text is
+    // dancing." The fill already says which word is being sung. The lift is an accent on top of
+    // that, and an accent the eye tracks is not an accent.
+
+    @Test
+    fun theWholeTravelIsATinyFractionOfALine() {
+        // Roughly a tenth of the 22dp type, and less than half of what device QA called too much.
+        assertTrue("the lift must stay around 1-1.5dp: ${AudioPlayerAlert.KARAOKE_LIFT_DP}",
+            AudioPlayerAlert.KARAOKE_LIFT_DP <= 1.5f)
+        assertTrue("but not be removed entirely", AudioPlayerAlert.KARAOKE_LIFT_DP > 0f)
+        assertTrue("and stay far under the type size",
+            AudioPlayerAlert.KARAOKE_LIFT_DP < AudioPlayerAlert.LYRICS_TEXT_SIZE_DP / 8f)
+    }
+
+    @Test
+    fun aFastPassageGetsEssentiallyNoVerticalMovement() {
+        // Everything at singing speed or faster: the amplitude has to be gone, not merely small.
+        for (window in longArrayOf(30, 50, 80, 100, 150)) {
+            assertEquals("a ${window}ms word must not move at all",
+                0f, KaraokeFrame.liftAmplitudeScale(window), 0.001f)
+        }
+        // And only a genuinely held word reaches the full travel.
+        assertTrue("a 300ms word stays subtle: ${KaraokeFrame.liftAmplitudeScale(300)}",
+            KaraokeFrame.liftAmplitudeScale(300) < 0.35f)
+        assertEquals("a held word gets the whole of it", 1f, KaraokeFrame.liftAmplitudeScale(900), 0.0001f)
     }
 
     @Test
@@ -202,7 +231,7 @@ class LyricsKaraokeRenderingTest {
             assertTrue("a word this short must barely move at all: $scale", scale < 0.02f)
         }
         // And the frame really does hand back that reduced amplitude, not a full one.
-        for (duration in longArrayOf(30, 50, 60)) {
+        for (duration in longArrayOf(30, 50, 60, 100, 150)) {
             val line = pairWithGap(duration)
             val frame = KaraokeFrame()
             var peak = 0f
@@ -228,11 +257,11 @@ class LyricsKaraokeRenderingTest {
             previous = scale
         }
         // A held word gets the whole of the intended travel.
-        assertEquals(1f, KaraokeFrame.liftAmplitudeScale(600), 0.0001f)
+        assertEquals(1f, KaraokeFrame.liftAmplitudeScale(620), 0.0001f)
         assertEquals(1f, KaraokeFrame.liftAmplitudeScale(1500), 0.0001f)
-        // A medium word gets a modest amount of it.
-        val medium = KaraokeFrame.liftAmplitudeScale(200)
-        assertTrue("a 200ms word moves, but modestly: $medium", medium > 0.15f && medium < 0.75f)
+        // A word of middling length gets a modest fraction of it, not most of it.
+        val medium = KaraokeFrame.liftAmplitudeScale(400)
+        assertTrue("a 400ms word moves, but modestly: $medium", medium > 0.2f && medium < 0.8f)
     }
 
     @Test
@@ -317,13 +346,13 @@ class LyricsKaraokeRenderingTest {
         // end still drives the fill; ownership still bounds the lift, so there is nothing to snap.
         val line = ttml(
             """<p begin="00:00.000" end="00:05.000">""" +
-                """<span begin="00:00.000" end="00:02.000">Held</span>""" +
+                """<span begin="00:00.000" end="00:02.000">Held</span> """ +
                 """<span begin="00:00.300" end="00:00.900">Next</span></p>"""
         )
         assertEquals("the fill follows the stated end", 2000L,
             KaraokeFrame.sweepWindowMs(line.segments, 0, Long.MAX_VALUE))
-        assertEquals("the lift may not outlast ownership", 300L,
-            KaraokeFrame.liftWindowMs(line.segments, 0, Long.MAX_VALUE))
+        assertEquals("the lift is bounded by the next displayed word", 300L,
+            KaraokeFrame.liftWindowMs(line.text, line.segments, 0, Long.MAX_VALUE))
         val frame = KaraokeFrame()
         frame.resolve(line, 299, Long.MAX_VALUE)
         assertTrue("outgoing word at rest before the overlap takes over: ${frame.lift}", frame.lift < 0.01f)
@@ -339,10 +368,122 @@ class LyricsKaraokeRenderingTest {
         for (gap in longArrayOf(30, 50, 80, 120, 200, 400, 900, 2000, 4000)) {
             val line = pairWithGap(gap)
             val ownership = KaraokeFrame.ownershipWindowMs(line.segments, 0, Long.MAX_VALUE)
-            val lift = KaraokeFrame.liftWindowMs(line.segments, 0, Long.MAX_VALUE)
+            val lift = KaraokeFrame.liftWindowMs(line.text, line.segments, 0, Long.MAX_VALUE)
             assertEquals("ownership is the stated gap", gap, ownership)
             assertTrue("lift window $lift must fit inside ownership $ownership", lift <= ownership)
         }
+    }
+
+    // ============================================= split / syllable-timed displayed words
+    // Device QA: a displayed word cut into several timed parts lifted and settled once per part,
+    // which was the busiest thing on the page. The fill must still follow every genuine part; only
+    // the decoration is grouped, by the real text boundary.
+
+    /** "beautiful" cut into four stated syllables with no whitespace between them. */
+    private fun syllables(): Line = lrc(
+        "[00:00.000]<00:00.000>beau<00:00.200>ti<00:00.400>ful <00:00.800>day"
+    )
+
+    @Test
+    fun consecutiveSegmentsInsideOneDisplayedWordAreOneWord() {
+        val line = syllables()
+        val segments = line.segments
+        assertEquals("the fixture must really be split", 4, segments.size())
+        // beau|ti|ful are one displayed word; "ful " ends with a space, so "day" starts a new one.
+        assertFalse(KaraokeFrame.isWordContinuation(line.text, segments, 0))
+        assertTrue(KaraokeFrame.isWordContinuation(line.text, segments, 1))
+        assertTrue(KaraokeFrame.isWordContinuation(line.text, segments, 2))
+        assertFalse(KaraokeFrame.isWordContinuation(line.text, segments, 3))
+        for (index in 0..2) {
+            assertEquals("segment $index belongs to the word that starts at 0",
+                0, KaraokeFrame.lexicalStartIndex(line.text, segments, index))
+        }
+        assertEquals(3, KaraokeFrame.lexicalStartIndex(line.text, segments, 3))
+    }
+
+    @Test
+    fun aSplitWordLiftsOnceAcrossTheWholeWordInsteadOfOncePerSyllable() {
+        val line = syllables()
+        // One window for all three syllables: 0 -> 800, not three windows of 200.
+        for (index in 0..2) {
+            assertEquals("segment $index shares the displayed word's window", 800L,
+                KaraokeFrame.liftWindowMs(line.text, line.segments, index, Long.MAX_VALUE))
+        }
+        // Sampled across the whole word, the travel rises once and settles once. A per-syllable
+        // lift would cross zero at 200 and 400 and peak three times.
+        val frame = KaraokeFrame()
+        var peaks = 0
+        var previous = 0f
+        var rising = true
+        var maxLift = 0f
+        for (position in 0..800L) {
+            frame.resolve(line, position, Long.MAX_VALUE)
+            if (frame.lift > maxLift) maxLift = frame.lift
+            if (rising && frame.lift < previous - 0.0005f) {
+                peaks++
+                rising = false
+            } else if (!rising && frame.lift > previous + 0.0005f) {
+                rising = true
+            }
+            previous = frame.lift
+        }
+        assertEquals("exactly one rise and one settle across the displayed word", 1, peaks)
+        assertEquals("and it does reach the full travel once", 1f, maxLift, 0.01f)
+        // Zero at both ends of the displayed word.
+        frame.resolve(line, 0, Long.MAX_VALUE)
+        assertEquals(0f, frame.lift, 0.0001f)
+        frame.resolve(line, 800, Long.MAX_VALUE)
+        assertEquals("the next displayed word starts from rest", 0f, frame.lift, 0.0001f)
+    }
+
+    @Test
+    fun theFillStillFollowsEverySyllableOfASplitWord() {
+        // Grouping the decoration must not group the timing. Each stated syllable is still its own
+        // current segment at its own stated time, with its own fill.
+        val line = syllables()
+        val frame = KaraokeFrame()
+        for (index in 0..3) {
+            val at = line.segments.startTimeMs(index)
+            frame.resolve(line, at, Long.MAX_VALUE)
+            assertEquals("syllable $index becomes current at its stated time",
+                start(line, index), frame.wordStart)
+            assertEquals("and its fill starts there", 0f, frame.sweep, 0.0001f)
+            // Each syllable has its own window - 200, 200, 400, then the tail - and its own fill.
+            val window = KaraokeFrame.sweepWindowMs(line.segments, index, Long.MAX_VALUE)
+            frame.resolve(line, at + window / 2, Long.MAX_VALUE)
+            assertEquals("syllable $index is half filled half way across its own interval",
+                0.5f, frame.sweep, 0.02f)
+        }
+    }
+
+    @Test
+    fun theLiftNeverDelaysTheNextWord() {
+        // The absolute rule. Ownership is Segments.indexAt and nothing else, so whatever the
+        // decoration is doing, the next stated time takes the frame on the exact millisecond.
+        for (gap in longArrayOf(1500, 800, 400, 200, 100, 50, 30)) {
+            val line = pairWithGap(gap)
+            val frame = KaraokeFrame()
+            frame.resolve(line, gap - 1, Long.MAX_VALUE)
+            val liftBefore = frame.lift
+            assertEquals("${gap}ms: still the first word", start(line, 0), frame.wordStart)
+            frame.resolve(line, gap, Long.MAX_VALUE)
+            assertEquals("${gap}ms: the next word is current on its stated millisecond, " +
+                "whatever the outgoing lift was ($liftBefore)", start(line, 1), frame.wordStart)
+            assertEquals("${gap}ms: and its fill starts immediately", 0f, frame.sweep, 0.0001f)
+        }
+    }
+
+    @Test
+    fun aSplitWordThatIsStillLiftingDoesNotHoldBackTheNextDisplayedWord() {
+        val line = syllables()
+        val frame = KaraokeFrame()
+        // Mid-word, the decoration is in flight.
+        frame.resolve(line, 500, Long.MAX_VALUE)
+        assertTrue("the word is mid-lift here: ${frame.lift}", frame.lift > 0f)
+        // "day" still becomes current on its own stated millisecond.
+        frame.resolve(line, 800, Long.MAX_VALUE)
+        assertEquals(start(line, 3), frame.wordStart)
+        assertEquals(0f, frame.sweep, 0.0001f)
     }
 
     // ==================================================================== the last word of a line
@@ -424,11 +565,81 @@ class LyricsKaraokeRenderingTest {
         assertEquals(0f, frame.sweep, 0.0001f)
     }
 
+    // ======================================= the line fade rides the scroll, it does not follow it
+    // Device QA: "the list scrolls, the scroll finishes, THEN the colour changes." The fade now
+    // reads the follow animator's own fraction - the same number that is moving the list this
+    // frame - so the two are one gesture. These assert the crossfade directly.
+
     @Test
-    fun theFocusHandOverAlwaysFitsInsideItsOwnLine() {
-        // The hierarchy crossfade is bounded by the line, so a rapid passage can never start a
-        // second hand-over on top of an unfinished one.
-        assertTrue(AudioPlayerAlert.LYRICS_FOCUS_MS >= 120L && AudioPlayerAlert.LYRICS_FOCUS_MS <= 400L)
+    fun theOutgoingLineIsFullyCurrentAtTheStartOfTheScroll() {
+        assertEquals(1f, AudioPlayerAlert.lyricsFocusValue(3, 3, 4, 0f), 0.0001f)
+        assertEquals(0f, AudioPlayerAlert.lyricsFocusValue(4, 3, 4, 0f), 0.0001f)
+    }
+
+    @Test
+    fun theIncomingLineIsFullyCurrentAtTheEndOfTheScroll() {
+        assertEquals(0f, AudioPlayerAlert.lyricsFocusValue(3, 3, 4, 1f), 0.0001f)
+        assertEquals(1f, AudioPlayerAlert.lyricsFocusValue(4, 3, 4, 1f), 0.0001f)
+    }
+
+    @Test
+    fun bothLinesAreMidTransitionHalfWayThroughTheScroll() {
+        val outgoing = AudioPlayerAlert.lyricsFocusValue(3, 3, 4, 0.5f)
+        val incoming = AudioPlayerAlert.lyricsFocusValue(4, 3, 4, 0.5f)
+        assertTrue("the outgoing line has started fading: $outgoing", outgoing < 1f && outgoing > 0f)
+        assertTrue("the incoming line has started arriving: $incoming", incoming < 1f && incoming > 0f)
+    }
+
+    @Test
+    fun theFadeIsContinuousAndComplementaryAcrossTheWholeScroll() {
+        var previousIn = -1f
+        for (step in 0..200) {
+            val progress = step / 200f
+            val outgoing = AudioPlayerAlert.lyricsFocusValue(3, 3, 4, progress)
+            val incoming = AudioPlayerAlert.lyricsFocusValue(4, 3, 4, progress)
+            // No dip or overshoot in total brightness at any point of the travel.
+            assertEquals("complementary at $progress", 1f, outgoing + incoming, 0.0001f)
+            assertTrue("the incoming line only ever brightens at $progress", incoming >= previousIn - 0.0001f)
+            // The colour is genuinely moving throughout - never parked until the scroll ends.
+            if (progress > 0.02f) {
+                assertTrue("something has changed by $progress", incoming > 0.005f)
+            }
+            previousIn = incoming
+        }
+    }
+
+    @Test
+    fun noThirdLineIsTouchedByAHandOver() {
+        assertEquals(0f, AudioPlayerAlert.lyricsFocusValue(9, 3, 4, 0.5f), 0.0001f)
+        assertEquals(0f, AudioPlayerAlert.lyricsFocusValue(-1, 3, 4, 0.5f), 0.0001f)
+    }
+
+    @Test
+    fun aLineWithNoWordTagsFadesByExactlyTheSameRule() {
+        // A karaoke document may contain a section with no inline timing. It resolves to the
+        // fallback branch, whose only emphasis input is this same crossfade - so it fades with the
+        // scroll like an ordinary synced line rather than switching once the scroll has stopped.
+        val untimed = parse("[00:01.00]an instrumental section").lines[0]
+        assertFalse("no word state is invented for it",
+            KaraokeFrame().resolveRow(untimed, 0, 0, 2000, Long.MAX_VALUE))
+        assertEquals(1f, AudioPlayerAlert.lyricsFocusValue(0, 0, 1, 0f), 0.0001f)
+        assertEquals(0f, AudioPlayerAlert.lyricsFocusValue(0, 0, 1, 1f), 0.0001f)
+    }
+
+    @Test
+    fun aTrueKaraokeLineKeepsItsWordStateWhileTheLineFadesOut() {
+        // The two layers are independent. Whatever the line-level fade is doing, the word state of
+        // the outgoing line is still resolved from the clock and is still correct all the way down.
+        val line = startsOnly()
+        val frame = KaraokeFrame()
+        for (progress in floatArrayOf(0f, 0.25f, 0.5f, 0.75f, 1f)) {
+            val fade = AudioPlayerAlert.lyricsFocusValue(0, 0, 1, progress)
+            assertTrue("the fade is a real value at $progress", fade in 0f..1f)
+            // The frame takes no fade input at all - it cannot be influenced by one.
+            frame.resolve(line, 1500, 1600)
+            assertEquals("the word is the one the clock says", start(line, 2), frame.wordStart)
+            assertEquals("and its fill is where the clock says", 0.5f, frame.sweep, 0.02f)
+        }
     }
 
     // ============================================================================== pause
@@ -527,7 +738,7 @@ class LyricsKaraokeRenderingTest {
         assertTrue("generous line spacing", AudioPlayerAlert.LYRICS_LINE_SPACING_DP >= 2)
         assertTrue("generous rows", AudioPlayerAlert.LYRICS_ROW_MIN_HEIGHT_DP >= 60)
         assertTrue("generous padding", AudioPlayerAlert.LYRICS_ROW_PADDING_V_DP >= 12)
-        assertTrue("the lift stays tiny", AudioPlayerAlert.KARAOKE_LIFT_DP <= 4f)
+        assertTrue("the lift stays tiny", AudioPlayerAlert.KARAOKE_LIFT_DP <= 1.5f)
     }
 
     @Test
