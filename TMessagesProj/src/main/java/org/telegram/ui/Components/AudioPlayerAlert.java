@@ -3187,6 +3187,18 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
     // ---------------------------------------------------------------------------------------
 
     private static final long LYRIC_FOLLOW_LEAD_MAX = 440;
+
+    /**
+     * How long BEFORE a line's stated time the list starts carrying the previous line away.
+     *
+     * <p>This is the whole of the pre-roll, and it is the reason the outgoing line's last word has
+     * far less visible time than its stated interval suggests: from this many milliseconds before
+     * the next timestamp the row is already scrolling off and fading down. Anything decorative
+     * that must be SEEN on the outgoing line has to finish by then, not by the timestamp.
+     */
+    static long lyricFollowLeadMs(long gapMs) {
+        return Math.min(LYRIC_FOLLOW_LEAD_MAX, Math.max(80, gapMs / 2));
+    }
     private static final long LYRIC_FOLLOW_MIN_MS = 160;
     private static final long LYRIC_FOLLOW_MAX_MS = 900;
 
@@ -3387,7 +3399,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             final long previousTime = line < 0 ? 0 : currentLyrics.lines.get(line).timeMs;
             final long untilNext = nextTime - position;
             final long gap = Math.max(1, nextTime - previousTime);
-            final long lead = Math.min(LYRIC_FOLLOW_LEAD_MAX, Math.max(80, gap / 2));
+            final long lead = lyricFollowLeadMs(gap);
             final int nextRow = rowForLyricsLine(line + 1);
             if (untilNext <= lead) {
                 // Inside the lead window: move toward the next line now. A blank timestamp has no
@@ -3565,14 +3577,22 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
      */
     static final float KARAOKE_LIFT_DP = 0.9f;
     /**
-     * How many discrete heights the lift is quantised to for drawing.
+     * How many graphemes share one drawn height.
      *
-     * <p>The wave is a continuous function of the playback position, but the picture is painted by
-     * clipping the row's own laid-out text once per distinct height, so the number of heights is
-     * the number of extra draw passes. At this amplitude one step is well under half a pixel on
-     * any real density, so quantising costs nothing visible and bounds the drawing.
+     * <p>The lift is a continuous function of the playback position and is never quantised. The
+     * DRAWING still has to group graphemes, because each group costs one clipped pass over the
+     * row's laid-out text - but the grouping is by position in the text, fixed for as long as the
+     * line is on screen, so a grapheme never changes group and therefore never steps. Quantising
+     * the HEIGHT instead, which is what the previous build did, gave every grapheme a small
+     * vertical jump at each level crossing, and device QA saw exactly that as shaking.
+     *
+     * <p>Four is derived, not chosen: the steepest the rise ever gets is 1.875 (smootherstep's
+     * peak slope), so two graphemes {@code n} apart differ by at most
+     * {@code 1.875 * n * STAGGER_MS / RISE_MS} of the travel - about 0.015 each at the wave's own
+     * constants. Four of them is under a sixth of a pixel of spread inside one group on a normal
+     * screen, which is below anything that can be drawn.
      */
-    static final int KARAOKE_LIFT_LEVELS = 5;
+    static final int KARAOKE_WAVE_RUN_GRAPHEMES = 4;
 
     /** Resolved once per document: true only when some line genuinely states inline word timing. */
     private boolean lyricsWordTimed;
@@ -4167,20 +4187,27 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
          * How long one grapheme takes to travel from the baseline to its raised position.
          *
          * <p>Fixed, and deliberately unrelated to how long the word was sung. Tying the motion to
-         * the word's own window - which is what the previous model did - meant a quick word jumped
+         * the word's own window - which is what an earlier model did - meant a quick word jumped
          * and a held word crawled, so a fast passage read as the page dancing. The fill already
          * says how fast the singing is, exactly and from the source's own times. The decoration
          * says only that the word has begun, and it says it at the same unhurried speed every time.
+         *
+         * <p>A full second. Half of that still read as quick on device: the word arrived at its
+         * raised position while the singer was plainly still on it. At this length the travel is
+         * under three pixels spread over a second, which is slow enough to be felt rather than
+         * watched.
          */
-        public static final long RISE_MS = 520;
+        public static final long RISE_MS = 1000;
         /**
          * How far behind its neighbour each grapheme sets off.
          *
-         * <p>Tiny on purpose. It is a fraction of {@link #RISE_MS}, so a word's letters are all
-         * moving at once and merely out of step with one another: a soft wave travelling along the
-         * word rather than a typewriter working through it.
+         * <p>Tiny on purpose - under a hundredth of {@link #RISE_MS}, so every letter of a word is
+         * in motion together and merely a shade out of step: a soft wave passing along the word
+         * rather than a typewriter working through it. At 26ms, which is what device QA saw, the
+         * letters visibly followed one another; the fourth letter of a word did not set off until
+         * the first was a fifth of the way up.
          */
-        public static final long STAGGER_MS = 26;
+        public static final long STAGGER_MS = 8;
         /**
          * Floor on the compression, for the degenerate case only.
          *
@@ -4253,9 +4280,30 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             }
             endOffset[count - 1] = Math.max(endOffset[count - 1], text.length());
             if (nextLineTimeMs != Long.MAX_VALUE) {
-                // At least one, so a word stated at the very instant the line changes is read as
-                // having almost no room rather than as having none stated.
-                availableMs[count - 1] = Math.max(1L, nextLineTimeMs - startMs[count - 1]);
+                // The DECORATIVE deadline, which is not the next line's timestamp.
+                //
+                // The list starts carrying this line away, and fading it down, a pre-roll BEFORE
+                // that timestamp - see AudioPlayerAlert#lyricFollowLeadMs. Measuring the last
+                // word's room to the timestamp therefore credited it with up to 440ms during which
+                // the row was already leaving, so a word that "fitted" on paper was still climbing
+                // when it went. That is what device QA saw as the last word never lifting.
+                //
+                // Nothing semantic is touched here: the stated next-line time, the word's own
+                // start and its fill are all exactly as the source gave them. Only the window the
+                // decoration is asked to finish inside gets shorter. At least one millisecond, so
+                // a word stated at or after the hand-over is read as having almost no room rather
+                // than as having none stated.
+                //
+                // Half the pre-roll, not all of it: the row is not gone the instant it starts
+                // moving, it is gone by the time it has finished. Half way through the departure
+                // it has plainly lost the page but is still large, still on screen and - while its
+                // own final word is sweeping - still held at the readability floor. Demanding the
+                // whole pre-roll made moderately late words snap up in a few dozen milliseconds,
+                // which is the popping this wave exists to avoid; demanding none of it is what
+                // Build #38 did, and the word never arrived at all.
+                final long gap = Math.max(1L, nextLineTimeMs - line.timeMs);
+                final long deadline = nextLineTimeMs - lyricFollowLeadMs(gap) / 2;
+                availableMs[count - 1] = Math.max(1L, deadline - startMs[count - 1]);
             }
         }
 
@@ -4311,8 +4359,24 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             final float elapsed = positionMs - wordStartMs - Math.max(0, graphemeIndex) * STAGGER_MS * scale;
             if (elapsed <= 0f) return 0f;
             if (elapsed >= rise) return 1f;
-            final float t = elapsed / rise;
-            return t * t * (3f - 2f * t);
+            return ease(elapsed / rise);
+        }
+
+        /**
+         * Smootherstep: zero velocity AND zero acceleration at both ends.
+         *
+         * <p>Smoothstep, which this replaces, leaves the baseline with a rising acceleration and
+         * arrives with a falling one; over half a second that read as setting off and getting
+         * there rather than as drifting. This spends longer near both ends and does its travelling
+         * in the middle, which is the calm, continuous motion the reference has.
+         *
+         * <p>Monotonic on [0,1] and bounded by it, so there is no overshoot, no spring and nothing
+         * to come back down from.
+         */
+        public static float ease(float t) {
+            if (t <= 0f) return 0f;
+            if (t >= 1f) return 1f;
+            return t * t * t * (t * (6f * t - 15f) + 10f);
         }
     }
 
@@ -4810,7 +4874,24 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         private CharSequence clusterText;
         private int clusterCount;
         private int[] clusterStart = new int[32];
-        private byte[] clusterLevel = new byte[32];
+        /** Continuous 0..1 height of each grapheme this frame. Never quantised. */
+        private float[] clusterLift = new float[32];
+        /**
+         * Which drawn group each grapheme belongs to. Decided from the text alone - displayed word
+         * and position inside it - so it is the same for every frame the line is on screen, which
+         * is what stops a grapheme ever stepping between two heights.
+         */
+        private int[] clusterRun = new int[32];
+        /** Visual line each grapheme sits on, and the graphemes in left-to-right order. */
+        private int[] clusterLine = new int[32];
+        private int[] clusterOrder = new int[32];
+        private int clusterOrderCount;
+        /**
+         * How far past the ends of a visual line the outermost strips reach, in pixels. Far enough
+         * that a glyph overhanging the start or end of the line is still drawn; the clip is
+         * intersected with the view's own bounds anyway, so it can never paint outside the row.
+         */
+        private static final float LINE_EDGE_OVERRUN_PX = 100000f;
         private Layout clusterLayout;
         private CharSequence clusterGeometryText;
         private int clusterGeometryCount;
@@ -4831,8 +4912,6 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         /** Quantised blur radius currently on the view, or -1 when nothing has been applied yet. */
         private int appliedBlur = -1;
 
-        /** Rebuilt per draw pass. One Path, rewound, so drawing allocates nothing. */
-        private final Path levelClip = new Path();
 
         LyricsTextView(Context context) {
             super(context);
@@ -4908,7 +4987,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 changed = true;
             }
             if (adoptWave(wave)) changed = true;
-            if (updateLiftLevels(positionMs)) changed = true;
+            if (updateGraphemeLift(positionMs)) changed = true;
             if (resolveColourBoundaries()) changed = true;
             // SpannableString does not report span changes to a SpanWatcher, and a colour changed
             // in place is not a change the text could report anyway, so every repaint here is this
@@ -4940,6 +5019,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                             graphemesBetween(wave.startOffset[w], wave.endOffset[w]));
                 }
             }
+            rebuildRunGrouping();
             return true;
         }
 
@@ -4957,15 +5037,17 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
 
         /**
          * Re-derives where every grapheme of this row is standing, from the playback position and
-         * nothing else.
+         * nothing else. The value is a continuous float and is never rounded to a set of heights.
          *
          * <p>Each grapheme's clock starts at its own displayed word's genuine start plus its own
          * small offset along the word, so a word begins the instant the source says so however far
-         * the previous word has got, and a letter begins however far its neighbour has got. The
-         * value is quantised to a small number of heights, which bounds the drawing and is what
-         * lets an unchanged frame skip the repaint entirely.
+         * the previous word has got, and a letter begins however far its neighbour has got.
+         *
+         * <p>Reports whether anything moved by enough to be worth a repaint - a twentieth of a
+         * pixel - so a settled line still costs nothing per tick while a moving one is redrawn on
+         * every tick it actually moves on.
          */
-        private boolean updateLiftLevels(long positionMs) {
+        private boolean updateGraphemeLift(long positionMs) {
             ensureClusters();
             if (clusterCount == 0) return false;
             boolean changed = false;
@@ -4989,13 +5071,48 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                         if (!isBlankCluster(i)) grapheme++;
                     }
                 }
-                final byte level = (byte) Math.round(value * KARAOKE_LIFT_LEVELS);
-                if (clusterLevel[i] != level) {
-                    clusterLevel[i] = level;
+                if (Math.abs(clusterLift[i] - value) * liftAmplitude > 0.05f) {
                     changed = true;
                 }
+                clusterLift[i] = value;
             }
             return changed;
+        }
+
+        /**
+         * Groups the row's graphemes into the units the drawing actually translates.
+         *
+         * <p>Decided from the text and the wave's word boundaries only, so a grapheme belongs to
+         * the same group for as long as the line is on screen. That is the whole point: a group's
+         * height is a continuous function of the playback position, and because nothing ever
+         * changes group, no grapheme can jump from one height to another. Groups break at
+         * displayed-word boundaries - where there is whitespace, so no glyph straddles the cut -
+         * and every {@link AudioPlayerAlert#KARAOKE_WAVE_RUN_GRAPHEMES} graphemes inside a word,
+         * which keeps the spread inside one group below a fifth of a pixel.
+         */
+        private void rebuildRunGrouping() {
+            if (clusterCount == 0) return;
+            if (waveCount == 0) {
+                // No wave: the whole row moves as one, so it is one group and one pass.
+                java.util.Arrays.fill(clusterRun, 0, clusterCount, 0);
+                return;
+            }
+            int run = 0;
+            int word = 0;
+            int currentWord = Integer.MIN_VALUE;
+            int inRun = 0;
+            for (int i = 0; i < clusterCount; i++) {
+                final int offset = clusterStart[i];
+                while (word < waveCount && offset >= waveEndOffset[word]) word++;
+                final int owner = word >= waveCount || offset < waveStartOffset[word] ? -1 : word;
+                if (owner != currentWord || inRun >= KARAOKE_WAVE_RUN_GRAPHEMES) {
+                    currentWord = owner;
+                    run++;
+                    inRun = 0;
+                }
+                clusterRun[i] = run;
+                inRun++;
+            }
         }
 
         /**
@@ -5109,27 +5226,39 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
 
         /**
          * Draws the row. Without a word being sung this is exactly {@link TextView}'s own drawing.
-         * With one it is the same drawing several times over, each pass showing a different,
-         * <em>non-overlapping</em> part of the same laid-out text at a different height:
          *
-         * <ol>
-         *     <li>one pass per height the row's graphemes are currently standing at, clipped to
-         *     the graphemes at that height and translated to it, with the grapheme the fill front
-         *     is inside suppressed;</li>
-         *     <li>the part of that one grapheme the fill has reached, in the sung colour;</li>
-         *     <li>the part it has not, in the muted colour.</li>
-         * </ol>
+         * <p>With one, the row is cut into vertical strips and each strip is one pass: the same
+         * laid-out text, clipped to that strip, translated to that strip's height, coloured for
+         * that strip's side of the fill. The strips tile the row exactly - they are cut at the
+         * boundaries between graphemes and at the fill front, every cut is shared by the two
+         * strips either side of it, and the outermost cuts run off the ends of the visual line -
+         * so every pixel of every glyph is rasterised exactly once, by exactly one pass.
          *
-         * <p>No pixel is rasterised twice. That is the difference that matters: drawing text muted
-         * and then drawing it again in the sung colour on top composites two antialiased glyph
-         * edges over each other, which fringes the sung text and thickens its outline. Nothing
-         * overlaps here, so the fill has a clean edge and the glyphs keep their real weight.
+         * <p>Three properties of that are what the previous build got wrong, and device QA saw all
+         * three:
+         *
+         * <ul>
+         *     <li><b>The cuts are rectangles, not paths.</b> {@code clipPath} is ANTIALIASED. Two
+         *     passes tiling complementary sides of the same boundary each covered the boundary
+         *     column partially and each composited the glyph against the background separately, so
+         *     that column came out lighter than a single draw - a one-pixel seam at every cut,
+         *     moving with the wave and with the fill. That reads exactly as letters changing
+         *     weight and shape. A rectangular clip has no partial coverage, so two strips meeting
+         *     at a cut reconstruct the glyph exactly.</li>
+         *     <li><b>Every cut is snapped to a whole pixel</b> and both sides are given the same
+         *     snapped value, so the two strips can neither overlap nor leave a gap however the
+         *     device rounds.</li>
+         *     <li><b>The fill front is not a special case.</b> It used to be lifted out of the
+         *     other passes and drawn on its own with a different kind of clip, which is why the
+         *     instability tracked the sweep. It is now simply one more cut inside whichever strip
+         *     it falls in; the two halves share that strip's height and differ only in colour.</li>
+         * </ul>
          *
          * <p>Each pass is the platform drawing the row's real {@link Layout}, so the glyphs are the
-         * same shaped, kerned, wrapped and reordered glyphs throughout - there is no second
-         * measurement of anything, no per-letter view and no per-letter span, and nothing here can
-         * move a boundary or a metric. The number of passes is bounded by
-         * {@link AudioPlayerAlert#KARAOKE_LIFT_LEVELS}, and a line standing entirely still is two of them.
+         * same shaped, kerned, wrapped and bidirectionally reordered glyphs throughout. There is no
+         * second measurement of anything, no per-letter view, no per-letter span and no per-letter
+         * shaping, and nothing here can move a boundary or a metric: for one playback position the
+         * geometry is identical whatever the colours are doing.
          */
         @Override
         protected void onDraw(Canvas canvas) {
@@ -5138,7 +5267,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 return;
             }
             ensureClusterGeometry();
-            if (clusterCount == 0 || clusterGeometryCount != clusterCount) {
+            if (clusterOrderCount == 0 || clusterGeometryCount != clusterCount) {
                 // Nothing to clip against: the row has not been laid out yet. Everything the
                 // source has finished is sung, the rest is muted, and nothing is lifted or filled.
                 applyPassColors(sungColor, mutedColor, mutedColor);
@@ -5148,64 +5277,90 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             // The row never scrolls, so the layout sits at exactly the total padding.
             final float originX = getTotalPaddingLeft();
             final float originY = getTotalPaddingTop();
-            final float step = liftAmplitude / KARAOKE_LIFT_LEVELS;
-            for (int level = 0; level <= KARAOKE_LIFT_LEVELS; level++) {
-                if (!buildLevelClip(level, originX, originY)) continue;
-                canvas.save();
-                if (level > 0) canvas.translate(0f, -level * step);
-                canvas.clipPath(levelClip);
-                applyPassColors(sungColor, Color.TRANSPARENT, mutedColor);
-                super.onDraw(canvas);
-                canvas.restore();
-            }
-            if (frontCluster >= 0) {
-                drawFrontRegion(canvas, originX, originY, step, true);
-                drawFrontRegion(canvas, originX, originY, step, false);
+            final float frontCut = frontCutX();
+            int at = 0;
+            while (at < clusterOrderCount) {
+                final int first = clusterOrder[at];
+                final int line = clusterLine[first];
+                final int run = clusterRun[first];
+                int last = first;
+                int end = at;
+                int latest = first;
+                boolean carriesFront = first == frontCluster;
+                while (end + 1 < clusterOrderCount) {
+                    final int next = clusterOrder[end + 1];
+                    if (clusterLine[next] != line || clusterRun[next] != run) break;
+                    if (next == frontCluster) carriesFront = true;
+                    if (next > latest) latest = next;
+                    last = next;
+                    end++;
+                }
+                // The strip runs from the cut it shares with the strip before it to the cut it
+                // shares with the one after, and off the end of the line where there is neither -
+                // so a glyph that overhangs its own advance box is still drawn, once, by whichever
+                // strip owns the column it lands in.
+                final float left = at > 0 && clusterLine[clusterOrder[at - 1]] == line
+                        ? snap(0.5f * (clusterRight[clusterOrder[at - 1]] + clusterLeft[first]))
+                        : -LINE_EDGE_OVERRUN_PX;
+                final float right = end + 1 < clusterOrderCount && clusterLine[clusterOrder[end + 1]] == line
+                        ? snap(0.5f * (clusterRight[last] + clusterLeft[clusterOrder[end + 1]]))
+                        : LINE_EDGE_OVERRUN_PX;
+                // -1 is the "no frame pushed yet" marker; it rests at the baseline like 0 does.
+                final float height = clusterLift[first];
+                final float lift = height > 0f ? -height * liftAmplitude : 0f;
+                final float top = clusterTop[first];
+                final float bottom = clusterBottom[first];
+                if (carriesFront && frontCut > left && frontCut < right) {
+                    final boolean rtl = clusterRtl[frontCluster];
+                    drawStrip(canvas, originX, originY, left, frontCut, top, bottom, lift, !rtl);
+                    drawStrip(canvas, originX, originY, frontCut, right, top, bottom, lift, rtl);
+                } else {
+                    // A strip wholly before the fill front is on the sung side, which only matters
+                    // for the sliver of the front glyph that overhangs into it.
+                    drawStrip(canvas, originX, originY, left, right, top, bottom, lift,
+                            frontCluster >= 0 && latest < frontCluster);
+                }
+                at = end + 1;
             }
         }
 
         /**
-         * Collects the graphemes standing at one height into the clip for that height's pass. The
-         * grapheme the fill front is inside is left out: it is drawn afterwards, in two pieces.
+         * Where, in layout coordinates, the fill has reached inside the grapheme it is crossing, or
+         * {@link Float#NaN} when no grapheme is being crossed. Snapped to a whole pixel, so the two
+         * strips either side of it are given the same number and the edge cannot shimmer.
          */
-        private boolean buildLevelClip(int level, float originX, float originY) {
-            levelClip.rewind();
-            boolean any = false;
-            for (int i = 0; i < clusterCount; i++) {
-                if (i == frontCluster || clusterLevel[i] != level || !clusterHasRect[i]) continue;
-                final float width = clusterRight[i] - clusterLeft[i];
-                if (width <= 0.01f) continue;
-                levelClip.addRect(originX + clusterLeft[i], originY + clusterTop[i],
-                        originX + clusterRight[i], originY + clusterBottom[i], Path.Direction.CW);
-                any = true;
-            }
-            return any;
-        }
-
-        /**
-         * Draws one side of the fill boundary: the part of the front grapheme the fill has reached,
-         * or the part it has not. Grown from whichever side that grapheme is actually read from, so
-         * a right-to-left word fills from its right edge.
-         */
-        private void drawFrontRegion(Canvas canvas, float originX, float originY, float step, boolean swept) {
+        private float frontCutX() {
             final int i = frontCluster;
-            if (i < 0 || i >= clusterCount || !clusterHasRect[i]) return;
+            if (i < 0 || i >= clusterCount || !clusterHasRect[i]) return Float.NaN;
             final float width = clusterRight[i] - clusterLeft[i];
-            if (width <= 0.01f) return;
+            if (width <= 0.01f) return Float.NaN;
             float shown = frontRevealed;
             if (shown < 0f) shown = 0f;
             if (shown > width) shown = width;
-            final float part = swept ? shown : width - shown;
-            if (part <= 0.01f) return;
-            final float left = swept
-                    ? KaraokeGeometry.revealedLeft(clusterLeft[i], clusterRight[i], shown, clusterRtl[i])
-                    : clusterRtl[i] ? clusterLeft[i] : clusterLeft[i] + shown;
+            return snap(clusterRtl[i] ? clusterRight[i] - shown : clusterLeft[i] + shown);
+        }
+
+        /** Whole pixels, so two strips meeting at a cut are given exactly the same edge. */
+        private static float snap(float x) {
+            return Math.round(x);
+        }
+
+        /**
+         * One strip: the row's own text, clipped to a rectangle, translated to the strip's height,
+         * and coloured for the strip's side of the fill.
+         *
+         * <p>{@code swept} only decides the colour of the one grapheme the fill front is inside -
+         * everything before it is already the sung colour and everything after it the muted one,
+         * from the spans - so it changes which pixels get which colour and nothing else.
+         */
+        private void drawStrip(Canvas canvas, float originX, float originY,
+                               float left, float right, float top, float bottom,
+                               float lift, boolean swept) {
+            if (right - left < 0.5f) return;
             canvas.save();
-            final float offset = clusterLevel[i] * step;
-            if (offset > 0f) canvas.translate(0f, -offset);
-            canvas.clipRect(originX + left, originY + clusterTop[i],
-                    originX + left + part, originY + clusterBottom[i]);
-            applyPassColors(Color.TRANSPARENT, swept ? sungColor : mutedColor, Color.TRANSPARENT);
+            canvas.translate(0f, lift);
+            canvas.clipRect(originX + left, originY + top, originX + right, originY + bottom);
+            applyPassColors(sungColor, swept ? sungColor : mutedColor, mutedColor);
             super.onDraw(canvas);
             canvas.restore();
         }
@@ -5235,7 +5390,9 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 clusterStart[++count] = offset;
             }
             clusterCount = count;
-            java.util.Arrays.fill(clusterLevel, 0, clusterCount, (byte) -1);
+            java.util.Arrays.fill(clusterLift, 0, clusterCount, -1f);
+            java.util.Arrays.fill(clusterRun, 0, clusterCount, 0);
+            rebuildRunGrouping();
         }
 
         /**
@@ -5261,6 +5418,37 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             }
             pendingCluster = -1;
             clusterGeometryCount = clusterCount;
+            buildClusterOrder(layout);
+        }
+
+        /**
+         * Orders the graphemes that have something to draw by visual line and then left to right.
+         *
+         * <p>Logical order is not visual order in bidirectional text - an Arabic word inside a
+         * Latin line, or a number inside an Arabic one, is laid out against the run around it - and
+         * the strips have to tile the row from left to right whatever the reading order is. The
+         * positions all come from the row's own {@link Layout}, so this reorders what Android
+         * already decided rather than deciding anything itself. Built once per layout.
+         */
+        private void buildClusterOrder(Layout layout) {
+            clusterOrderCount = 0;
+            for (int i = 0; i < clusterCount; i++) {
+                if (!clusterHasRect[i]) continue;
+                clusterLine[i] = layout.getLineForOffset(clusterStart[i]);
+                // Insertion sort: a lyric line is a few dozen graphemes, this runs once per
+                // layout, and for the ordinary single-direction line it is already in order.
+                int at = clusterOrderCount;
+                while (at > 0) {
+                    final int previous = clusterOrder[at - 1];
+                    if (clusterLine[previous] < clusterLine[i]) break;
+                    if (clusterLine[previous] == clusterLine[i]
+                            && clusterLeft[previous] <= clusterLeft[i]) break;
+                    clusterOrder[at] = previous;
+                    at--;
+                }
+                clusterOrder[at] = i;
+                clusterOrderCount++;
+            }
         }
 
         /** True when a grapheme has no glyph to raise or fill - a space, a tab, a line separator. */
@@ -5309,7 +5497,10 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             if (size <= clusterStart.length) return;
             final int grown = Math.max(size, clusterStart.length * 2);
             clusterStart = java.util.Arrays.copyOf(clusterStart, grown);
-            clusterLevel = java.util.Arrays.copyOf(clusterLevel, grown);
+            clusterLift = java.util.Arrays.copyOf(clusterLift, grown);
+            clusterRun = java.util.Arrays.copyOf(clusterRun, grown);
+            clusterLine = java.util.Arrays.copyOf(clusterLine, grown);
+            clusterOrder = java.util.Arrays.copyOf(clusterOrder, grown);
         }
 
         private void ensureClusterGeometryCapacity(int size) {
@@ -5360,7 +5551,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             clusterLayout = null;
             clusterGeometryText = null;
             clusterGeometryCount = 0;
-            if (clusterCount > 0) java.util.Arrays.fill(clusterLevel, 0, clusterCount, (byte) -1);
+            clusterOrderCount = 0;
+            if (clusterCount > 0) java.util.Arrays.fill(clusterLift, 0, clusterCount, -1f);
         }
     }
 

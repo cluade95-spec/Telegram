@@ -138,13 +138,66 @@ class LyricsKaraokeRenderingTest {
             assertEquals("still raised at $position", 1f,
                 KaraokeWave.graphemeLift(position, 1000, 0, 1f), 0f)
         }
-        // Eases away from rest rather than kicking off it.
-        assertTrue("eases out of rest", KaraokeWave.graphemeLift(1005, 1000, 0, 1f) < 0.01f)
-        // And it really is slow: not even half way after a fifth of a second.
-        assertTrue("a fifth of a second is not most of the travel",
-            KaraokeWave.graphemeLift(1200, 1000, 0, 1f) < 0.5f)
-        assertTrue("the normal rise is in the half-second territory",
-            KaraokeWave.RISE_MS in 400L..700L)
+        // Eases away from rest rather than kicking off it, and eases into the raised position
+        // rather than arriving at it.
+        assertTrue("eases out of rest", KaraokeWave.graphemeLift(1010, 1000, 0, 1f) < 0.005f)
+        assertTrue("eases into the top", KaraokeWave.graphemeLift(1990, 1000, 0, 1f) > 0.995f)
+        // B. Device QA: 520ms "does not feel slow". A word must still be plainly on its way up
+        // well after that, and the whole travel takes about a second.
+        assertTrue("still climbing at 520ms: ${KaraokeWave.graphemeLift(1520, 1000, 0, 1f)}",
+            KaraokeWave.graphemeLift(1520, 1000, 0, 1f) < 0.75f)
+        assertTrue("and nowhere near done at a fifth of a second",
+            KaraokeWave.graphemeLift(1200, 1000, 0, 1f) < 0.15f)
+        assertTrue("the normal rise is around a second: ${KaraokeWave.RISE_MS}",
+            KaraokeWave.RISE_MS in 800L..1200L)
+    }
+
+    @Test
+    fun theLiftIsAContinuousFloatAndNotASetOfHeights() {
+        // A. The previous build rounded every grapheme to one of six heights, so each one stepped
+        // about half a pixel at a time and the page visibly shook. Sampling one rise finely has to
+        // produce a genuinely continuous ramp, not a staircase.
+        val heights = HashSet<Float>()
+        var previous = -1f
+        var biggestStep = 0f
+        for (position in 0L..KaraokeWave.RISE_MS) {
+            val value = KaraokeWave.graphemeLift(position, 0, 0, 1f)
+            if (previous >= 0f) {
+                val step = value - previous
+                assertTrue("never goes down at $position", step >= -0.0001f)
+                if (step > biggestStep) biggestStep = step
+            }
+            heights.add(value)
+            previous = value
+        }
+        assertTrue("a quantised rise would have a handful of distinct heights, this has " +
+            "${heights.size}", heights.size > 500)
+        // No single millisecond may move it by anything like one of the old levels (1/5 of the
+        // travel). The steepest point of the curve is its middle, and even there it crawls.
+        assertTrue("no visible step anywhere in the rise: $biggestStep", biggestStep < 0.005f)
+        assertEquals("and it arrives exactly", 1f, previous, 0f)
+    }
+
+    @Test
+    fun theEasingIsCalmAtBothEndsAndNeverOvershoots() {
+        var previous = -1f
+        for (step in 0..2000) {
+            val t = step / 2000f
+            val value = KaraokeWave.ease(t)
+            assertTrue("never below rest at $t", value >= 0f)
+            assertTrue("never overshoots at $t: $value", value <= 1f)
+            assertTrue("monotonic at $t", value >= previous - 0.0001f)
+            previous = value
+        }
+        assertEquals(0f, KaraokeWave.ease(0f), 0f)
+        assertEquals(1f, KaraokeWave.ease(1f), 0f)
+        assertEquals(0f, KaraokeWave.ease(-1f), 0f)
+        assertEquals(1f, KaraokeWave.ease(2f), 0f)
+        assertEquals("symmetric about the half-way point", 0.5f, KaraokeWave.ease(0.5f), 0.0001f)
+        // Flatter at both ends than smoothstep, which is what makes it read as drifting rather
+        // than as setting off and getting there. smoothstep(0.1) is 0.028; this is far less.
+        assertTrue("very flat leaving rest: ${KaraokeWave.ease(0.1f)}", KaraokeWave.ease(0.1f) < 0.02f)
+        assertTrue("very flat arriving: ${KaraokeWave.ease(0.9f)}", KaraokeWave.ease(0.9f) > 0.98f)
     }
 
     @Test
@@ -182,12 +235,25 @@ class LyricsKaraokeRenderingTest {
 
     @Test
     fun adjacentGraphemesOverlapHeavilyRatherThanQueueing() {
-        // D. A soft wave, not a typewriter: the trail between neighbours is a small fraction of
-        // the rise, so a whole word is in motion at once.
-        assertTrue("the stagger is tens of milliseconds",
-            KaraokeWave.STAGGER_MS in 10L..60L)
-        assertTrue("and far smaller than the rise it trails",
-            KaraokeWave.STAGGER_MS * 6 < KaraokeWave.RISE_MS)
+        // D. A soft wave, not a typewriter. Device QA saw the letters visibly following one
+        // another at 26ms; the trail has to be a small enough fraction of the rise that a whole
+        // word reads as one movement.
+        assertTrue("the stagger is a handful of milliseconds: ${KaraokeWave.STAGGER_MS}",
+            KaraokeWave.STAGGER_MS in 4L..12L)
+        assertTrue("substantially tighter than the 26ms device QA rejected",
+            KaraokeWave.STAGGER_MS * 2 < 26L)
+        assertTrue("and a hundredth or less of the rise it trails",
+            KaraokeWave.STAGGER_MS * 100 <= KaraokeWave.RISE_MS)
+        // Four adjacent graphemes - the group the drawing translates together - never spread by
+        // more than a fraction of the travel, which on any real screen is a fraction of a pixel.
+        var spread = 0f
+        for (position in 0L..(KaraokeWave.RISE_MS + 200)) {
+            val head = KaraokeWave.graphemeLift(position, 0, 0, 1f)
+            val tail = KaraokeWave.graphemeLift(position, 0,
+                AudioPlayerAlert.KARAOKE_WAVE_RUN_GRAPHEMES - 1, 1f)
+            if (head - tail > spread) spread = head - tail
+        }
+        assertTrue("a drawn group spreads by almost nothing: $spread", spread < 0.06f)
         val at = 200L
         var previous = 2f
         for (grapheme in 0..5) {
@@ -197,18 +263,21 @@ class LyricsKaraokeRenderingTest {
             assertTrue("but is already moving with it: $value", value > 0f)
             previous = value
         }
-        // The last letter of a nine-letter word starts long before the first has finished.
+        // The last letter of a nine-letter word sets off while the first has barely moved, so
+        // they spend essentially the whole of their rise travelling together.
         val lastStarts = KaraokeWave.STAGGER_MS * 8
-        assertTrue("letter 9 sets off while letter 1 is still climbing",
-            lastStarts < KaraokeWave.RISE_MS)
-        assertTrue("and letter 1 is nowhere near done when it does",
-            KaraokeWave.graphemeLift(lastStarts, 0, 0, 1f) < 0.85f)
+        assertTrue("letter 9 sets off long before letter 1 is done",
+            lastStarts < KaraokeWave.RISE_MS / 10)
+        assertTrue("and letter 1 has barely started when it does: " +
+            "${KaraokeWave.graphemeLift(lastStarts, 0, 0, 1f)}",
+            KaraokeWave.graphemeLift(lastStarts, 0, 0, 1f) < 0.02f)
     }
 
     @Test
     fun aWordBeginsItsWaveAtItsOwnTimeWhileTheWordBeforeIsStillRising() {
-        // C. Word A at 10.000, word B at 10.180, a rise of about half a second. At 10.250 both
-        // are in motion. There is no queue and nothing waits.
+        // D. Word A at 10.000, word B at 10.180, a rise of about a second. With the slower rise
+        // this overlap is the normal case, not the exception: at 10.250 both are in motion, and A
+        // is neither cut short nor hurried because B arrived.
         val aStart = 10000L
         val bStart = 10180L
         val at = 10250L
@@ -219,8 +288,11 @@ class LyricsKaraokeRenderingTest {
         assertTrue("and B really did start on its own millisecond",
             KaraokeWave.graphemeLift(bStart - 1, bStart, 0, 1f) == 0f &&
                 KaraokeWave.graphemeLift(bStart + 5, bStart, 0, 1f) > 0f)
-        // The overlap is genuine, not a rounding artefact: A is well past half way.
-        assertTrue("A is substantially ahead of B: $a vs $b", a > b + 0.2f)
+        // The overlap is genuine, not a rounding artefact.
+        assertTrue("A is ahead of B: $a vs $b", a > b)
+        // And A carries on to the top on its own clock, long after B began.
+        assertEquals("B never truncates A", 1f,
+            KaraokeWave.graphemeLift(aStart + KaraokeWave.RISE_MS, aStart, 0, 1f), 0f)
     }
 
     @Test
@@ -299,10 +371,114 @@ class LyricsKaraokeRenderingTest {
     // The reference behaviour has one exception to the fixed speed: a final word that genuinely
     // starts so late that its normal wave would still be climbing when the line is carried away.
     // Only that word, only by as much as it needs, and continuously rather than at a threshold.
+    //
+    // The deadline is the thing the previous build got wrong. It measured the last word's room to
+    // the NEXT LINE'S STATED TIME, but the list starts carrying this line away, and fading it
+    // down, a pre-roll before that - so a word that "fitted" on paper was still near the baseline
+    // when the row left. These tests are written against the visible deadline, not the timestamp.
+
+    /**
+     * The moment the outgoing row has visibly lost the page: half way through the pre-roll that
+     * carries it away. This is what the decoration has to beat, and it is earlier than the next
+     * line's stated time by a margin the previous build spent entirely.
+     */
+    private fun visualDeadline(lineMs: Long, nextLineMs: Long): Long =
+        nextLineMs - AudioPlayerAlert.lyricFollowLeadMs(Math.max(1L, nextLineMs - lineMs)) / 2
+
+    /** When a word's whole wave, last grapheme included, is finished. */
+    private fun waveFinishMs(startMs: Long, graphemes: Int, scale: Float): Long =
+        startMs + (KaraokeWave.spanMs(graphemes) * scale).toLong() + 1
+
+    @Test
+    fun theDecorativeDeadlineIsTheDepartureAndNotTheNextTimestamp() {
+        // K. The regression for the Build #38 failure, in the numbers that produced it.
+        //
+        // The list starts carrying a line away a pre-roll BEFORE the next line's timestamp.
+        assertEquals("the pre-roll is half the gap, capped", 440L,
+            AudioPlayerAlert.lyricFollowLeadMs(4000))
+        assertEquals("a tight gap gets a proportionally shorter pre-roll", 150L,
+            AudioPlayerAlert.lyricFollowLeadMs(300))
+        assertEquals("and never less than 80ms", 80L, AudioPlayerAlert.lyricFollowLeadMs(100))
+        // A line at 0 with the next at 4.000 therefore starts leaving at 3.560 and has lost the
+        // page by 3.780 - not at 4.000, which is what Build #38 measured against.
+        val leaves = 4000L - AudioPlayerAlert.lyricFollowLeadMs(4000)
+        val deadline = visualDeadline(0, 4000)
+        assertEquals(3560L, leaves)
+        assertEquals(3780L, deadline)
+        assertTrue("the deadline is genuinely earlier than the timestamp", deadline < 4000L)
+
+        val line = lrc("[00:00.000]<00:00.000>first <00:03.400>last")
+        val wave = KaraokeWave().apply { build(line, 4000) }
+        assertEquals(2, wave.count)
+        assertEquals("the word's own stated start is untouched", 3400L, wave.startMs[1])
+        assertEquals("but its decorative room is measured to the departure", deadline - 3400L,
+            wave.availableMs[1])
+        assertTrue("which is less than the stated interval suggested",
+            wave.availableMs[1] < 4000L - 3400L)
+
+        // What Build #38 did: 600ms of nominal room, nothing to compress, and a last letter that
+        // was still on the baseline as the row began to go and only arrived as the line changed.
+        val nominal = KaraokeWave.compression(4000L - 3400L, 4)
+        assertEquals("the old reading found nothing to compress", 1f, nominal, 0f)
+        var oldArrives = 3400L
+        while (oldArrives < 6000L && oldLift(oldArrives, 3400, 3) < 0.999f) oldArrives++
+        assertTrue("the old model was still at the baseline when the row started leaving: " +
+            "${oldLift(leaves, 3400, 3)}", oldLift(leaves, 3400, 3) < 0.10f)
+        assertTrue("and only arrived as the line itself changed: $oldArrives", oldArrives >= 3950L)
+
+        // What it does now: compressed against the real window, and up with room to spare.
+        val scale = KaraokeWave.compression(wave.availableMs[1], 4)
+        assertTrue("the visible window forces a compression: $scale", scale < 1f)
+        assertTrue("the LAST letter is up by the deadline",
+            KaraokeWave.graphemeLift(deadline, wave.startMs[1], 3, scale) >= 0.999f)
+        assertTrue("and that is comfortably before the line changes",
+            waveFinishMs(wave.startMs[1], 4, scale) < 4000L)
+    }
+
+    /** Build #38's wave, kept only so the regression above can state what it did. */
+    private fun oldLift(positionMs: Long, wordStartMs: Long, grapheme: Int): Float {
+        val elapsed = (positionMs - wordStartMs - grapheme * 26L).toFloat()
+        if (elapsed <= 0f) return 0f
+        if (elapsed >= 520f) return 1f
+        val t = elapsed / 520f
+        return t * t * (3f - 2f * t)
+    }
+
+    @Test
+    fun aLateFinalWordIsUpBeforeTheRowLeavesRatherThanAfterIt() {
+        // J. Every grapheme of the word, not just the first, and by the visible deadline rather
+        // than at the line change. A jump to fully raised once the line has already gone is
+        // exactly the thing device QA called "skipped".
+        val nextLine = 4000L
+        val deadline = visualDeadline(0, nextLine)
+        val graphemes = 6 // "lovely"
+        val needed = KaraokeWave.spanMs(graphemes)
+        for (startMs in longArrayOf(1800, 2600, 3100, 3400, 3520)) {
+            val line = lrc("[00:00.000]<00:00.000>first <${clock(startMs)}>lovely")
+            val wave = KaraokeWave().apply { build(line, nextLine) }
+            assertEquals("the stated start is never moved", startMs, wave.startMs[1])
+            val room = wave.availableMs[1]
+            val scale = KaraokeWave.compression(room, graphemes)
+            // L/M. Compressed exactly when, and only when, the normal wave would not fit.
+            assertEquals("word at $startMs: compressed iff the normal wave does not fit " +
+                "(room $room, needs $needed)", room < needed, scale < 1f)
+            for (grapheme in 0 until graphemes) {
+                assertTrue("word at $startMs: grapheme $grapheme must be up by the deadline, was " +
+                    "${KaraokeWave.graphemeLift(deadline, startMs, grapheme, scale)}",
+                    KaraokeWave.graphemeLift(deadline, startMs, grapheme, scale) >= 0.999f)
+            }
+            // And it got there by rising, not by teleporting: half way through its own rise it is
+            // half way up, whatever that rise was compressed to.
+            val halfWay = startMs + (KaraokeWave.RISE_MS * scale / 2f).toLong()
+            val at = KaraokeWave.graphemeLift(halfWay, startMs, 0, scale)
+            assertTrue("word at $startMs: visibly mid-rise at $halfWay, was $at",
+                at > 0.05f && at < 0.95f)
+        }
+    }
 
     @Test
     fun aFinalWordWithEnoughRoomKeepsTheNormalSlowRise() {
-        // G. Six letters need RISE + 5 * STAGGER to finish. Given more than that, nothing changes.
+        // H. Six letters need RISE + 5 * STAGGER to finish. Given more than that, nothing changes.
         val needed = KaraokeWave.spanMs(6)
         assertEquals("nothing is compressed when the room is ample", 1f,
             KaraokeWave.compression(needed + 200, 6), 0f)
@@ -313,9 +489,9 @@ class LyricsKaraokeRenderingTest {
 
     @Test
     fun aFinalWordThatWouldBeSkippedIsCompressedJustEnoughToFinish() {
-        // H. The same six letters with far less room. The lift is shortened only as much as it
+        // I. The same six letters with far less room. The lift is shortened only as much as it
         // must be, and it really does complete before the line goes.
-        for (room in longArrayOf(500, 400, 280, 200)) {
+        for (room in longArrayOf(900, 650, 400, 300, 200)) {
             val scale = KaraokeWave.compression(room, 6)
             assertTrue("${room}ms: compressed", scale < 1f)
             assertTrue("${room}ms: but never to nothing", scale >= KaraokeWave.MIN_COMPRESSION)
@@ -324,7 +500,7 @@ class LyricsKaraokeRenderingTest {
         }
         // Continuous: a millisecond more room never changes the character of the motion.
         var previous = KaraokeWave.compression(100, 6)
-        for (room in 101L..900L) {
+        for (room in 101L..1400L) {
             val scale = KaraokeWave.compression(room, 6)
             assertTrue("never decreases as room grows at $room", scale >= previous - 0.0001f)
             assertTrue("no visible step at $room", scale - previous < 0.02f)
@@ -342,14 +518,68 @@ class LyricsKaraokeRenderingTest {
         assertEquals(3, wave.count)
         assertEquals("only the final word is ever bounded", Long.MAX_VALUE, wave.availableMs[0])
         assertEquals(Long.MAX_VALUE, wave.availableMs[1])
-        assertEquals("and the final word is bounded by the next line's stated time",
-            5000L - 80L, wave.availableMs[2])
+        assertEquals("and the final word is bounded by when the row starts leaving",
+            visualDeadline(0, 5000) - 80L, wave.availableMs[2])
         for (index in 0..1) {
             assertEquals("word $index keeps the normal speed however fast it is sung", 1f,
                 KaraokeWave.compression(wave.availableMs[index], 2), 0f)
         }
         // The last word here has plenty of room too, so nothing on this line is hurried at all.
         assertEquals(1f, KaraokeWave.compression(wave.availableMs[2], 2), 0f)
+    }
+
+    @Test
+    fun theColourOfAWordCannotMoveAnyOfItsGeometry() {
+        // M. Device QA: letters appeared to change shape and size while the colour slid through
+        // them. Everything the drawing measures has to be a function of the layout and the
+        // playback position ONLY - never of the fill - so advancing the sweep through a word must
+        // leave every geometry input identical.
+        val line = startsOnly()
+        val frame = KaraokeFrame()
+        frame.resolve(line, 1200, Long.MAX_VALUE)
+        val word = frame.wordStart
+        val wordEnd = frame.wordEnd
+        var previousSweep = -1f
+        for (position in 1200L..1399L) {
+            frame.resolve(line, position, Long.MAX_VALUE)
+            assertEquals("the word's start never moves as it fills", word, frame.wordStart)
+            assertEquals("nor its end", wordEnd, frame.wordEnd)
+            assertTrue("and the fill only ever advances", frame.sweep >= previousSweep - 0.0001f)
+            previousSweep = frame.sweep
+        }
+        // The vertical decoration is likewise blind to the fill: it is a function of the word's
+        // stated start and the position, and takes no argument that the colour could change.
+        val wave = KaraokeWave().apply { build(line, Long.MAX_VALUE) }
+        for (position in longArrayOf(1200, 1250, 1300, 1350, 1399)) {
+            assertEquals("the height at $position depends on the clock, not on the fill",
+                KaraokeWave.graphemeLift(position, wave.startMs[1], 0, 1f),
+                KaraokeWave.graphemeLift(position, wave.startMs[1], 0, 1f), 0f)
+        }
+        // And the cluster boundaries the strips are cut on come from the text, so they are the
+        // same whatever the clock or the colours are doing.
+        val text = line.text
+        val boundaries = waveGraphemes(text).map { it.length }
+        assertEquals("the same text always splits the same way", boundaries, waveGraphemes(text).map { it.length })
+    }
+
+    @Test
+    fun theDrawnGroupingIsFixedForTheLineAndNeverFollowsTheHeight() {
+        // A. The shaking came from grouping by HEIGHT: a grapheme crossed a level and jumped. The
+        // grouping is now by position in the text, so it cannot depend on the clock at all - which
+        // is what guarantees no grapheme ever steps from one height to another.
+        assertTrue("a group is a few graphemes, not the whole line",
+            AudioPlayerAlert.KARAOKE_WAVE_RUN_GRAPHEMES in 2..8)
+        // The spread inside one group, at the steepest point of the curve, is a fraction of the
+        // travel - and the travel is under a pixel in total on a normal screen.
+        val n = AudioPlayerAlert.KARAOKE_WAVE_RUN_GRAPHEMES
+        var worst = 0f
+        for (position in 0L..(KaraokeWave.RISE_MS + 200)) {
+            val head = KaraokeWave.graphemeLift(position, 0, 0, 1f)
+            val tail = KaraokeWave.graphemeLift(position, 0, n - 1, 1f)
+            if (head - tail > worst) worst = head - tail
+        }
+        assertTrue("one drawn group is essentially flat: $worst of ${AudioPlayerAlert.KARAOKE_LIFT_DP}dp",
+            worst * AudioPlayerAlert.KARAOKE_LIFT_DP < 0.06f)
     }
 
     @Test
@@ -467,19 +697,26 @@ class LyricsKaraokeRenderingTest {
             0, wave.startOffset[0])
         assertTrue("and runs up to the next one", wave.endOffset[0] >= "beautiful".length)
         assertEquals(wave.endOffset[0], wave.startOffset[1])
-        // One continuous rise across it: sampled at the syllable boundaries the source states,
-        // the travel never returns to the baseline and never restarts.
+        // L. One continuous rise across it: sampled right through the word, the travel never
+        // returns to the baseline and never restarts. A per-syllable wave would cross zero at
+        // 200 and 400 and set off again.
         var previous = -1f
-        for (position in 0L..800L) {
+        for (position in 0L..(KaraokeWave.RISE_MS + 200)) {
             val value = KaraokeWave.graphemeLift(position, wave.startMs[0], 0, 1f)
             assertTrue("no restart at $position: $previous -> $value", value >= previous - 0.0001f)
             previous = value
         }
-        assertEquals("and it is fully raised well before the word ends", 1f, previous, 0f)
+        assertEquals("and it does reach the raised position, once", 1f, previous, 0f)
         for (boundary in longArrayOf(200, 400)) {
-            assertTrue("the stated syllable at $boundary does not drop it back",
-                KaraokeWave.graphemeLift(boundary, wave.startMs[0], 0, 1f) > 0f)
+            val before = KaraokeWave.graphemeLift(boundary - 1, wave.startMs[0], 0, 1f)
+            val after = KaraokeWave.graphemeLift(boundary, wave.startMs[0], 0, 1f)
+            assertTrue("the stated syllable at $boundary does not drop it back: $before -> $after",
+                after >= before && after > 0f)
         }
+        // The word's own wave is still climbing when the next displayed word starts, and that is
+        // the point: the two overlap rather than queueing.
+        assertTrue("still rising at the next word's stated start",
+            KaraokeWave.graphemeLift(800, wave.startMs[0], 0, 1f) < 1f)
     }
 
     @Test
@@ -557,12 +794,21 @@ class LyricsKaraokeRenderingTest {
             frame.resolve(line, nextLine - 1, nextLine)
             assertTrue("${tail}ms tail: complete before the line can change, not swallowed by it",
                 frame.sweep > 0.98f)
-            // And its decoration is compressed exactly as far as it has to be to be seen at all.
+            // And its decoration is compressed exactly as far as it has to be to be seen at all -
+            // measured to the moment the row starts leaving, which is earlier than nextLine.
             val wave = KaraokeWave().apply { build(line, nextLine) }
+            val deadline = visualDeadline(0, nextLine)
             val scale = KaraokeWave.compression(wave.availableMs[1], 4)
-            assertTrue("${tail}ms tail: the last word is raised by the transition, not skipped",
-                KaraokeWave.graphemeLift(nextLine, wave.startMs[1], 3, scale) >= 0.999f)
-            assertTrue("${tail}ms tail: and compressed only as far as it had to be",
+            // A word that begins before the deadline must be up by it. A word that begins after it
+            // - the line changes almost as it starts - cannot beat a deadline already past, so the
+            // honest requirement is that it still finishes its whole wave before the line goes.
+            val finish = Math.max(Math.max(deadline, wave.startMs[1]),
+                waveFinishMs(wave.startMs[1], 4, scale))
+            assertTrue("${tail}ms tail: the last letter of the last word does get there",
+                KaraokeWave.graphemeLift(finish, wave.startMs[1], 3, scale) >= 0.999f)
+            assertTrue("${tail}ms tail: and before the line changes ($finish vs $nextLine)",
+                finish <= nextLine)
+            assertTrue("${tail}ms tail: compressed only as far as it had to be",
                 scale <= 1f && scale >= KaraokeWave.MIN_COMPRESSION)
         }
     }
