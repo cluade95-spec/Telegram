@@ -1065,6 +1065,223 @@ class LyricsKaraokeRenderingTest {
         }
     }
 
+    // ============================ the composed picture: the fade, the sweep and the hand-over
+    // The previous round of fade tests asserted the crossfade formula on its own, which is exactly
+    // how the "swallowed last word" came back: every isolated part was right and the composition
+    // was not. These drive the real combination - a final word still sweeping while the pre-roll
+    // scroll is already fading its line away - and assert what a person watching would say.
+
+    /** Focus as the page actually paints it: the crossfade, floored while a word is still sung. */
+    private fun paintedFocus(frame: KaraokeFrame, outgoingRow: Int, incomingRow: Int,
+                             scrollProgress: Float, isCurrentLine: Boolean): Float {
+        val crossfade = AudioPlayerAlert.lyricsFocusValue(outgoingRow, outgoingRow, incomingRow, scrollProgress)
+        val singing = isCurrentLine && frame.wordEnd > frame.wordStart
+        return maxOf(crossfade, AudioPlayerAlert.karaokeReadableFloor(singing, frame.sweep))
+    }
+
+    // "one two three" at [00:01.000], the line after it at 00:02.000. The gap is 1000ms so the
+    // follow's lead is its 440ms cap: the scroll toward the next line starts at 1560 and the last
+    // word - "three", stated at 1400 - is still being sung through every frame of it.
+    private val preRollStart = 1560L
+    private val preRollEnd = 2000L
+
+    private fun atScroll(progress: Float): Long =
+        preRollStart + ((preRollEnd - preRollStart) * progress).toLong()
+
+    @Test
+    fun theLastWordIsStillBeingSungThroughTheWholePreRoll() {
+        // Guards the fixture: if the final word were finished before the scroll began there would
+        // be nothing to protect and every assertion below would pass vacuously.
+        val line = startsOnly()
+        val frame = KaraokeFrame()
+        for (progress in floatArrayOf(0f, 0.25f, 0.5f, 0.75f)) {
+            frame.resolve(line, atScroll(progress), preRollEnd)
+            assertEquals("the final word owns the pre-roll at $progress", start(line, 2), frame.wordStart)
+            assertTrue("and its fill is genuinely mid-travel at $progress", frame.sweep in 0.01f..0.99f)
+        }
+    }
+
+    @Test
+    fun theOutgoingLineStillFadesDuringTheScroll() {
+        // The fade is not postponed, frozen or removed: the line is already visibly less than
+        // current a quarter of the way into the travel, and it keeps going.
+        val line = startsOnly()
+        val frame = KaraokeFrame()
+        var previous = 1.01f
+        for (step in 0..40) {
+            val progress = step / 40f
+            frame.resolve(line, atScroll(progress), preRollEnd)
+            val focus = paintedFocus(frame, 3, 4, progress, isCurrentLine = true)
+            assertTrue("the fade never reverses at $progress: $focus vs $previous", focus <= previous + 0.0001f)
+            previous = focus
+        }
+        frame.resolve(line, atScroll(0.25f), preRollEnd)
+        assertTrue("the line has visibly left full focus by a quarter of the scroll",
+            paintedFocus(frame, 3, 4, 0.25f, isCurrentLine = true) < 0.95f)
+    }
+
+    @Test
+    fun theFinalWordStaysReadableAtEveryPointOfTheScroll() {
+        val line = startsOnly()
+        val frame = KaraokeFrame()
+        for (progress in floatArrayOf(0.25f, 0.5f, 0.75f)) {
+            frame.resolve(line, atScroll(progress), preRollEnd)
+            val focus = paintedFocus(frame, 3, 4, progress, isCurrentLine = true)
+            assertTrue("still clearly readable at $progress of the scroll: $focus",
+                focus >= AudioPlayerAlert.KARAOKE_SINGING_FOCUS_FLOOR - 0.0001f)
+            assertTrue("but never frozen at full focus at $progress: $focus", focus < 1f)
+        }
+        // Halfway and three quarters through, the bare crossfade would have handed the word to the
+        // subordinate colour. The floor is what keeps it legible while it is still being sung.
+        assertTrue("the floor is what is doing the work at 0.75",
+            AudioPlayerAlert.lyricsFocusValue(3, 3, 4, 0.75f) < AudioPlayerAlert.KARAOKE_SINGING_FOCUS_FLOOR)
+    }
+
+    @Test
+    fun theFloorIsARestraintAndNotFullFocus() {
+        // A floor at or near 1 would be the "scroll first, recolour afterwards" behaviour QA
+        // rejected. It has to be low enough that the line is plainly subordinate to the incoming
+        // one and high enough that the word can still be read.
+        assertTrue(AudioPlayerAlert.KARAOKE_SINGING_FOCUS_FLOOR in 0.35f..0.7f)
+    }
+
+    @Test
+    fun theFloorReleasesWithTheWordsOwnFillSoNothingStepsAtTheBoundary() {
+        var previous = AudioPlayerAlert.karaokeReadableFloor(true, 0f)
+        for (step in 0..100) {
+            val sweep = step / 100f
+            val floor = AudioPlayerAlert.karaokeReadableFloor(true, sweep)
+            assertTrue("the floor never rises at $sweep", floor <= previous + 0.0001f)
+            assertTrue("and never jumps at $sweep", previous - floor < 0.1f)
+            previous = floor
+        }
+        assertEquals("gone by the time the word's fill is complete", 0f,
+            AudioPlayerAlert.karaokeReadableFloor(true, 1f), 0.0001f)
+    }
+
+    @Test
+    fun aLineAlreadyLeftBehindGetsNoFloorAndCanGoFullySecondary() {
+        // Past the boundary the line is no longer current: resolveRow reports it wholly sung with
+        // no word in progress, so the floor stops applying and the crossfade alone decides.
+        val lyrics = parse("[00:01.000]<00:01.000>one <00:01.400>three\n[00:02.000]next")
+        val frame = KaraokeFrame()
+        frame.resolveRow(lyrics.lines[0], 0, lyrics.lineAt(2100), 2100, Long.MAX_VALUE)
+        assertFalse("no word of it is in progress any more", frame.wordEnd > frame.wordStart)
+        assertEquals(0f, AudioPlayerAlert.karaokeReadableFloor(
+            frame.wordEnd > frame.wordStart, frame.sweep), 0.0001f)
+        assertEquals("so it can finish fully subordinate", 0f,
+            paintedFocus(frame, 3, 4, 1f, isCurrentLine = false), 0.0001f)
+    }
+
+    @Test
+    fun theFillItselfIsUntouchedByTheFadeAndTheFloor() {
+        // The floor changes how the LINE is coloured. It must not change where the sweep is, which
+        // is still read straight off the clock.
+        val line = startsOnly()
+        val frame = KaraokeFrame()
+        var previous = -1f
+        for (progress in floatArrayOf(0f, 0.25f, 0.5f, 0.75f, 1f)) {
+            frame.resolve(line, atScroll(progress), preRollEnd)
+            assertTrue("the fill only travels forwards at $progress", frame.sweep > previous)
+            previous = frame.sweep
+        }
+        assertEquals("and completes exactly at the line boundary", 1f, previous, 0.0001f)
+    }
+
+    // ================================================================= the fade is eased once
+    // The follow animator hands lyricsFocusValue an ALREADY eased fraction. Easing it again is
+    // what made the outgoing line lose most of its prominence long before the halfway point.
+
+    @Test
+    fun halfWayThroughTheScrollIsHalfWayThroughTheFade() {
+        assertEquals(0.5f, AudioPlayerAlert.lyricsFocusValue(3, 3, 4, 0.5f), 0.02f)
+        assertEquals(0.5f, AudioPlayerAlert.lyricsFocusValue(4, 3, 4, 0.5f), 0.02f)
+    }
+
+    @Test
+    fun theFadeIsNotEasedASecondTimeOnTopOfTheAnimatorsOwnEasing() {
+        // A second easing shows up as a bow in the curve: the incoming line would be well past the
+        // fraction it was handed. The mapping has to be the identity.
+        for (step in 0..20) {
+            val progress = step / 20f
+            assertEquals("no extra curve at $progress", progress,
+                AudioPlayerAlert.lyricsFocusValue(4, 3, 4, progress), 0.0001f)
+        }
+    }
+
+    @Test
+    fun theIncomingLineDoesNotTakeOverBeforeItArrives() {
+        assertTrue("a quarter in, the outgoing line is still the dominant one",
+            AudioPlayerAlert.lyricsFocusValue(3, 3, 4, 0.25f) >
+                AudioPlayerAlert.lyricsFocusValue(4, 3, 4, 0.25f))
+        assertTrue("three quarters in, the incoming line has taken over",
+            AudioPlayerAlert.lyricsFocusValue(4, 3, 4, 0.75f) >
+                AudioPlayerAlert.lyricsFocusValue(3, 3, 4, 0.75f))
+    }
+
+    // ============================================== pause, interruption and cancellation
+    // All three stop a transition that is part way through. Painting reads these values directly
+    // now, so resolving the bookkeeping in one frame is a visible colour and blur pop.
+
+    @Test
+    fun aTransitionStartsFromWhateverIsOnScreenRatherThanFromTheEndpoints() {
+        // Row 4 was 0.6 of the way in when a new line retargeted the follow at row 5. The new
+        // transition begins with row 4 exactly where the eye left it, not snapped to full focus.
+        val carried = AudioPlayerAlert.lyricsFocusValue(4, 3, 4, 0.6f)
+        assertEquals("no step on the row being handed over", carried,
+            AudioPlayerAlert.lyricsFocusValue(4, 4, 5, 0f, carried, 0f), 0.0001f)
+        assertEquals("and none on the row arriving", 0f,
+            AudioPlayerAlert.lyricsFocusValue(5, 4, 5, 0f, carried, 0f), 0.0001f)
+        assertEquals("which still finishes fully subordinate", 0f,
+            AudioPlayerAlert.lyricsFocusValue(4, 4, 5, 1f, carried, 0f), 0.0001f)
+        assertEquals("while the new line becomes current", 1f,
+            AudioPlayerAlert.lyricsFocusValue(5, 4, 5, 1f, carried, 0f), 0.0001f)
+    }
+
+    @Test
+    fun theThirdRowOfAnInterruptedHandOverFadesOutInsteadOfBeingDropped() {
+        // Interrupting an A -> B crossfade leaves A still partly lit. Two rows cannot express
+        // three, so A rides the extra slot down to nothing over the new transition.
+        val stranded = AudioPlayerAlert.lyricsFocusValue(3, 3, 4, 0.6f)
+        assertTrue("A really is still lit when the interruption lands", stranded > 0.1f)
+        assertEquals("it starts where it was", stranded,
+            AudioPlayerAlert.lyricsDropFocusValue(stranded, 0f), 0.0001f)
+        assertEquals("and ends at rest", 0f,
+            AudioPlayerAlert.lyricsDropFocusValue(stranded, 1f), 0.0001f)
+        var previous = stranded + 0.0001f
+        for (step in 0..40) {
+            val value = AudioPlayerAlert.lyricsDropFocusValue(stranded, step / 40f)
+            assertTrue("monotonic at $step", value <= previous + 0.0001f)
+            previous = value
+        }
+    }
+
+    @Test
+    fun settlingOntoALineAlreadySettledThereChangesNothing() {
+        // A pause or a cancellation that lands on the line the hierarchy already belongs to is a
+        // no-op, not a re-run of the crossfade.
+        val noRow = -1 // RecyclerView.NO_POSITION
+        assertEquals(1f, AudioPlayerAlert.lyricsFocusValue(4, noRow, 4, 1f), 0.0001f)
+        assertEquals(1f, AudioPlayerAlert.lyricsFocusValue(4, noRow, 4, 0f, 1f, 1f), 0.0001f)
+    }
+
+    @Test
+    fun aPauseInsideThePreRollHandsTheHierarchyBackWithoutAStep() {
+        // Paused mid-pre-roll the follow settles back onto the line whose timestamp has passed.
+        // Both rows continue from where they are: the outgoing one rises back rather than popping,
+        // and the half-promoted one fades out rather than vanishing.
+        val outgoing = AudioPlayerAlert.lyricsFocusValue(3, 3, 4, 0.5f)
+        val promoted = AudioPlayerAlert.lyricsFocusValue(4, 3, 4, 0.5f)
+        assertEquals("no step on the line getting the hierarchy back", outgoing,
+            AudioPlayerAlert.lyricsFocusValue(3, 4, 3, 0f, promoted, outgoing), 0.0001f)
+        assertEquals("nor on the one giving it up", promoted,
+            AudioPlayerAlert.lyricsFocusValue(4, 4, 3, 0f, promoted, outgoing), 0.0001f)
+        assertEquals("the settle ends with the current line fully current", 1f,
+            AudioPlayerAlert.lyricsFocusValue(3, 4, 3, 1f, promoted, outgoing), 0.0001f)
+        assertEquals("and the pre-rolled one back at rest", 0f,
+            AudioPlayerAlert.lyricsFocusValue(4, 4, 3, 1f, promoted, outgoing), 0.0001f)
+    }
+
     // ====================================================================== fixture guards
 
     @Test

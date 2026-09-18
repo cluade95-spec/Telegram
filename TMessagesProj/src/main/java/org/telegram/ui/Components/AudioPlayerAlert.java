@@ -3196,6 +3196,15 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
     private int lyricsEmphasisFromRow = RecyclerView.NO_POSITION;
     private int lyricsEmphasisToRow = RecyclerView.NO_POSITION;
     private float lyricsEmphasisProgress = 1f;
+    // Where each side of the crossfade STARTED. A transition that begins from rest runs 1 -> 0 and
+    // 0 -> 1, but one that interrupts an unfinished transition begins from whatever the eye is
+    // actually looking at, which is what keeps a retarget from stepping the hierarchy in one frame.
+    private float lyricsEmphasisFromStart = 1f;
+    private float lyricsEmphasisToStart = 0f;
+    // One extra slot: interrupting a two-row crossfade leaves a THIRD row still partly lit, and it
+    // has to be faded out rather than dropped to zero. Two rows cannot express three.
+    private int lyricsEmphasisDropRow = RecyclerView.NO_POSITION;
+    private float lyricsEmphasisDropStart = 0f;
     private final Runnable advanceLyricsFollow = () -> updateLyricsFollow(true);
 
     private void cancelLyricsFollow() {
@@ -3204,19 +3213,29 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         lyricsFollowRow = RecyclerView.NO_POSITION;
         // Never leave a line half-emphasised behind a cancelled transition: resolve onto whatever
         // the logical state says is active right now. The hierarchy rides the same values, so
-        // resolving the transition resolves the colours with it.
-        setLyricsEmphasis(RecyclerView.NO_POSITION, activeLyricsRow, 1f);
+        // resolving the transition resolves the colours with it - but it SETTLES there over a
+        // frame or two instead of stepping, because painting now reads these values directly and a
+        // drag, a mode change or a dismiss would otherwise pop the colour and the blur.
+        if (dismissing || lyricsListView == null || !showingLyrics) {
+            setLyricsEmphasis(RecyclerView.NO_POSITION, activeLyricsRow, 1f);
+        } else {
+            settleLyricsEmphasis(activeLyricsRow);
+        }
     }
 
-    /** Eases the current emphasis out to "no active lyric", used for an explicit timed blank. */
-    private void clearLyricsEmphasis() {
-        if (lyricsEmphasisToRow == RecyclerView.NO_POSITION && (lyricsFollowAnimator != null || lyricsEmphasisProgress >= 1f)) {
-            return; // already clearing, or already clear: the blank interval ticks many times
-        }
+    /**
+     * Eases the hierarchy onto {@code toRow} from wherever it visually is, without a step. Used by
+     * every path that stops a transition early - a pause inside a pre-roll, a cancelled follow -
+     * where resolving the bookkeeping instantly would be a visible colour and blur snap.
+     */
+    private void settleLyricsEmphasis(int toRow) {
         cancelLyricsFollowAnimator();
-        lyricsEmphasisFromRow = lyricsEmphasisToRow;
-        lyricsEmphasisToRow = RecyclerView.NO_POSITION;
-        lyricsEmphasisProgress = 0f;
+        if (lyricsEmphasisToRow == toRow && lyricsEmphasisProgress >= 1f
+                && lyricsEmphasisFromRow == RecyclerView.NO_POSITION
+                && lyricsEmphasisDropRow == RecyclerView.NO_POSITION) {
+            return; // already settled exactly there
+        }
+        retargetLyricsEmphasis(toRow);
         final ValueAnimator animator = ValueAnimator.ofFloat(0f, 1f);
         animator.addUpdateListener(a -> {
             if (lyricsFollowAnimator != a) return;
@@ -3227,9 +3246,80 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             @Override public void onAnimationEnd(Animator animation) {
                 if (lyricsFollowAnimator != animation) return;
                 lyricsFollowAnimator = null;
-                lyricsEmphasisProgress = 1f;
-                lyricsEmphasisFromRow = RecyclerView.NO_POSITION;
-                updateLyricsDepth();
+                resolveLyricsEmphasis();
+            }
+        });
+        animator.setDuration(LYRIC_FOLLOW_MIN_MS);
+        animator.setInterpolator(CubicBezierInterpolator.EASE_OUT);
+        lyricsFollowAnimator = animator;
+        animator.start();
+        updateLyricsDepth();
+    }
+
+    /**
+     * Points the crossfade at a new target while keeping every row's CURRENT focus as its starting
+     * value, so an interrupted transition continues from what is on screen. The outgoing slot takes
+     * the brightest row that is not the new target and the drop slot the next brightest; anything
+     * dimmer than those two is already at rest.
+     */
+    private void retargetLyricsEmphasis(int toRow) {
+        final int[] rows = {lyricsEmphasisToRow, lyricsEmphasisFromRow, lyricsEmphasisDropRow};
+        final float[] focus = new float[rows.length];
+        for (int i = 0; i < rows.length; i++) {
+            focus[i] = rows[i] == RecyclerView.NO_POSITION || rows[i] == toRow
+                    ? -1f : lyricsFocusOf(rows[i]);
+        }
+        int first = -1, second = -1;
+        for (int i = 0; i < rows.length; i++) {
+            if (focus[i] < 0f) continue;
+            if (first < 0 || focus[i] > focus[first]) {
+                second = first;
+                first = i;
+            } else if (second < 0 || focus[i] > focus[second]) {
+                second = i;
+            }
+        }
+        final float toStart = toRow == RecyclerView.NO_POSITION ? 0f : lyricsFocusOf(toRow);
+        lyricsEmphasisFromRow = first < 0 ? RecyclerView.NO_POSITION : rows[first];
+        lyricsEmphasisFromStart = first < 0 ? 0f : focus[first];
+        lyricsEmphasisDropRow = second < 0 ? RecyclerView.NO_POSITION : rows[second];
+        lyricsEmphasisDropStart = second < 0 ? 0f : focus[second];
+        lyricsEmphasisToRow = toRow;
+        lyricsEmphasisToStart = toStart;
+        lyricsEmphasisProgress = 0f;
+    }
+
+    /** Finishes a transition: the target owns the hierarchy and nothing else is left part-lit. */
+    private void resolveLyricsEmphasis() {
+        lyricsEmphasisProgress = 1f;
+        lyricsEmphasisFromRow = RecyclerView.NO_POSITION;
+        lyricsEmphasisFromStart = 1f;
+        lyricsEmphasisToStart = 0f;
+        lyricsEmphasisDropRow = RecyclerView.NO_POSITION;
+        lyricsEmphasisDropStart = 0f;
+        updateLyricsDepth();
+    }
+
+    /** Eases the current emphasis out to "no active lyric", used for an explicit timed blank. */
+    private void clearLyricsEmphasis() {
+        if (lyricsEmphasisToRow == RecyclerView.NO_POSITION && (lyricsFollowAnimator != null || lyricsEmphasisProgress >= 1f)) {
+            return; // already clearing, or already clear: the blank interval ticks many times
+        }
+        cancelLyricsFollowAnimator();
+        // Continues from the focus every row actually has, so a blank that lands mid-transition
+        // dims what is lit rather than stepping it.
+        retargetLyricsEmphasis(RecyclerView.NO_POSITION);
+        final ValueAnimator animator = ValueAnimator.ofFloat(0f, 1f);
+        animator.addUpdateListener(a -> {
+            if (lyricsFollowAnimator != a) return;
+            lyricsEmphasisProgress = (float) a.getAnimatedValue();
+            updateLyricsDepth();
+        });
+        animator.addListener(new AnimatorListenerAdapter() {
+            @Override public void onAnimationEnd(Animator animation) {
+                if (lyricsFollowAnimator != animation) return;
+                lyricsFollowAnimator = null;
+                resolveLyricsEmphasis();
             }
         });
         animator.setDuration(LYRIC_FOLLOW_MIN_MS);
@@ -3240,7 +3330,11 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
 
     private void setLyricsEmphasis(int fromRow, int toRow, float progress) {
         lyricsEmphasisFromRow = fromRow;
+        lyricsEmphasisFromStart = 1f;
         lyricsEmphasisToRow = toRow;
+        lyricsEmphasisToStart = 0f;
+        lyricsEmphasisDropRow = RecyclerView.NO_POSITION;
+        lyricsEmphasisDropStart = 0f;
         lyricsEmphasisProgress = progress;
         updateLyricsDepth();
     }
@@ -3282,9 +3376,10 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         if (paused && lyricsFollowAnimator != null && lyricsFollowRow != targetRow) {
             // Paused inside a pre-roll: stop short of the next line and hand the emphasis back to
             // the line whose timestamp has actually passed.
-            cancelLyricsFollowAnimator();
             lyricsFollowRow = targetRow;
-            setLyricsEmphasis(RecyclerView.NO_POSITION, targetRow, 1f);
+            // Settle, never step: the pre-roll had already part-promoted the next line, and
+            // handing the hierarchy back in one frame is exactly the colour/blur pop QA saw.
+            settleLyricsEmphasis(targetRow);
         }
         if (!paused && line + 1 < currentLyrics.lines.size()) {
             final long nextTime = currentLyrics.lines.get(line + 1).timeMs;
@@ -3367,9 +3462,10 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         // the surface; restarting the emphasis there would un-bold and re-bold the current line.
         final boolean advancing = lyricsEmphasisToRow != row;
         if (advancing) {
-            lyricsEmphasisFromRow = lyricsEmphasisToRow;
-            lyricsEmphasisToRow = row;
-            lyricsEmphasisProgress = 0f;
+            // Fast consecutive lines retarget a transition that has not finished. Carrying every
+            // row's current focus into the new one is what keeps the outgoing row from dropping to
+            // zero and the half-promoted row from jumping to full in a single frame.
+            retargetLyricsEmphasis(row);
         }
         final int[] applied = {0};
         final ValueAnimator animator = ValueAnimator.ofFloat(0f, 1f);
@@ -3390,11 +3486,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             @Override public void onAnimationEnd(Animator animation) {
                 if (lyricsFollowAnimator != animation) return;
                 lyricsFollowAnimator = null;
-                if (advancing) {
-                    lyricsEmphasisProgress = 1f;
-                    lyricsEmphasisFromRow = RecyclerView.NO_POSITION;
-                    updateLyricsDepth();
-                }
+                if (advancing) resolveLyricsEmphasis();
             }
         });
         animator.setDuration(duration);
@@ -3573,22 +3665,79 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
      * list this frame - so at a quarter of the travel the outgoing line is a quarter faded and the
      * incoming line a quarter arrived. There is no second animator and no post-scroll switch.
      *
-     * <p>The two sides are derived from one eased value, so the crossfade stays complementary and
-     * the pair can never dip or overshoot in total brightness. The emphasis curve is eased out
-     * while the movement is eased in and out, which is the existing tuning: a line has most of its
-     * prominence by the time it arrives rather than finishing its colour after it has stopped.
+     * <p>The two sides are derived from one value, so the crossfade stays complementary and the
+     * pair can never dip or overshoot in total brightness. That value is the follow animator's
+     * fraction, which the animator has ALREADY eased; the interpolation here is therefore linear
+     * on purpose. Easing it a second time is what made the outgoing line lose most of its
+     * prominence well before the halfway point of the travel.
      */
     private float lyricsFocusOf(int row) {
-        return lyricsFocusValue(row, lyricsEmphasisFromRow, lyricsEmphasisToRow, lyricsEmphasisProgress);
+        if (row == RecyclerView.NO_POSITION) return 0f;
+        if (row == lyricsEmphasisDropRow && row != lyricsEmphasisToRow && row != lyricsEmphasisFromRow) {
+            return lyricsDropFocusValue(lyricsEmphasisDropStart, lyricsEmphasisProgress);
+        }
+        return lyricsFocusValue(row, lyricsEmphasisFromRow, lyricsEmphasisToRow,
+                lyricsEmphasisProgress, lyricsEmphasisFromStart, lyricsEmphasisToStart);
     }
 
     /** The crossfade itself, free of the view state, so it can be asserted directly. */
     public static float lyricsFocusValue(int row, int fromRow, int toRow, float progress) {
+        return lyricsFocusValue(row, fromRow, toRow, progress, 1f, 0f);
+    }
+
+    /**
+     * The same crossfade, told where each side started. A transition from rest runs 1 -> 0 and
+     * 0 -> 1; one that interrupts an unfinished transition starts from what is on screen.
+     */
+    public static float lyricsFocusValue(int row, int fromRow, int toRow, float progress,
+                                         float fromStart, float toStart) {
         if (row == RecyclerView.NO_POSITION) return 0f;
-        if (row != toRow && row != fromRow) return 0f;
-        final float eased = CubicBezierInterpolator.EASE_OUT.getInterpolation(
-                Math.max(0f, Math.min(1f, progress)));
-        return row == toRow ? eased : 1f - eased;
+        final float t = clampUnit(progress);
+        if (row == toRow) return lerp(toStart, 1f, t);
+        if (row == fromRow) return lerp(fromStart, 0f, t);
+        return 0f;
+    }
+
+    /**
+     * The third row's side of an interrupted hand-over: it fades out from wherever it was rather
+     * than being dropped to nothing, which is what a two-row crossfade alone would have to do.
+     */
+    public static float lyricsDropFocusValue(float dropStart, float progress) {
+        return lerp(dropStart, 0f, clampUnit(progress));
+    }
+
+    static float clampUnit(float value) {
+        return value < 0f ? 0f : value > 1f ? 1f : value;
+    }
+
+    /**
+     * How much prominence a line keeps, whatever the scroll fade is doing, while a word of it is
+     * genuinely still being sung.
+     *
+     * <p>The fade and the movement are one gesture and must stay that way - the line visibly dims
+     * from the moment the pre-roll starts. But the pre-roll begins up to {@link
+     * #LYRIC_FOLLOW_LEAD_MAX} before the next line's timestamp, and the final word of the outgoing
+     * line is usually still sweeping through the whole of it. Letting the crossfade alone decide
+     * would hand that word over to the subordinate colour while it is still being sung, which is
+     * the "swallowed last word" QA kept reporting.
+     *
+     * <p>So the floor is a composition rule, not a freeze: the painted focus is the larger of the
+     * crossfade and this floor. The floor is deliberately well below full focus, so the line is
+     * still plainly fading, and it releases over the tail of the word's own fill so that it is
+     * already gone by the line boundary - the outgoing line finishes fully secondary, and nothing
+     * steps when the floor stops applying.
+     */
+    static final float KARAOKE_SINGING_FOCUS_FLOOR = 0.55f;
+    /** Point in the word's own fill at which the floor starts releasing back to the crossfade. */
+    static final float KARAOKE_SINGING_FLOOR_RELEASE = 0.85f;
+
+    public static float karaokeReadableFloor(boolean wordActive, float sweep) {
+        if (!wordActive) return 0f;
+        final float filled = clampUnit(sweep);
+        if (filled <= KARAOKE_SINGING_FLOOR_RELEASE) return KARAOKE_SINGING_FOCUS_FLOOR;
+        final float released = (filled - KARAOKE_SINGING_FLOOR_RELEASE)
+                / (1f - KARAOKE_SINGING_FLOOR_RELEASE);
+        return KARAOKE_SINGING_FOCUS_FLOOR * (1f - released);
     }
 
     /**
@@ -3636,6 +3785,19 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
     }
 
     private void resetKaraoke() {
+        // The hierarchy is document state too. A new document must start from its OWN current
+        // line, so no row index, no half-finished crossfade and no blur depth may survive the
+        // change - an old row would otherwise paint as current for a frame before the first tick.
+        AndroidUtilities.cancelRunOnUIThread(advanceLyricsFollow);
+        cancelLyricsFollowAnimator();
+        lyricsFollowRow = RecyclerView.NO_POSITION;
+        lyricsEmphasisFromRow = RecyclerView.NO_POSITION;
+        lyricsEmphasisFromStart = 1f;
+        lyricsEmphasisToRow = RecyclerView.NO_POSITION;
+        lyricsEmphasisToStart = 0f;
+        lyricsEmphasisDropRow = RecyclerView.NO_POSITION;
+        lyricsEmphasisDropStart = 0f;
+        lyricsEmphasisProgress = 1f;
         karaoke.clear();
         rowKaraoke.clear();
         karaokeLine = Integer.MIN_VALUE;
@@ -3690,7 +3852,19 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         }
         final RecyclerView.ViewHolder holder = lyricsListView.findContainingViewHolder(child);
         final int row = holder == null ? RecyclerView.NO_POSITION : holder.getAdapterPosition();
-        final float focus = lyricsFocusOf(row);
+        final SyncedLyricsController.Line lyricLine = lineForLyricsRow(row);
+        // Resolved before the focus, because the focus is composed with it: a line whose own word
+        // is still being sung keeps a readable floor while the crossfade carries it away.
+        final boolean wordFrame = lyricsWordTimed && lyricLine != null && textView != null
+                && rowKaraoke.resolveRow(lyricLine, visibleLyrics.get(row), karaokeLine,
+                        karaokePositionMs, karaokeNextLineTimeMs);
+        // Only the line the crossfade is carrying AWAY needs protecting. The row the transition is
+        // arriving at is already heading to full focus on its own, and lifting it with a floor the
+        // instant its first word begins would be a step up rather than a rescue.
+        final boolean singing = wordFrame && visibleLyrics.get(row) == karaokeLine
+                && row != lyricsEmphasisToRow && rowKaraoke.wordEnd > rowKaraoke.wordStart;
+        final float focus = Math.max(lyricsFocusOf(row),
+                karaokeReadableFloor(singing, rowKaraoke.sweep));
         final float center = getLyricsFocusCenter();
         final float distance = Math.abs((child.getTop() + child.getBottom()) / 2f - center) / Math.max(1f, center);
         // Smoothstep rather than the raw distance: the falloff starts gently, so the lines either
@@ -3707,9 +3881,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         child.setScaleY(1f);
         if (textView == null) return;
         textView.setDepthBlur(lerp(depth * dp(KARAOKE_BLUR_MAX_DP), 0f, focus));
-        final SyncedLyricsController.Line lyricLine = lineForLyricsRow(row);
-        if (lyricsWordTimed && lyricLine != null && rowKaraoke.resolveRow(lyricLine, visibleLyrics.get(row),
-                karaokeLine, karaokePositionMs, karaokeNextLineTimeMs)) {
+        if (wordFrame) {
             // Word timing splits what used to be one colour into two: text the source has reached
             // takes the sung colour, text it has not stays muted, and the word being sung right now
             // is filled from the muted colour into the sung one by a clip travelling across its

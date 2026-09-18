@@ -1,4 +1,4 @@
-name: Build Telegram APK
+name: Build Telegram QA APK
 
 on:
   workflow_dispatch:
@@ -37,37 +37,89 @@ jobs:
       - name: Make Gradle executable
         run: chmod +x gradlew
 
-      # The afat flavour crossed with the release build type, which is the variant
-      # TMessagesProj_App/build.gradle already defines: minified, non-debuggable, and signed with
-      # signingConfigs.release - the keystore at TMessagesProj/config/release.keystore with the
-      # credentials already in gradle.properties. Nothing is generated or substituted here.
-      - name: Build release APK
-        run: ./gradlew :TMessagesProj_App:assembleAfatRelease --no-daemon
+      # The afat flavour crossed with the qaRelease build type. qaRelease is release in every
+      # respect - minified, non-debuggable, release proguard rules, release manifest, signed with
+      # signingConfigs.release (TMessagesProj/config/release.keystore) - with one difference:
+      # applicationIdSuffix ".beta", so it installs as org.telegram.messenger.beta.
+      #
+      # The plain release variant is deliberately NOT built here: its applicationId is
+      # org.telegram.messenger, the Google Play Telegram package, so installing it would replace
+      # the store app rather than update the test build.
+      - name: Build QA release APK
+        run: ./gradlew :TMessagesProj_App:assembleAfatQaRelease --no-daemon
 
       - name: Collect APK
         run: |
           mkdir -p apk
-          # The variant writes outputFileName = "app.apk" into its own output directory. Addressed
-          # explicitly rather than by a wildcard find, so this can never pick up some other
-          # variant's output and label it release.
-          RELEASE_APK=TMessagesProj_App/build/outputs/apk/afat/release/app.apk
-          if [ ! -f "$RELEASE_APK" ]; then
-            echo "Release APK not found at $RELEASE_APK"
+          QA_APK=TMessagesProj_App/build/outputs/apk/afat/qaRelease/app.apk
+          if [ ! -f "$QA_APK" ]; then
+            echo "QA release APK not found at $QA_APK"
             find TMessagesProj_App/build/outputs/apk -name '*.apk' -print
             exit 1
           fi
-          cp "$RELEASE_APK" apk/Telegram-Lyrics-Release.apk
+          cp "$QA_APK" apk/Telegram-Lyrics-QA-Release.apk
           ls -lh apk
 
-      # Proves the artifact is actually signed and therefore installable, rather than assuming it.
-      - name: Verify APK signature
+      # Everything below is asserted against the built file, not against the Gradle config, because
+      # the point of the whole change is what the APK actually declares.
+      - name: Verify package, debuggable flag and signature
         run: |
-          APKSIGNER="$ANDROID_HOME/build-tools/36.0.0/apksigner"
-          "$APKSIGNER" verify --verbose --print-certs apk/Telegram-Lyrics-Release.apk
-          "$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging apk/Telegram-Lyrics-Release.apk | head -5
+          set -eu
+          BT="$ANDROID_HOME/build-tools/36.0.0"
+          APK=apk/Telegram-Lyrics-QA-Release.apk
+          BADGING=$("$BT/aapt" dump badging "$APK")
+          echo "$BADGING" | head -5
+
+          PACKAGE=$(echo "$BADGING" | sed -n "s/^package: name='\([^']*\)'.*/\1/p")
+          echo "package: $PACKAGE"
+          if [ "$PACKAGE" != "org.telegram.messenger.beta" ]; then
+            echo "FAIL: expected org.telegram.messenger.beta, got '$PACKAGE'"
+            exit 1
+          fi
+          if [ "$PACKAGE" = "org.telegram.messenger" ]; then
+            echo "FAIL: this is the Google Play Telegram package"
+            exit 1
+          fi
+
+          if echo "$BADGING" | grep -q "application-debuggable"; then
+            echo "FAIL: the APK is debuggable"
+            exit 1
+          fi
+          echo "OK: not debuggable"
+
+          # R8 only writes a mapping file when minifyEnabled is on, so its presence is proof the
+          # variant was genuinely minified rather than a debug build wearing a release name.
+          MAPPING=TMessagesProj_App/build/outputs/mapping/afatQaRelease/mapping.txt
+          if [ ! -s "$MAPPING" ]; then
+            MAPPING=$(find TMessagesProj_App/build/outputs/mapping -name mapping.txt -print -quit || true)
+          fi
+          if [ -z "${MAPPING:-}" ] || [ ! -s "$MAPPING" ]; then
+            echo "FAIL: no R8 mapping file, so the variant was not minified"
+            find TMessagesProj_App/build/outputs/mapping -type f -print || true
+            exit 1
+          fi
+          echo "OK: minified ($MAPPING, $(wc -l < "$MAPPING") lines)"
+
+          "$BT/apksigner" verify --verbose --print-certs "$APK"
+
+          # The certificate has to be the repository keystore the existing test (debug) build is
+          # signed with, or Android will refuse the update rather than apply it.
+          APK_SHA=$("$BT/apksigner" verify --print-certs "$APK" \
+            | sed -n 's/.*SHA-256 digest: *//p' | head -1 | tr 'A-F' 'a-f')
+          KEYSTORE_SHA=$(keytool -list -v \
+            -keystore TMessagesProj/config/release.keystore \
+            -storepass android -alias androidkey \
+            | sed -n 's/.*SHA256: *//p' | head -1 | tr -d ':' | tr 'A-F' 'a-f')
+          echo "apk cert:      $APK_SHA"
+          echo "keystore cert: $KEYSTORE_SHA"
+          if [ -z "$APK_SHA" ] || [ "$APK_SHA" != "$KEYSTORE_SHA" ]; then
+            echo "FAIL: the APK is not signed with TMessagesProj/config/release.keystore"
+            exit 1
+          fi
+          echo "OK: signed with the repository release keystore - this updates the existing test app"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: Telegram-Android-Release
-          path: apk/Telegram-Lyrics-Release.apk
+          name: Telegram-Android-QA-Release
+          path: apk/Telegram-Lyrics-QA-Release.apk
