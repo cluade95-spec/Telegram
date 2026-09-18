@@ -33,6 +33,7 @@ import android.graphics.PorterDuffColorFilter;
 import android.graphics.PorterDuffXfermode;
 import android.graphics.RectF;
 import android.graphics.Shader;
+import android.graphics.Typeface;
 import android.graphics.drawable.BitmapDrawable;
 import android.graphics.drawable.Drawable;
 import android.net.Uri;
@@ -173,6 +174,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
     private RLottieImageView prevButton;
     private RLottieImageView nextButton;
     private ClippingTextViewSwitcher authorTextView;
+    private int activeLyricsLine = Integer.MIN_VALUE;
+    private int activeLyricsRow = RecyclerView.NO_POSITION;
     private ActionBarMenuItem optionsButton;
     private ImageView lyricsExpandButton;
     private boolean lyricsExpandShown;
@@ -2582,6 +2585,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 if (lyrics.kind == SyncedLyricsController.Kind.PLAIN || !TextUtils.isEmpty(lyrics.lines.get(i).text)) visibleLyrics.add(i);
             }
             updateLyricsPadding();
+            activeLyricsLine = Integer.MIN_VALUE;
+            activeLyricsRow = RecyclerView.NO_POSITION;
             resetKaraoke();
             lyricsAdapter.notifyDataSetChanged();
         }
@@ -2600,16 +2605,25 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             setShowingLyrics(true, animated);
         }
         final long position = SyncedLyricsController.positionMs(message);
-        final int index = lyrics.lineAt(position);
-        // Semantics first, camera second, both from the same real position. The line and word
-        // state is what the timestamps say right now; the camera then moves towards it and may
-        // lean ahead of it. Resolving them in this order means the repaints the camera triggers
-        // within this same tick already see the state this tick established, so nothing lights up
-        // a frame late - and, because the camera never writes semantics, nothing lights up early
-        // either. There is no cached "active line" to compare against: a seek, a pause or a track
-        // change recomputes from the position and can never be stale.
-        updateKaraoke(index, position);
+        int index = lyrics.lineAt(position);
+        // The visual follow is re-evaluated on every tick so pause, seek and track changes always
+        // recompute from the real playback position instead of from a stale schedule.
         updateLyricsFollow(true);
+        // Word highlighting is resolved from the same real position, every tick, so a seek or a
+        // pause lands exactly where the timestamps say it should instead of unwinding an animation.
+        updateKaraoke(index, position);
+        if (index == activeLyricsLine) return;
+        int oldRow = activeLyricsRow;
+        activeLyricsLine = index;
+        activeLyricsRow = RecyclerView.NO_POSITION;
+        for (int i = 0; i < visibleLyrics.size(); i++) {
+            if (visibleLyrics.get(i) == index) {
+                activeLyricsRow = i;
+                break;
+            }
+        }
+        // No notifyItemChanged here: the timestamp changes the LOGICAL active line only. The
+        // visual transition is already in flight from the pre-roll and owns the presentation.
     }
 
     private void setShowingLyrics(boolean show, boolean animated) {
@@ -2684,9 +2698,6 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         actionBarShadow.animate().alpha(fullscreen ? 1f : preFullscreenActionBarShadowAlpha).setDuration(220).setInterpolator(CubicBezierInterpolator.EASE_OUT_QUINT).start();
         setAllowNestedScroll(!fullscreen);
         applyFullscreenPlayerLayout(fullscreen);
-        // Fullscreen reads at a larger size, and size is bound per row, so the rows are rebound
-        // once here rather than measured at two sizes during the transition.
-        if (lyricsAdapter != null) lyricsAdapter.notifyDataSetChanged();
         updateLyricsGeometry();
         updateLyricsPadding();
         // Expand/collapse continuity: the same viewport slides to its new bounds instead of cutting.
@@ -3145,246 +3156,253 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         return getNormalPlayerHeight();
     }
 
-    // ---------------------------------------------------------------------------------------
-    // Large-player lyric motion.
-    //
-    // Three things are kept strictly apart, because conflating them is what made this feel like
-    // rows being advanced by machinery:
-    //
-    //   1. The CAMERA. One continuously running spring over a virtual scroll position. It is
-    //      retargeted on every playback tick against freshly measured geometry, so it is never a
-    //      chain of one-shot animations: a new target arriving while it is still moving is
-    //      absorbed with the velocity it already has. It is also the only thing allowed to
-    //      anticipate, easing toward the next line slightly before that line begins.
-    //
-    //   2. SEMANTIC state - which line is current, and how much of it has been sung. Derived from
-    //      the playback position on every tick and never from an animation, so a seek or a pause
-    //      reconstructs it exactly, and it changes at the time the source stated and nowhere
-    //      else. The camera moving early can never promote it.
-    //
-    //   3. APPEARANCE. Opacity, scale and depth follow the camera continuously, so they change
-    //      with the surface rather than in steps; colour follows the semantic state, so it changes
-    //      on the timestamp. Nothing here keeps animation state, so there is nothing to leave
-    //      behind, cancel, or let two animations fight over.
-    // ---------------------------------------------------------------------------------------
-
-    /** Where the current line settles: a little above the middle, so what is coming has room. */
-    private static final float LYRICS_FOCUS_FRACTION = 0.42f;
-    /** Distance, as a fraction of the focus height, over which a line fully recedes. */
-    private static final float LYRICS_DEPTH_SPAN = 1.15f;
-    /**
-     * How long before the next line the camera may start easing toward it, and how far it may
-     * lean. Camera only: the current line stays semantically current until its successor's own
-     * timestamp, so nothing lights up early merely because the surface is already moving.
-     */
-    private static final long LYRICS_CAMERA_LEAD_MS = 520;
-    private static final float LYRICS_CAMERA_ANTICIPATION = 0.55f;
-    /**
-     * Colour hand-over between two lines, measured from the incoming line's stated timestamp.
-     * Short enough that the change is unmistakable on the beat, long enough not to snap.
-     */
-    private static final long LYRICS_LINE_COLOR_MS = 260;
-    /**
-     * How much of its emphasis a line takes the instant its own time arrives, before the rest is
-     * eased. Same reasoning as {@link #LYRICS_WORD_FIRST_TOUCH}, and the same necessity: a line
-     * change is a genuine event, and the first word of the incoming line draws its colour, its
-     * lift and its bloom from this. Starting the hand-over from zero would make that first word
-     * arrive invisibly and only become perceptible a quarter of a second late.
-     */
-    private static final float LYRICS_LINE_FIRST_TOUCH = 0.55f;
-    /** What a line furthest from the focus keeps. Subordinate, never unreadable. */
-    private static final float LYRICS_REST_ALPHA = 0.42f;
-    private static final float LYRICS_REST_SCALE = 0.94f;
-    /**
-     * How much of the way to its sung colour a word is the instant its stated time arrives. A word
-     * 50ms ahead of the next one still has to register, so the change cannot all be in the easing.
-     */
-    private static final float LYRICS_WORD_FIRST_TOUCH = 0.45f;
-    /** The physical part of a word arriving: a small lift and a brief bloom, both decaying. */
-    private static final float LYRICS_WORD_LIFT_DP = 1.6f;
-    private static final float LYRICS_WORD_BLOOM_DP = 5f;
-    /**
-     * How long after a line's last <em>stated</em> time the quiet state has to wait when the source
-     * never said where that line stops - which is every line of ordinary line-synced lyrics, and
-     * every line of Enhanced LRC, whose word tags state starts only. The line may well still be
-     * being sung, so this is the benefit of the doubt: long enough that an ordinary gap between two
-     * lines never reads as an instrumental, and only a real break gets the state. A source that
-     * does state an end - TTML - waits none of it, because then it is not a guess.
-     */
-    private static final long LYRICS_QUIET_HOLD_MS = 4000;
-    /** How long entering and leaving the quiet state takes. Slow enough to read as a settling. */
-    private static final long LYRICS_QUIET_FADE_MS = 900;
-    /** What presence is worth at rest while quiet: the page recedes, it does not disappear. */
-    private static final float LYRICS_QUIET_PRESENCE = 0.55f;
-    /** How much of the active line's colour emphasis relaxes while quiet. */
-    private static final float LYRICS_QUIET_SEMANTIC = 0.55f;
-    /** Lyric typography. Large, one weight, chosen once so the metrics never move. */
-    private static final int LYRICS_TEXT_SIZE_DP = 22;
-    private static final int LYRICS_TEXT_SIZE_FULLSCREEN_DP = 26;
-    private static final float LYRICS_LINE_SPACING = 1.1f;
-
-    private int lyricsTextSizeDp() {
-        return fullscreenLyrics ? LYRICS_TEXT_SIZE_FULLSCREEN_DP : LYRICS_TEXT_SIZE_DP;
-    }
-
-    private SpringAnimation lyricsCameraSpring;
-    private final FloatValueHolder lyricsCameraHolder = new FloatValueHolder(0);
-    /** How much of the spring's virtual travel has already been handed to the list. */
-    private float lyricsCameraApplied;
-    private boolean lyricsCameraRunning;
-
-    /** Vertical position inside the viewport that the current line settles on. */
+    /** Vertical position inside the viewport that the active synced line settles on. */
     private int getLyricsFocusCenter() {
-        return Math.round(lyricsListView.getHeight() * LYRICS_FOCUS_FRACTION);
+        return lyricsListView.getHeight() / 2;
     }
 
-    private SpringAnimation lyricsCamera() {
-        if (lyricsCameraSpring == null) {
-            lyricsCameraSpring = new SpringAnimation(lyricsCameraHolder).setMinimumVisibleChange(0.5f);
-            // Critically damped, so a lyric is never overshot and pulled back; soft enough to feel
-            // carried rather than driven. One spring for the whole session - retargeting it is what
-            // preserves velocity, and a new spring per line is exactly what made this stutter.
-            lyricsCameraSpring.getSpring().setDampingRatio(1f).setStiffness(190f);
-            lyricsCameraSpring.addUpdateListener((animation, value, velocity) -> {
-                if (lyricsListView == null) return;
-                final int step = Math.round(value - lyricsCameraApplied);
-                if (step != 0) {
-                    lyricsCameraApplied += step;
-                    lyricsListView.scrollBy(0, step); // onScrolled repaints the appearance
-                } else {
-                    updateLyricsDepth();
-                }
-            });
-            lyricsCameraSpring.addEndListener((animation, canceled, value, velocity) -> lyricsCameraRunning = false);
-        }
-        return lyricsCameraSpring;
-    }
+    // ---------------------------------------------------------------------------------------
+    // Large-player synced follow. The compact player is the motion reference: it starts moving a
+    // little BEFORE the next timestamp and eases over that lead, so nothing ever snaps on the
+    // timestamp itself. The same philosophy is applied here to the lyrics list - one driven
+    // animation at a time, never a stack of competing SmoothScrollers - while the LOGICAL active
+    // line (emphasis, colour, tap-to-seek) still changes exactly at the real timestamp.
+    // ---------------------------------------------------------------------------------------
 
-    /**
-     * Drops the camera where it stands and forgets its travel. There is no half-finished
-     * emphasis to resolve, because appearance is a function of where things are, not of an
-     * animation that was in flight.
-     */
+    private static final long LYRIC_FOLLOW_LEAD_MAX = 440;
+    private static final long LYRIC_FOLLOW_MIN_MS = 160;
+    private static final long LYRIC_FOLLOW_MAX_MS = 900;
+
+    private ValueAnimator lyricsFollowAnimator;
+    private int lyricsFollowRow = RecyclerView.NO_POSITION;
+    // Visual transition state. Deliberately separate from activeLyricsLine/activeLyricsRow, which
+    // stay the LOGICAL state and still change exactly at the real timestamp.
+    private int lyricsEmphasisFromRow = RecyclerView.NO_POSITION;
+    private int lyricsEmphasisToRow = RecyclerView.NO_POSITION;
+    private float lyricsEmphasisProgress = 1f;
+    private final Runnable advanceLyricsFollow = () -> updateLyricsFollow(true);
+
     private void cancelLyricsFollow() {
-        if (lyricsCameraSpring != null) {
-            lyricsCameraSpring.cancel();
+        AndroidUtilities.cancelRunOnUIThread(advanceLyricsFollow);
+        cancelLyricsFollowAnimator();
+        lyricsFollowRow = RecyclerView.NO_POSITION;
+        // Never leave a line half-emphasised behind a cancelled transition: resolve onto whatever
+        // the logical state says is active right now.
+        setLyricsEmphasis(RecyclerView.NO_POSITION, activeLyricsRow, 1f);
+    }
+
+    /** Eases the current emphasis out to "no active lyric", used for an explicit timed blank. */
+    private void clearLyricsEmphasis() {
+        if (lyricsEmphasisToRow == RecyclerView.NO_POSITION && (lyricsFollowAnimator != null || lyricsEmphasisProgress >= 1f)) {
+            return; // already clearing, or already clear: the blank interval ticks many times
         }
-        lyricsCameraRunning = false;
-        lyricsCameraHolder.setValue(0);
-        lyricsCameraApplied = 0;
+        cancelLyricsFollowAnimator();
+        lyricsEmphasisFromRow = lyricsEmphasisToRow;
+        lyricsEmphasisToRow = RecyclerView.NO_POSITION;
+        lyricsEmphasisProgress = 0f;
+        final ValueAnimator animator = ValueAnimator.ofFloat(0f, 1f);
+        animator.addUpdateListener(a -> {
+            if (lyricsFollowAnimator != a) return;
+            lyricsEmphasisProgress = (float) a.getAnimatedValue();
+            updateLyricsDepth();
+        });
+        animator.addListener(new AnimatorListenerAdapter() {
+            @Override public void onAnimationEnd(Animator animation) {
+                if (lyricsFollowAnimator != animation) return;
+                lyricsFollowAnimator = null;
+                lyricsEmphasisProgress = 1f;
+                lyricsEmphasisFromRow = RecyclerView.NO_POSITION;
+                updateLyricsDepth();
+            }
+        });
+        animator.setDuration(LYRIC_FOLLOW_MIN_MS);
+        animator.setInterpolator(CubicBezierInterpolator.EASE_BOTH);
+        lyricsFollowAnimator = animator;
+        animator.start();
+    }
+
+    private void setLyricsEmphasis(int fromRow, int toRow, float progress) {
+        lyricsEmphasisFromRow = fromRow;
+        lyricsEmphasisToRow = toRow;
+        lyricsEmphasisProgress = progress;
         updateLyricsDepth();
     }
 
     /**
-     * Retargets the camera from the real playback position. Called on every progress tick, on
-     * every geometry change and whenever the surface appears; cheap enough for all of that, being
-     * one measurement and one spring retarget.
+     * 0 = fully inactive, 1 = fully active, blended while a transition is in flight.
+     *
+     * <p>The movement and the emphasis share one clock but not one curve: the surface eases in and
+     * out of its move, while the emphasis is eased out, so a line has most of its prominence by
+     * the time it arrives instead of finishing its colour after it has stopped moving. The curve is
+     * applied to the progress once and the two sides derived from it, so a crossfade stays
+     * complementary and the pair can never dip or overshoot in total brightness.
+     */
+    private float lyricsEmphasisOf(int row) {
+        if (row == RecyclerView.NO_POSITION) return 0f;
+        if (row != lyricsEmphasisToRow && row != lyricsEmphasisFromRow) return 0f;
+        final float eased = CubicBezierInterpolator.EASE_OUT.getInterpolation(
+                Math.max(0f, Math.min(1f, lyricsEmphasisProgress)));
+        return row == lyricsEmphasisToRow ? eased : 1f - eased;
+    }
+
+    /**
+     * Schedules and drives the visual follow. Mirrors the compact player's lead algorithm: the move
+     * toward the next line starts {@code lead} before its timestamp, where the lead is half the gap
+     * capped at the compact roll duration, so closely spaced lines flow continuously and widely
+     * spaced ones get a long, soft move.
      */
     private void updateLyricsFollow(boolean animated) {
+        AndroidUtilities.cancelRunOnUIThread(advanceLyricsFollow);
         if (dismissing || lyricsListView == null || !showingLyrics) return;
         if (currentLyrics == null || !currentLyrics.isSynced()) return;
         if (lyricsUserScrolling || lyricsPagerTracking || draggingSeekBar) return;
-        if (lyricsListView.getHeight() == 0) {
-            lyricsListView.post(() -> updateLyricsFollow(false));
-            return;
-        }
         final MessageObject message = MediaController.getInstance().getPlayingMessageObject();
         if (message == null) return;
         final long position = SyncedLyricsController.positionMs(message);
         final int line = currentLyrics.lineAt(position);
-        // This runs on geometry changes and on appearance as well as on the progress tick, and the
-        // position it reads is its own. Reconciling here means the camera and the semantics can
-        // never be looking at two different lines within one frame, whichever of them was entered
-        // first - and, because updateKaraoke() only ever derives state from the position it is
-        // given, doing it here costs a repaint and invents nothing.
-        if (line != karaokeLine) updateKaraoke(line, position);
-
-        int row = rowForLyricsLine(line);
-        if (row == RecyclerView.NO_POSITION) {
-            // Before the first lyric, or inside a timed blank, neither of which is a row. Keep the
-            // frame pointed at what is coming instead of inventing somewhere to be.
-            row = rowForLyricsLine(nextVisibleLyricLine(line));
-            if (row == RecyclerView.NO_POSITION) return;
-        }
-        final View child = lyricsLayoutManager.findViewByPosition(row);
-        if (child == null) {
-            // Outside the laid-out window: a first open or a long seek. Place it and let the camera
-            // carry on from there rather than travel the whole document.
-            cancelLyricsFollow();
-            lyricsLayoutManager.scrollToPositionWithOffset(row, Math.max(0, getLyricsFocusCenter() - dp(28)));
+        if (line >= 0 && line < currentLyrics.lines.size() && TextUtils.isEmpty(currentLyrics.lines.get(line).text)) {
+            // An explicit timed blank. Timed blanks are not rows, so there is nothing to follow:
+            // the visible active lyric clears and stays clear for the whole interval. Crucially we
+            // return before the pre-roll below, which would otherwise start promoting line + 1
+            // early. Only a real blank event lands here - line < 0 is "before the first lyric" and
+            // keeps its normal pre-roll into the first line.
+            lyricsFollowRow = RecyclerView.NO_POSITION;
+            clearLyricsEmphasis();
             return;
         }
-        float desired = (child.getTop() + child.getBottom()) / 2f;
-        final int nextLine = nextVisibleLyricLine(line);
-        final int nextRow = rowForLyricsLine(nextLine);
-        if (!MediaController.getInstance().isMessagePaused() && nextRow != RecyclerView.NO_POSITION && nextRow != row) {
-            final long until = currentLyrics.lines.get(nextLine).timeMs - position;
-            if (until > 0 && until <= LYRICS_CAMERA_LEAD_MS) {
-                final View nextChild = lyricsLayoutManager.findViewByPosition(nextRow);
-                if (nextChild != null) {
-                    final float lean = CubicBezierInterpolator.EASE_IN.getInterpolation(
-                            1f - until / (float) LYRICS_CAMERA_LEAD_MS) * LYRICS_CAMERA_ANTICIPATION;
-                    desired = lerp(desired, (nextChild.getTop() + nextChild.getBottom()) / 2f, lean);
+        int targetRow = rowForLyricsLine(line);
+        long duration = 0;
+        final boolean paused = MediaController.getInstance().isMessagePaused();
+        if (paused && lyricsFollowAnimator != null && lyricsFollowRow != targetRow) {
+            // Paused inside a pre-roll: stop short of the next line and hand the emphasis back to
+            // the line whose timestamp has actually passed.
+            cancelLyricsFollowAnimator();
+            lyricsFollowRow = targetRow;
+            setLyricsEmphasis(RecyclerView.NO_POSITION, targetRow, 1f);
+        }
+        if (!paused && line + 1 < currentLyrics.lines.size()) {
+            final long nextTime = currentLyrics.lines.get(line + 1).timeMs;
+            final long previousTime = line < 0 ? 0 : currentLyrics.lines.get(line).timeMs;
+            final long untilNext = nextTime - position;
+            final long gap = Math.max(1, nextTime - previousTime);
+            final long lead = Math.min(LYRIC_FOLLOW_LEAD_MAX, Math.max(80, gap / 2));
+            final int nextRow = rowForLyricsLine(line + 1);
+            if (untilNext <= lead) {
+                // Inside the lead window: move toward the next line now. A blank timestamp has no
+                // row, so nothing is visually promoted during the blank interval.
+                if (nextRow != RecyclerView.NO_POSITION) {
+                    targetRow = nextRow;
+                    duration = Math.max(80, Math.min(lead, untilNext));
                 }
-            }
-        }
-        final float delta = desired - getLyricsFocusCenter();
-        if (!animated) {
-            cancelLyricsFollow();
-            lyricsListView.scrollBy(0, Math.round(delta));
-            return;
-        }
-        // Every animated move goes through the spring, however far it has to travel. A row that is
-        // laid out is at most a screen or so from the focus, so the spring is never asked to cross
-        // the document - that case is the un-laid-out branch above, which places the row instead.
-        // There is deliberately no distance past which this snaps: resuming after a manual scroll
-        // is an animated move like any other, and it has to leave from where the finger left the
-        // list rather than teleport to the answer.
-        if (Math.abs(delta) < 0.5f && !lyricsCameraRunning) return;
-        lyricsCameraRunning = true;
-        lyricsCamera().animateToFinalPosition(lyricsCameraHolder.getValue() + delta);
-    }
-
-    /**
-     * The next line that actually occupies a row, skipping timed blanks, or -1.
-     *
-     * <p>{@link #visibleLyrics} holds line indices in ascending order and is only ever rebuilt
-     * wholesale, so this and {@link #rowForLyricsLine} search it rather than scan it. Both are on
-     * the per-row repaint path and on the per-tick camera path, where a linear scan of a long
-     * document would be paid for once per row per frame.
-     */
-    private int nextVisibleLyricLine(int line) {
-        int low = 0;
-        int high = visibleLyrics.size() - 1;
-        int found = -1;
-        while (low <= high) {
-            final int mid = (low + high) >>> 1;
-            final int value = visibleLyrics.get(mid);
-            if (value > line) {
-                found = value;
-                high = mid - 1;
             } else {
-                low = mid + 1;
+                AndroidUtilities.runOnUIThread(advanceLyricsFollow, untilNext - lead);
             }
         }
-        return found;
+        if (targetRow == RecyclerView.NO_POSITION) return;
+        scrollLyricsToRow(targetRow, animated, duration);
     }
 
     private int rowForLyricsLine(int line) {
         if (line < 0) return RecyclerView.NO_POSITION;
-        int low = 0;
-        int high = visibleLyrics.size() - 1;
-        while (low <= high) {
-            final int mid = (low + high) >>> 1;
-            final int value = visibleLyrics.get(mid);
-            if (value == line) return mid;
-            if (value < line) {
-                low = mid + 1;
-            } else {
-                high = mid - 1;
-            }
+        for (int i = 0; i < visibleLyrics.size(); i++) {
+            if (visibleLyrics.get(i) == line) return i;
         }
         return RecyclerView.NO_POSITION;
+    }
+
+    private void scrollLyricsToRow(int row, boolean animated, long preferredDuration) {
+        if (lyricsListView == null || row < 0 || row >= visibleLyrics.size()) return;
+        if (lyricsListView.getHeight() == 0) {
+            lyricsListView.post(() -> scrollLyricsToRow(row, false, 0));
+            return;
+        }
+        final View child = lyricsLayoutManager.findViewByPosition(row);
+        if (child == null) {
+            // Far away (first open, long seek): reach the destination immediately rather than
+            // crawling through the whole document, then let the next update ease from there.
+            cancelLyricsFollowAnimator();
+            lyricsLayoutManager.scrollToPositionWithOffset(row, Math.max(0, getLyricsFocusCenter() - dp(32)));
+            lyricsFollowRow = row;
+            // Resolve emphasis onto the destination too, so a long seek cannot leave the previous
+            // line emphasised or bold a row that is no longer current.
+            setLyricsEmphasis(RecyclerView.NO_POSITION, row, 1f);
+            return;
+        }
+        // scrollBy() takes the opposite sign convention: positive dy moves content up.
+        final int distance = (child.getTop() + child.getBottom()) / 2 - getLyricsFocusCenter();
+        if (!animated) {
+            cancelLyricsFollowAnimator();
+            lyricsListView.scrollBy(0, distance);
+            lyricsFollowRow = row;
+            setLyricsEmphasis(RecyclerView.NO_POSITION, row, 1f);
+            return;
+        }
+        // updateLyricsFollow() runs on every progress tick, so a move already easing toward this
+        // row must be left alone. Restarting it per tick is exactly what made the old
+        // implementation stutter: each restart reset the interpolator and the velocity.
+        if (lyricsFollowRow == row && (lyricsFollowAnimator != null || Math.abs(distance) <= dp(1))) {
+            return;
+        }
+        if (distance == 0 && lyricsEmphasisToRow == row && lyricsEmphasisProgress >= 1f) {
+            lyricsFollowRow = row;
+            return;
+        }
+        long duration = preferredDuration;
+        if (duration <= 0) {
+            // Distance-proportional, so a one-line step stays soft and a long seek stays responsive.
+            duration = Math.round(220 + Math.abs(distance) / AndroidUtilities.density * 0.9f);
+        }
+        duration = Math.max(LYRIC_FOLLOW_MIN_MS, Math.min(LYRIC_FOLLOW_MAX_MS, duration));
+        lyricsFollowRow = row;
+        cancelLyricsFollowAnimator();
+        // The incoming row's emphasis and the movement share this one clock, so the line gains
+        // prominence while it rises instead of popping into bold once the scroll has finished.
+        // Re-targeting the SAME row - a fullscreen expand/collapse, a viewport resize - only moves
+        // the surface; restarting the emphasis there would un-bold and re-bold the current line.
+        final boolean advancing = lyricsEmphasisToRow != row;
+        if (advancing) {
+            lyricsEmphasisFromRow = lyricsEmphasisToRow;
+            lyricsEmphasisToRow = row;
+            lyricsEmphasisProgress = 0f;
+        }
+        final int[] applied = {0};
+        final ValueAnimator animator = ValueAnimator.ofFloat(0f, 1f);
+        animator.addUpdateListener(a -> {
+            if (lyricsFollowAnimator != a) return;
+            final float fraction = (float) a.getAnimatedValue();
+            final int step = Math.round(distance * fraction);
+            final int delta = step - applied[0];
+            applied[0] = step;
+            if (advancing) lyricsEmphasisProgress = fraction;
+            if (delta != 0) {
+                lyricsListView.scrollBy(0, delta); // onScrolled repaints the emphasis
+            } else if (advancing) {
+                updateLyricsDepth();
+            }
+        });
+        animator.addListener(new AnimatorListenerAdapter() {
+            @Override public void onAnimationEnd(Animator animation) {
+                if (lyricsFollowAnimator != animation) return;
+                lyricsFollowAnimator = null;
+                if (advancing) {
+                    lyricsEmphasisProgress = 1f;
+                    lyricsEmphasisFromRow = RecyclerView.NO_POSITION;
+                    updateLyricsDepth();
+                }
+            }
+        });
+        animator.setDuration(duration);
+        // Same easing family as the compact lyric transition: soft in, soft out, no snap.
+        animator.setInterpolator(CubicBezierInterpolator.EASE_BOTH);
+        lyricsFollowAnimator = animator;
+        animator.start();
+    }
+
+    private void cancelLyricsFollowAnimator() {
+        if (lyricsFollowAnimator == null) return;
+        final ValueAnimator animator = lyricsFollowAnimator;
+        lyricsFollowAnimator = null;
+        animator.cancel();
     }
 
     private void updateLyricsDepth() {
@@ -3424,10 +3442,6 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
     private int karaokeRow = RecyclerView.NO_POSITION;
     private int paintedKaraokeEnd = -1;
     private boolean paintedKaraokeSettled;
-    /** {@link #lyricsQuiet()} for this tick. Resolved once and read by every row. */
-    private float lyricsQuietValue;
-    /** The hand-over already painted, so a moving one keeps repainting the rows it moves. */
-    private float paintedHandover = -1f;
 
     /**
      * Resolves the word state for the line the position is actually inside, and repaints what
@@ -3436,11 +3450,9 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
      * before its own stated time.
      */
     private void updateKaraoke(int line, long positionMs) {
-        final long nextLineTimeMs = currentLyrics != null && line >= 0 && line + 1 < currentLyrics.lines.size()
-                ? currentLyrics.lines.get(line + 1).timeMs : Long.MAX_VALUE;
         final boolean resolved = currentLyrics != null && currentLyrics.isSynced()
                 && line >= 0 && line < currentLyrics.lines.size()
-                && karaoke.resolve(currentLyrics.lines.get(line), positionMs, KARAOKE_TRANSITION_MS, nextLineTimeMs);
+                && karaoke.resolve(currentLyrics.lines.get(line), positionMs, KARAOKE_TRANSITION_MS);
         if (!resolved) karaoke.clear();
         karaokePositionMs = positionMs;
         final boolean lineChanged = line != karaokeLine;
@@ -3449,24 +3461,14 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         karaokeRow = resolved ? rowForLyricsLine(line) : RecyclerView.NO_POSITION;
         paintedKaraokeEnd = karaoke.sungEnd;
         paintedKaraokeSettled = karaoke.fadeProgress >= 1f;
-        // Two things besides the word range move the whole page rather than one row: the colour
-        // hand-over between two lines, which is still running for a moment after the line changed,
-        // and the quiet state entering or leaving a wordless stretch. Both are resolved once here,
-        // for the tick rather than for a row, and while either is moving every attached row is
-        // repainted; once both settle, that stops costing anything at all.
-        final float quiet = lyricsQuiet();
-        final float handover = lyricsLineHandover();
-        final boolean pageChanged = quiet != lyricsQuietValue || handover != paintedHandover;
-        lyricsQuietValue = quiet;
-        paintedHandover = handover;
-        if (lineChanged || pageChanged) {
+        if (lineChanged) {
             // Every attached row derives its own state from which side of the current line it is
             // on, so a line change - including a seek across several lines - repaints them all.
             updateLyricsDepth();
             return;
         }
-        // Within one line, and with the page settled, only that line can change: a settled range
-        // repaints nothing until the next one arrives, so a long word costs no work per tick.
+        // Within one line only that line can change: a settled range repaints nothing until the
+        // next one arrives, so a long word costs no work per tick.
         if (karaokeRow != RecyclerView.NO_POSITION && rangeChanged) {
             repaintLyricsRow(karaokeRow);
         }
@@ -3486,141 +3488,6 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         karaokeRow = RecyclerView.NO_POSITION;
         paintedKaraokeEnd = -1;
         paintedKaraokeSettled = false;
-        lyricsQuietValue = 0f;
-        paintedHandover = -1f;
-    }
-
-    /**
-     * Where a row sits between "the line being sung" and "somewhere else on the page", purely as a
-     * function of where the camera has put it. Continuous by construction: as the camera glides,
-     * every row's prominence glides with it, which is what removes the sense of rows being
-     * switched between states.
-     */
-    private float lyricsPresenceOf(View child) {
-        final float focus = Math.max(1f, getLyricsFocusCenter());
-        final float distance = Math.abs((child.getTop() + child.getBottom()) / 2f - focus)
-                / (focus * LYRICS_DEPTH_SPAN);
-        final float linear = Math.min(1f, distance);
-        // Smoothstep: the falloff starts gently, so the lines either side stay comfortably
-        // readable, and deepens further out, where being subordinate is the point.
-        return 1f - linear * linear * (3f - 2f * linear);
-    }
-
-    /**
-     * How far the hand-over between the previous line and the current one has run, measured from
-     * the current line's own stated timestamp. Position-derived, so a seek or a pause reconstructs
-     * it exactly, and it is 0 until that timestamp - never a moment before it.
-     *
-     * <p>At the timestamp itself it is already {@link #LYRICS_LINE_FIRST_TOUCH}, not zero, and
-     * eases the rest of the way from there: the arrival of a line is an event and has to look like
-     * one. It is still exactly complementary - what the incoming line takes, the outgoing line
-     * gives up in the same instant - so the pair never dips or overshoots in total brightness.
-     */
-    private float lyricsLineHandover() {
-        if (currentLyrics == null || karaokeLine < 0 || karaokeLine >= currentLyrics.lines.size()) return 1f;
-        final long since = karaokePositionMs - currentLyrics.lines.get(karaokeLine).timeMs;
-        if (since < 0) return 0f;
-        if (since >= LYRICS_LINE_COLOR_MS) return 1f;
-        return LYRICS_LINE_FIRST_TOUCH + (1f - LYRICS_LINE_FIRST_TOUCH)
-                * CubicBezierInterpolator.EASE_OUT.getInterpolation(since / (float) LYRICS_LINE_COLOR_MS);
-    }
-
-    /**
-     * 1 for the line the position is inside, falling to 0 for the one it has just left, 0 for
-     * everything else. This is the semantic half of the appearance and it changes on the stated
-     * timestamp, whatever the camera happens to be doing.
-     */
-    private float lyricsSemanticOf(int row) {
-        if (row == RecyclerView.NO_POSITION || currentLyrics == null) return 0f;
-        if (row < 0 || row >= visibleLyrics.size()) return 0f;
-        final int line = visibleLyrics.get(row);
-        if (line == karaokeLine) return lyricsLineHandover();
-        if (line == previousVisibleLyricLine()) return 1f - lyricsLineHandover();
-        return 0f;
-    }
-
-    /**
-     * How deep into a wordless stretch the track currently is, in 0..1.
-     *
-     * <p>Position-derived like everything else here, and bounded by times the source stated: the
-     * last thing the current line states, and the moment the next line says it begins. Nothing is
-     * inferred about the music itself - this is only "the lyrics say nothing is being sung right
-     * now", which is exactly what an intro, an instrumental break, a bridge and an outro have in
-     * common, and it is the whole of what this claims.
-     *
-     * <p>Where the source does not state an end, {@link #LYRICS_QUIET_HOLD_MS} is added before the
-     * state may begin, so a line that is still being sung is never treated as silence and an
-     * ordinary gap between two lines never reads as a break. A gap with no room left for the fade
-     * returns 0.
-     */
-    private float lyricsQuiet() {
-        if (currentLyrics == null || !currentLyrics.isSynced()) return 0f;
-        long from = 0;
-        // Whether the source itself says the singing has stopped at `from`, or whether that is
-        // only the last time it happened to state.
-        boolean stated = true;
-        if (karaokeLine >= 0 && karaokeLine < currentLyrics.lines.size()) {
-            final SyncedLyricsController.Line line = currentLyrics.lines.get(karaokeLine);
-            from = line.timeMs;
-            final SyncedLyricsController.Segments segments = line.segments;
-            if (segments != null) {
-                final int last = segments.size() - 1;
-                if (segments.hasEndTime(last)) {
-                    from = Math.max(from, segments.endTimeMs(last));
-                } else {
-                    from = Math.max(from, segments.startTimeMs(last));
-                    stated = false;
-                }
-            } else if (!TextUtils.isEmpty(line.text)) {
-                // An ordinary timed line. Its timestamp says when it starts and nothing else.
-                stated = false;
-            }
-            // A timed blank falls through with stated = true: a line the source timed and left
-            // empty is the source saying, in as many words, that nothing is sung from here.
-        }
-        final long start = from + (stated ? 0 : LYRICS_QUIET_HOLD_MS);
-        final int nextLine = nextVisibleLyricLine(karaokeLine);
-        final long until = nextLine >= 0 && nextLine < currentLyrics.lines.size()
-                ? currentLyrics.lines.get(nextLine).timeMs : Long.MAX_VALUE;
-        // Not enough room left for the state to mean anything. There is deliberately no threshold
-        // beyond this: a gap barely long enough dips a little and comes straight back, and a real
-        // break settles all the way, with nothing switching on at a particular number of seconds.
-        if (until != Long.MAX_VALUE && until - start < LYRICS_QUIET_FADE_MS) return 0f;
-        // Before the first lyric there is no emphasis to ease out of, so the lead-in begins quiet
-        // rather than settling into it. After the last one there is nothing left to come back for.
-        final float in = karaokeLine < 0 ? 1f
-                : clamp((karaokePositionMs - start) / (float) LYRICS_QUIET_FADE_MS);
-        final float out = until == Long.MAX_VALUE ? 1f
-                : clamp((until - karaokePositionMs) / (float) LYRICS_QUIET_FADE_MS);
-        return Math.min(in, out);
-    }
-
-    private static float clamp(float value) {
-        return value < 0f ? 0f : value > 1f ? 1f : value;
-    }
-
-    /**
-     * The last line before the current one that occupies a row, so a hand-over reaches across a
-     * run of timed blanks. Searched, not walked back: this is called for every row of every
-     * repaint, and a document that opens with a long instrumental would otherwise pay for the
-     * whole run each time.
-     */
-    private int previousVisibleLyricLine() {
-        if (currentLyrics == null || karaokeLine == Integer.MIN_VALUE) return -1;
-        int low = 0;
-        int high = visibleLyrics.size() - 1;
-        int found = -1;
-        while (low <= high) {
-            final int mid = (low + high) >>> 1;
-            final int value = visibleLyrics.get(mid);
-            if (value < karaokeLine) {
-                found = value;
-                low = mid + 1;
-            } else {
-                high = mid - 1;
-            }
-        }
-        return found;
     }
 
     private void applyLyricsDepth(View child) {
@@ -3634,19 +3501,20 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         }
         final RecyclerView.ViewHolder holder = lyricsListView.findContainingViewHolder(child);
         final int row = holder == null ? RecyclerView.NO_POSITION : holder.getAdapterPosition();
-        // Presence follows the camera, so it is continuous; colour follows the timestamp, so it is
-        // exact. Keeping them apart is what lets the surface start moving early without anything
-        // lighting up early.
-        // While nothing is being sung the page eases back rather than holding an emphasis that
-        // has stopped meaning anything: presence loses its ceiling and colour loses part of its
-        // separation, both easing out again over the moments before the next line's own time. The
-        // camera keeps its frame, so focus is restored to exactly where the next lyric will be,
-        // and no text is invented to fill the silence.
-        final float quiet = lyricsQuietValue;
-        final float presence = lyricsPresenceOf(child) * lerp(1f, LYRICS_QUIET_PRESENCE, quiet);
-        final float semantic = lyricsSemanticOf(row) * lerp(1f, 1f - LYRICS_QUIET_SEMANTIC, quiet);
-        child.setAlpha(lerp(LYRICS_REST_ALPHA, 1f, presence));
-        final float scale = lerp(LYRICS_REST_SCALE, 1f, presence);
+        // Emphasis is a continuous value driven by the same clock as the movement, applied straight
+        // to the attached view. Nothing is rebound, so the style can never pop after the scroll.
+        final float emphasis = lyricsEmphasisOf(row);
+        final float center = getLyricsFocusCenter();
+        final float distance = Math.abs((child.getTop() + child.getBottom()) / 2f - center) / Math.max(1f, center);
+        // Smoothstep rather than the raw distance: the falloff starts gently, so the lines either
+        // side of the active one stay comfortably readable, and deepens further out, where being
+        // subordinate is the point. Linear distance did the opposite of both.
+        final float linear = Math.min(1f, distance);
+        final float depth = linear * linear * (3f - 2f * linear);
+        final float restAlpha = 0.84f - depth * .46f;
+        final float restScale = 0.978f - depth * .03f;
+        child.setAlpha(lerp(restAlpha, 1f, emphasis));
+        final float scale = lerp(restScale, 1f, emphasis);
         child.setScaleX(scale);
         child.setScaleY(scale);
         if (child instanceof LyricsTextView) {
@@ -3654,40 +3522,35 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             final int inactiveColor = getThemedColor(Theme.key_player_time);
             final int activeColor = getThemedColor(Theme.key_player_actionBarTitle);
             final SyncedLyricsController.Line lyricLine = lineForLyricsRow(row);
-            final long nextLineTimeMs = karaokeLine >= 0 && karaokeLine + 1 < currentLyrics.lines.size()
-                    ? currentLyrics.lines.get(karaokeLine + 1).timeMs : Long.MAX_VALUE;
             if (lyricLine != null && rowKaraoke.resolveRow(lyricLine, visibleLyrics.get(row), karaokeLine,
-                    karaokePositionMs, KARAOKE_TRANSITION_MS, nextLineTimeMs)) {
+                    karaokePositionMs, KARAOKE_TRANSITION_MS)) {
                 // Word timing splits what used to be one colour into two: a range takes the active
                 // colour only once the time stated for it has passed, and what is still to come
                 // keeps a hint of it so the line still reads as the current one. A line already
-                // passed is wholly sung; a line the camera is bringing in early shows nothing lit
-                // until its own time.
-                final int sungColor = ColorUtils.blendARGB(inactiveColor, activeColor, semantic);
-                final int unsungColor = ColorUtils.blendARGB(inactiveColor, activeColor, semantic * KARAOKE_UNSUNG_EMPHASIS);
-                // A word has to be unmistakable the instant its time arrives, even when the next
-                // one is 50ms behind it, so its colour starts already part of the way there and
-                // the rest is eased. The lift and bloom decay from full at that same instant, which
-                // is what gives the arrival a physical edge rather than a slow tint. All of it is
-                // appearance: the boundary is the offset the source stated, and the window it runs
-                // in is bounded by stated times only.
-                final float arrived = LYRICS_WORD_FIRST_TOUCH + (1f - LYRICS_WORD_FIRST_TOUCH)
-                        * CubicBezierInterpolator.EASE_OUT.getInterpolation(clamp(rowKaraoke.fadeProgress));
-                final float impulse = (1f - clamp(rowKaraoke.fadeProgress)) * semantic;
+                // passed is wholly sung and fades out with the emphasis exactly as a whole-line
+                // highlight always did; a line the pre-roll is bringing in early shows nothing lit
+                // until its own time. Every other part of the line's prominence - alpha, scale,
+                // weight, movement - is untouched.
+                final int sungColor = ColorUtils.blendARGB(inactiveColor, activeColor, emphasis);
+                final int unsungColor = ColorUtils.blendARGB(inactiveColor, activeColor, emphasis * KARAOKE_UNSUNG_EMPHASIS);
+                // The range that has just begun eases into its colour instead of ramping linearly,
+                // so a word catches the light quickly and settles rather than sliding. Only the
+                // colour is eased: the boundary it applies to is the one the source stated, and
+                // KARAOKE_TRANSITION_MS cannot move it.
+                final float arrived = CubicBezierInterpolator.EASE_OUT.getInterpolation(
+                        Math.max(0f, Math.min(1f, rowKaraoke.fadeProgress)));
                 textView.setTextColor(unsungColor);
                 textView.applyKaraoke(rowKaraoke.fadeStart, rowKaraoke.sungEnd, sungColor,
-                        ColorUtils.blendARGB(unsungColor, sungColor, arrived),
-                        -dp(LYRICS_WORD_LIFT_DP) * impulse,
-                        dp(LYRICS_WORD_BLOOM_DP) * impulse, activeColor);
+                        ColorUtils.blendARGB(unsungColor, sungColor, arrived));
             } else {
                 textView.clearKaraoke();
-                textView.setTextColor(ColorUtils.blendARGB(inactiveColor, activeColor, semantic));
+                textView.setTextColor(ColorUtils.blendARGB(inactiveColor, activeColor, emphasis));
             }
-            // Emphasis is carried by colour, opacity, scale and a draw-time lift alone. Weight is
-            // deliberately not part of it: a typeface is metric-affecting, so switching it
-            // re-measures the row, can re-wrap a long line into a different height and move every
-            // row below it, and it can only ever cross over at one point rather than interpolate.
-            // The lyric typeface is therefore chosen once, at bind, and never changes again.
+            // Emphasis is carried by colour, opacity and scale alone. Weight is deliberately not
+            // part of it: a typeface is metric-affecting, so switching it re-measures the row, can
+            // re-wrap a long line into a different height and move every row below it, and it can
+            // only ever cross over at one point rather than interpolate. Scale is a draw-time
+            // transform, so it expresses the same hierarchy continuously and never reflows text.
         }
     }
 
@@ -3712,10 +3575,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             top = dp(fullscreenLyrics ? 12 : LYRICS_EXPAND_INSET);
             bottom = dp(24);
         } else {
-            // Enough padding either side that the first and the last line can both reach the
-            // focus point, which is no longer the middle of the viewport.
-            top = Math.max(0, getLyricsFocusCenter() - dp(28));
-            bottom = Math.max(0, lyricsListView.getHeight() - getLyricsFocusCenter() - dp(28));
+            top = bottom = Math.max(0, getLyricsFocusCenter() - dp(32));
         }
         if (lyricsListView.getPaddingTop() != top || lyricsListView.getPaddingBottom() != bottom) {
             lyricsListView.setPadding(0, top, 0, bottom);
@@ -3833,9 +3693,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             String author = messageObject.getMusicAuthor();
             titleTextView.setText(title);
             authorTextView.setText(author);
-            // A different track carries different timing: drop the word state rather than let
-            // the first tick of the new song inherit the last word of the old one.
-            if (!sameMessageObject) resetKaraoke();
+            activeLyricsLine = Integer.MIN_VALUE;
             updateLyrics(!sameMessageObject);
 
             final MessagesController.SavedMusicIds musicIds = MessagesController.getInstance(currentAccount).getSavedMusicIds();
@@ -4000,8 +3858,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
          * always on a character boundary; {@link #clusterEnd} then keeps them off the inside of a
          * grapheme cluster as well.
          */
-        void applyKaraoke(int arrivingStart, int sungEnd, int sungColor, int arrivingColor,
-                          float arrivingLift, float arrivingBloom, int bloomColor) {
+        void applyKaraoke(int arrivingStart, int sungEnd, int sungColor, int arrivingColor) {
             if (karaokeText == null) return;
             boolean changed = false;
             // A settled line is repainted for its colours alone on every emphasis frame, and the
@@ -4021,7 +3878,6 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             }
             changed |= sungSpan.setColor(sungColor);
             changed |= arrivingSpan.setColor(arrivingColor);
-            changed |= arrivingSpan.setMotion(arrivingLift, arrivingBloom, bloomColor);
             // SpannableString does not report span changes to a SpanWatcher, and a colour changed
             // in place is not a change the text could report anyway, so every repaint here is this
             // one. It is also the reason nothing in this class can trigger a re-measure.
@@ -4122,9 +3978,6 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
      */
     private static final class KaraokeSpan extends CharacterStyle implements UpdateAppearance {
         private int color;
-        private float lift;
-        private float bloom;
-        private int bloomColor;
 
         boolean setColor(int value) {
             if (color == value) return false;
@@ -4132,27 +3985,9 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             return true;
         }
 
-        /**
-         * The physical half of a word arriving: a lift and a bloom, both of which decay to nothing
-         * as the word settles. Neither can move anything - baselineShift set here applies at draw,
-         * after the line has already been laid out, and a shadow layer is paint state - so a word
-         * can rise and glow without a single character changing position.
-         */
-        boolean setMotion(float liftPx, float bloomPx, int color) {
-            if (lift == liftPx && bloom == bloomPx && bloomColor == color) return false;
-            lift = liftPx;
-            bloom = bloomPx;
-            bloomColor = color;
-            return true;
-        }
-
         @Override
         public void updateDrawState(TextPaint paint) {
             paint.setColor(color);
-            paint.baselineShift += Math.round(lift);
-            if (bloom > 0.5f) {
-                paint.setShadowLayer(bloom, 0, 0, bloomColor);
-            }
         }
     }
 
@@ -4182,13 +4017,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             textView.setLayoutParams(new RecyclerView.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
             textView.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
             textView.setTextDirection(View.TEXT_DIRECTION_FIRST_STRONG);
-            // The lyric weight is decided once, here, and never changes again. It is the app's own
-            // bold - the same face the player title uses - because lyrics are the content of this
-            // screen rather than a list of settings, and because a weight that never changes is a
-            // row height that never changes.
-            textView.setTypeface(AndroidUtilities.bold());
-            textView.setLineSpacing(0, LYRICS_LINE_SPACING);
-            textView.setPadding(dp(22), dp(11), dp(22), dp(11));
+            textView.setPadding(dp(24), dp(12), dp(24), dp(12));
+            textView.setMinHeight(dp(56));
             textView.setBackground(Theme.createSelectorDrawable(getThemedColor(Theme.key_listSelector), 2));
             return new RecyclerListView.Holder(textView);
         }
@@ -4204,22 +4034,17 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             textView.setLyricText(lyricLine.text, synced && lyricLine.segments != null);
             boolean stanzaSpace = !synced && TextUtils.isEmpty(lyricLine.text);
             // Identical viewport, typography, sizes, spacing and margins for timed and untimed
-            // lyrics; only the timed visual hierarchy is synced-only. The size is the one thing
-            // that differs between the normal sheet and fullscreen, and it is applied at bind so a
-            // mode change re-measures every row once rather than mid-transition.
-            textView.setMinHeight(dp(stanzaSpace ? 20 : 48));
-            textView.setPadding(dp(22), dp(stanzaSpace ? 0 : 11), dp(22), dp(stanzaSpace ? 0 : 11));
-            textView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, lyricsTextSizeDp());
+            // lyrics; only the timed visual hierarchy is synced-only.
+            textView.setMinHeight(dp(stanzaSpace ? 24 : 56));
+            textView.setPadding(dp(24), dp(stanzaSpace ? 0 : 12), dp(24), dp(stanzaSpace ? 0 : 12));
+            textView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16);
+            // Timed rows get their emphasis from applyLyricsDepth(), which runs on attach and on
+            // every frame of the transition; binding it here as well would reintroduce the pop.
             if (synced) {
-                // A rebind resets the row to the plain colour, and a rebind of a row that is
-                // already attached fires neither the attach listener nor onScrolled - so a
-                // notifyDataSetChanged() (a theme change, a fullscreen size change) would leave
-                // the current line grey until the next word boundary. Painting the current state
-                // back on here closes that, and the attach listener still corrects the geometric
-                // half a moment later for a row that has not been positioned yet.
+                textView.setTypeface(Typeface.DEFAULT);
                 textView.setTextColor(getThemedColor(Theme.key_player_time));
-                applyLyricsDepth(textView);
             } else {
+                textView.setTypeface(Typeface.DEFAULT);
                 textView.setTextColor(getThemedColor(Theme.key_player_actionBarTitle));
                 textView.setAlpha(1f);
                 textView.setScaleX(1f);
@@ -4498,10 +4323,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             optionsButton.setPopupItemsColor(getThemedColor(Theme.key_actionBarDefaultSubmenuItem), true);
             optionsButton.redrawPopup(getThemedColor(Theme.key_actionBarDefaultSubmenuBackground));
             if (lyricsAdapter != null) lyricsAdapter.notifyDataSetChanged();
-            // notifyDataSetChanged() rebinds every row back to the plain theme colour, so the
-            // word state has to be re-resolved from scratch for the new palette to be painted on
-            // top of it instead of waiting for the next word boundary.
-            resetKaraoke();
+            activeLyricsLine = Integer.MIN_VALUE;
             updateLyrics(false);
         };
 
