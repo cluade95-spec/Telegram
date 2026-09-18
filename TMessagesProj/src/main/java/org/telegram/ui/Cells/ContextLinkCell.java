@@ -718,7 +718,8 @@ public class ContextLinkCell extends FrameLayout implements DownloadController.F
     private void didPressedButton() {
         if (documentAttachType == DOCUMENT_ATTACH_TYPE_AUDIO || documentAttachType == DOCUMENT_ATTACH_TYPE_MUSIC) {
             if (buttonState == 0) {
-                if (MediaController.getInstance().playMessage(currentMessageObject)) {
+                // An inline result stands alone too; for voice this is playMessage unchanged.
+                if (MediaController.getInstance().playStandaloneMessage(currentMessageObject)) {
                     buttonState = 1;
                     radialProgress.setIcon(getIconForCurrentState(), false, true);
                     invalidate();

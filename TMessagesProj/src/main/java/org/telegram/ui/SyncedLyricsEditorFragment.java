@@ -51,6 +51,7 @@ import org.telegram.ui.ActionBar.BaseFragment;
 import org.telegram.ui.ActionBar.Theme;
 import org.telegram.ui.ActionBar.ThemeDescription;
 import org.telegram.ui.Cells.RadioColorCell;
+import org.telegram.ui.Components.BulletinFactory;
 import org.telegram.ui.Components.EditTextBoldCursor;
 import org.telegram.ui.Components.AudioPlayerAlert;
 import org.telegram.ui.Components.LayoutHelper;
@@ -85,7 +86,12 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
      * and {@code .txt} was always accepted for plain lyrics. All three are read by the same parser,
      * which decides what the contents actually are.
      */
-    private static final String[] IMPORT_EXTENSIONS = {".lrc", ".elrc", ".txt"};
+    // .ttml joins the three that were already here because the editor can now genuinely hold a
+    // TTML document: the parser reads the dialect, the online search can return one, and Save
+    // persists it verbatim. Nothing else about import changes - same picker, same name check,
+    // same size limit, same strict UTF-8 decode, and the same parser deciding afterwards
+    // whether what arrived is usable.
+    private static final String[] IMPORT_EXTENSIONS = {".lrc", ".elrc", ".txt", ".ttml"};
 
     private final MessageObject messageObject;
     private LyricsEditText editText;
@@ -836,7 +842,7 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
         onlineProgressDialog = progress;
 
         final LyricsOnlineSearch.Request[] started = new LyricsOnlineSearch.Request[1];
-        started[0] = LyricsOnlineSearch.search(searchArtist, searchTitle, messageObject.getDuration(), type, (lyrics, error) -> {
+        started[0] = LyricsOnlineSearch.search(searchArtist, searchTitle, messageObject.getDuration(), type, (lyrics, resolved, error) -> {
             // Only the search that still owns the editor may act. A cancelled request never calls
             // back at all; this also rejects a result whose search has been superseded.
             if (started[0] == null || onlineRequest != started[0]) return;
@@ -851,6 +857,13 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
             consumePendingControllerRefresh();
             if (lyrics != null) {
                 applyOnlineLyrics(lyrics);
+                // A karaoke search that no word-timing source could answer still returns something
+                // useful, but it is line timing and the user is told so rather than left to
+                // discover it when nothing lights up word by word.
+                if (resolved != type) {
+                    BulletinFactory.of(this).createSimpleBulletin(R.raw.info,
+                            LocaleController.getString(R.string.LyricsOnlineSearchLineSyncOnly), 3).show();
+                }
             } else {
                 showError(onlineSearchErrorMessage(error));
             }

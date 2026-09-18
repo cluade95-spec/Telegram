@@ -5,14 +5,18 @@
 package org.telegram.messenger;
 
 import android.text.TextUtils;
+import android.util.Xml;
 
 import org.telegram.tgnet.TLRPC;
 import org.telegram.messenger.audioinfo.AudioInfo;
+
+import org.xmlpull.v1.XmlPullParser;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
+import java.io.StringReader;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -107,11 +111,19 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
         private final int[] startOffsets;
         private final int[] endOffsets;
         private final long[] startTimes;
+        /**
+         * Stated end times, or null when the format cannot state them. Enhanced LRC states starts
+         * only, so it is always null there; TTML can state an end per span, and where it does the
+         * value is kept. An individual entry is -1 when that one segment stated no end. Nothing
+         * here is ever filled in from a neighbour or a duration.
+         */
+        private final long[] endTimes;
 
-        private Segments(int[] startOffsets, int[] endOffsets, long[] startTimes) {
+        private Segments(int[] startOffsets, int[] endOffsets, long[] startTimes, long[] endTimes) {
             this.startOffsets = startOffsets;
             this.endOffsets = endOffsets;
             this.startTimes = startTimes;
+            this.endTimes = endTimes;
         }
 
         public int size() {
@@ -131,6 +143,20 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
         /** Absolute start, in the same timebase as {@link Line#timeMs}. Stated by the source. */
         public long startTimeMs(int index) {
             return startTimes[index];
+        }
+
+        /** True when the source stated an end time for this segment. Never inferred. */
+        public boolean hasEndTime(int index) {
+            return endTimes != null && endTimes[index] >= 0;
+        }
+
+        /**
+         * The stated end of this segment, valid only where {@link #hasEndTime} is true. It is the
+         * one thing a consumer may use to know how long a word was held, because it is the only
+         * one the source said.
+         */
+        public long endTimeMs(int index) {
+            return endTimes[index];
         }
 
         /**
@@ -217,12 +243,19 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
          * lasts and not a position within it. The boundaries above never depend on it.
          */
         public float fadeProgress;
+        /**
+         * The time the source said this word is held until, or -1 when it said nothing. Enhanced
+         * LRC always leaves this at -1; TTML sets it where a span stated an end. It is never
+         * derived from the next word, from the line, or from a duration.
+         */
+        public long heldUntilMs;
 
         public void clear() {
             active = false;
             sungEnd = 0;
             fadeStart = 0;
             fadeProgress = 1f;
+            heldUntilMs = -1;
         }
 
         /**
@@ -237,10 +270,14 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
          * signal to render it exactly the way it was rendered before word timing existed.
          */
         public boolean resolveRow(Line line, int lineIndex, int currentLine, long positionMs, long transitionMs) {
+            return resolveRow(line, lineIndex, currentLine, positionMs, transitionMs, Long.MAX_VALUE);
+        }
+
+        public boolean resolveRow(Line line, int lineIndex, int currentLine, long positionMs, long transitionMs, long nextLineTimeMs) {
             clear();
             if (line == null || line.segments == null || line.text.isEmpty()) return false;
             if (lineIndex == currentLine) {
-                if (resolve(line, positionMs, transitionMs)) return true;
+                if (resolve(line, positionMs, transitionMs, nextLineTimeMs)) return true;
                 clear(); // the line's own timestamp has not been reached, so nothing has happened
             } else if (lineIndex < currentLine) {
                 // Already left behind: every range it states has started, so all of it is sung.
@@ -262,6 +299,16 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
          * expected to fall back to line-level behaviour rather than invent anything.
          */
         public boolean resolve(Line line, long positionMs, long transitionMs) {
+            return resolve(line, positionMs, transitionMs, Long.MAX_VALUE);
+        }
+
+        /**
+         * @param nextLineTimeMs the stated start of the line after this one, or
+         *                       {@link Long#MAX_VALUE} when there is none. It bounds the last
+         *                       word's transition, which is the difference between a final word
+         *                       being seen and being swallowed by the line change.
+         */
+        public boolean resolve(Line line, long positionMs, long transitionMs, long nextLineTimeMs) {
             clear();
             if (line == null || line.segments == null || line.text.isEmpty()) return false;
             if (!line.timed || positionMs < line.timeMs) return false;
@@ -277,15 +324,25 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
             }
             fadeStart = segments.startOffset(index);
             sungEnd = segments.endOffset(index);
+            final long start = segments.startTimeMs(index);
+            // Every bound below is a time the source stated. The transition is never allowed to
+            // outlive the thing it is announcing, which is what made a quick final word arrive too
+            // late to be seen: it still had most of its transition to run when the line changed.
             long window = transitionMs;
             if (index + 1 < segments.size()) {
-                // Bounded by the real gap between two stated starts, so the transition is always
-                // finished before the next segment begins. Closely spaced syllables therefore
-                // arrive crisply instead of overlapping - and the bound comes from stated times,
-                // never from a guess at how long a word lasts.
-                window = Math.min(window, segments.startTimeMs(index + 1) - segments.startTimeMs(index));
+                // The real gap to the next stated start: closely spaced syllables arrive crisply
+                // instead of overlapping.
+                window = Math.min(window, segments.startTimeMs(index + 1) - start);
+            } else if (nextLineTimeMs != Long.MAX_VALUE) {
+                // The last word of a line is bounded by when the line itself ends.
+                window = Math.min(window, nextLineTimeMs - start);
             }
-            final long elapsed = positionMs - segments.startTimeMs(index);
+            if (segments.hasEndTime(index)) {
+                // A format that states how long the word was held bounds it by that, too.
+                window = Math.min(window, segments.endTimeMs(index) - start);
+            }
+            heldUntilMs = segments.hasEndTime(index) ? segments.endTimeMs(index) : -1;
+            final long elapsed = positionMs - start;
             fadeProgress = window <= 0 ? 1f : Math.max(0f, Math.min(1f, elapsed / (float) window));
             active = true;
             return true;
@@ -360,8 +417,315 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
         lyricsModePreferred = preferred;
     }
 
+    /**
+     * Turns captured lines into the final model, and is deliberately the only place that does:
+     * both the LRC and the TTML front ends hand their lines here, so ordering, the merging of
+     * lines that share a timestamp, and every timing-integrity rule in {@link #qualify} apply
+     * identically whichever format the source was written in.
+     */
+    // region ttml
+
+    /**
+     * TTML, the one lyric format in use that can state where a word <em>ends</em> as well as where
+     * it starts. Parsed into exactly the same model as LRC and put through exactly the same timing
+     * validation: the only difference that reaches a consumer is that a segment may now carry a
+     * genuine end time, and only where the document stated one.
+     *
+     * <p>The dialect is the AMLL TTML specification, which is Apple's word-timed TTML with an
+     * {@code amll:} metadata block: {@code <body>} holds {@code <div>} blocks, which hold
+     * {@code <p begin end>} lines, which hold {@code <span begin end>} words or syllables.
+     * {@code ttm:role} marks content that is not the line being sung - a translation, a
+     * romanisation, or background vocals - and those subtrees are skipped whole rather than
+     * interleaved into the text.
+     */
+    private static final String TTML_METADATA_NS = "http://www.w3.org/ns/ttml#metadata";
+
+    /**
+     * True when this source is a TTML document rather than lyrics text. Only an XML declaration,
+     * a comment, a doctype or whitespace may precede the root, and the root must be {@code tt}, so
+     * an Enhanced LRC line that happens to start with an inline tag cannot be mistaken for one.
+     */
+    private static boolean looksLikeTtml(String source) {
+        final int limit = Math.min(source.length(), 8192);
+        int a = 0;
+        while (a < limit) {
+            final char c = source.charAt(a);
+            if (Character.isWhitespace(c) || c == '﻿') {
+                a++;
+                continue;
+            }
+            if (c != '<') return false;
+            if (source.startsWith("<?", a)) {
+                final int end = source.indexOf("?>", a);
+                if (end < 0) return false;
+                a = end + 2;
+                continue;
+            }
+            if (source.startsWith("<!--", a)) {
+                final int end = source.indexOf("-->", a);
+                if (end < 0) return false;
+                a = end + 3;
+                continue;
+            }
+            if (source.startsWith("<!", a)) {
+                final int end = source.indexOf('>', a);
+                if (end < 0) return false;
+                a = end + 1;
+                continue;
+            }
+            if (!source.startsWith("<tt", a)) return false;
+            final int after = a + 3;
+            return after >= source.length() || source.charAt(after) == '>' || source.charAt(after) == '/'
+                    || Character.isWhitespace(source.charAt(after));
+        }
+        return false;
+    }
+
+    /**
+     * Reads a TTML document into timed lines. A document that cannot be read at all, or that
+     * carries no usable line, comes back {@link Kind#MALFORMED} with its source intact, exactly as
+     * a broken LRC document does - the text is never discarded and never rewritten.
+     */
+    private static Lyrics parseTtml(String source) {
+        final ArrayList<ParsedLine> parsed = new ArrayList<>();
+        try {
+            final XmlPullParser parser = Xml.newPullParser();
+            parser.setFeature(XmlPullParser.FEATURE_PROCESS_NAMESPACES, true);
+            parser.setInput(new StringReader(source));
+            int order = 0;
+            boolean inBody = false;
+            // Per-line state, live only between <p> and </p>.
+            boolean inLine = false;
+            long lineTimeMs = -1;
+            final StringBuilder text = new StringBuilder();
+            final boolean[] pendingSpace = new boolean[1];
+            int[] offsets = new int[16];
+            long[] times = new long[16];
+            long[] ends = new long[16];
+            int count = 0;
+            boolean malformed = false;
+            int skipDepth = -1;
+            int timedDepth = -1;
+            int event = parser.getEventType();
+            while (event != XmlPullParser.END_DOCUMENT) {
+                if (parsed.size() > MAX_EMBEDDED_LYRICS_LINES) return malformedTtml(source);
+                if (event == XmlPullParser.START_TAG) {
+                    final String name = parser.getName();
+                    if (skipDepth >= 0) {
+                        event = parser.next();
+                        continue;
+                    }
+                    if ("body".equals(name)) {
+                        inBody = true;
+                    } else if (inBody && "p".equals(name)) {
+                        inLine = true;
+                        lineTimeMs = parseTtmlTime(parser.getAttributeValue(null, "begin"));
+                        text.setLength(0);
+                        pendingSpace[0] = false;
+                        count = 0;
+                        malformed = false;
+                        timedDepth = -1;
+                    } else if (inLine && "span".equals(name)) {
+                        final String role = parser.getAttributeValue(TTML_METADATA_NS, "role");
+                        if (isNonLyricRole(role)) {
+                            // A translation, a romanisation or a background part: not this line.
+                            skipDepth = parser.getDepth();
+                        } else if (timedDepth < 0) {
+                            final String beginText = parser.getAttributeValue(null, "begin");
+                            final long begin = parseTtmlTime(beginText);
+                            if (beginText != null && begin < 0) {
+                                // A span that claims a time it cannot state is exactly the case an
+                                // impossible inline LRC tag covers: nothing on this line is
+                                // trusted, rather than trusting whichever spans happened to parse.
+                                // A span with no begin at all is different - that is ordinary
+                                // untimed text, and it stays untimed.
+                                malformed = true;
+                            }
+                            if (begin >= 0) {
+                                // Only the outermost timed span of a nest becomes a segment, so a
+                                // parent and its child can never both claim the same text.
+                                timedDepth = parser.getDepth();
+                                if (pendingSpace[0] && text.length() > 0) {
+                                    text.append(' ');
+                                    pendingSpace[0] = false;
+                                }
+                                if (count == offsets.length) {
+                                    offsets = Arrays.copyOf(offsets, count * 2);
+                                    times = Arrays.copyOf(times, count * 2);
+                                    ends = Arrays.copyOf(ends, count * 2);
+                                }
+                                offsets[count] = text.length();
+                                times[count] = begin;
+                                ends[count] = parseTtmlTime(parser.getAttributeValue(null, "end"));
+                                count++;
+                            }
+                        }
+                    }
+                } else if (event == XmlPullParser.TEXT) {
+                    if (skipDepth < 0 && inLine) {
+                        appendTtmlText(text, parser.getText(), pendingSpace);
+                    }
+                } else if (event == XmlPullParser.END_TAG) {
+                    final String name = parser.getName();
+                    if (skipDepth >= 0) {
+                        if (parser.getDepth() <= skipDepth) skipDepth = -1;
+                    } else if (inLine && "span".equals(name)) {
+                        if (timedDepth >= 0 && parser.getDepth() <= timedDepth) timedDepth = -1;
+                    } else if (inLine && "p".equals(name)) {
+                        inLine = false;
+                        final int begin = trimStart(text);
+                        final String lineText = text.substring(begin, trimEnd(text, begin));
+                        if (lineTimeMs >= 0) {
+                            long startTimeMs = lineTimeMs;
+                            Candidate candidate = null;
+                            if (count > 0) {
+                                final int[] rebased = Arrays.copyOf(offsets, count);
+                                for (int a = 0; a < count; a++) {
+                                    rebased[a] = Math.max(0, Math.min(lineText.length(), rebased[a] - begin));
+                                }
+                                candidate = new Candidate(rebased, Arrays.copyOf(times, count),
+                                        Arrays.copyOf(ends, count), count, malformed);
+                                // A word cannot start before the line that contains it. Where the
+                                // document disagrees with itself the line takes the earlier of the
+                                // two times it stated, rather than losing its word timing.
+                                startTimeMs = Math.min(startTimeMs, times[0]);
+                            }
+                            parsed.add(new ParsedLine(startTimeMs, lineText, candidate, order++));
+                        }
+                    } else if ("body".equals(name)) {
+                        inBody = false;
+                    }
+                }
+                event = parser.next();
+            }
+        } catch (Throwable e) {
+            return malformedTtml(source);
+        }
+        if (parsed.isEmpty()) return malformedTtml(source);
+        final ArrayList<Line> result = assemble(parsed);
+        if (result.isEmpty()) return malformedTtml(source);
+        return new Lyrics(result, source, Kind.SYNCED, Source.NONE);
+    }
+
+    private static Lyrics malformedTtml(String source) {
+        return new Lyrics(Collections.emptyList(), source, Kind.MALFORMED, Source.NONE);
+    }
+
+    /** Roles that mark content which is not the line being sung. */
+    private static boolean isNonLyricRole(String role) {
+        return "x-translation".equals(role) || "x-roman".equals(role) || "x-bg".equals(role);
+    }
+
+    /**
+     * Appends document text, collapsing every run of whitespace to one space. TTML is usually
+     * pretty-printed, so the indentation between two spans is markup rather than lyric text; left
+     * alone it would put newlines inside a line and shift every offset after it.
+     */
+    private static void appendTtmlText(StringBuilder text, String chunk, boolean[] pendingSpace) {
+        if (chunk == null) return;
+        for (int a = 0; a < chunk.length(); a++) {
+            final char c = chunk.charAt(a);
+            if (Character.isWhitespace(c)) {
+                pendingSpace[0] = text.length() > 0;
+                continue;
+            }
+            if (pendingSpace[0]) {
+                text.append(' ');
+                pendingSpace[0] = false;
+            }
+            text.append(c);
+        }
+    }
+
+    private static int trimStart(StringBuilder text) {
+        int begin = 0;
+        while (begin < text.length() && text.charAt(begin) <= ' ') begin++;
+        return begin;
+    }
+
+    private static int trimEnd(StringBuilder text, int begin) {
+        int last = text.length();
+        while (last > begin && text.charAt(last - 1) <= ' ') last--;
+        return last;
+    }
+
+    /**
+     * Parses a TTML time expression into milliseconds, or -1 when it states nothing usable.
+     *
+     * <p>The specification allows a clock time - {@code HH:MM:SS.fff}, {@code MM:SS.fff} or
+     * {@code SS.fff} - and an offset with a seconds suffix, {@code 12.3s}. In a colon form the
+     * minute and second fields must be below 60, which is enforced here rather than folded over:
+     * a document that states 90 seconds in a minute field is wrong about something, and guessing
+     * which would be inventing timing.
+     */
+    private static long parseTtmlTime(String value) {
+        if (value == null) return -1;
+        final String trimmed = value.trim();
+        if (trimmed.isEmpty()) return -1;
+        try {
+            if (trimmed.endsWith("s") || trimmed.endsWith("S")) {
+                final double seconds = Double.parseDouble(trimmed.substring(0, trimmed.length() - 1));
+                if (Double.isNaN(seconds) || Double.isInfinite(seconds) || seconds < 0) return -1;
+                return Math.round(seconds * 1000);
+            }
+            final String[] parts = trimmed.split(":", -1);
+            if (parts.length > 3) return -1;
+            double total = 0;
+            for (int a = 0; a < parts.length; a++) {
+                if (parts[a].isEmpty()) return -1;
+                final double part = Double.parseDouble(parts[a]);
+                if (Double.isNaN(part) || Double.isInfinite(part) || part < 0) return -1;
+                // In a colon form every field must be below 60 except the hours field, which
+                // only exists when all three are present. A minute field of 90 is a document that
+                // is wrong about something, and folding it over would be guessing which.
+                if (parts.length > 1 && part >= 60 && !(a == 0 && parts.length == 3)) return -1;
+                total = total * 60 + part;
+            }
+            return Math.round(total * 1000);
+        } catch (RuntimeException ignore) {
+            return -1;
+        }
+    }
+
+    // endregion
+
+    private static ArrayList<Line> assemble(ArrayList<ParsedLine> parsed) {
+        parsed.sort(Comparator.comparingLong((ParsedLine line) -> line.timeMs).thenComparingInt(line -> line.order));
+        ArrayList<Line> result = new ArrayList<>();
+        ArrayList<Candidate> candidates = new ArrayList<>();
+        for (int i = 0; i < parsed.size();) {
+            int j = i + 1;
+            while (j < parsed.size() && parsed.get(j).timeMs == parsed.get(i).timeMs) j++;
+            StringBuilder combined = new StringBuilder();
+            for (int k = i; k < j; k++) {
+                String text = parsed.get(k).text;
+                if (text.length() == 0) {
+                    combined.setLength(0);
+                } else {
+                    if (combined.length() > 0) combined.append('\n');
+                    combined.append(text);
+                }
+            }
+            // Inline timing survives only when this line came from exactly one source line. A
+            // combined line interleaves two texts, so the captured offsets would no longer address
+            // the text they were measured against; dropping them is the only honest option, and it
+            // leaves the visible text untouched either way.
+            candidates.add(j - i == 1 ? parsed.get(i).candidate : null);
+            result.add(new Line(parsed.get(i).timeMs, combined.toString(), true));
+            i = j;
+        }
+        for (int i = 0; i < result.size(); i++) {
+            final Line line = result.get(i);
+            final long nextTimeMs = i + 1 < result.size() ? result.get(i + 1).timeMs : Long.MAX_VALUE;
+            final Segments segments = qualify(candidates.get(i), line.text, line.timeMs, nextTimeMs);
+            if (segments != null) result.set(i, line.withSegments(segments));
+        }
+        return result;
+    }
+
     public static Lyrics parse(String source) {
         if (source == null) return EMPTY;
+        if (looksLikeTtml(source)) return parseTtml(source);
         ArrayList<ParsedLine> parsed = new ArrayList<>();
         boolean hasMalformedTiming = false;
         boolean hasUntimedContent = false;
@@ -415,37 +779,7 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
                 hasMalformedTiming |= LOOKS_TIMED.matcher(sourceLine).matches();
             }
         }
-        parsed.sort(Comparator.comparingLong((ParsedLine line) -> line.timeMs).thenComparingInt(line -> line.order));
-        ArrayList<Line> result = new ArrayList<>();
-        ArrayList<Candidate> candidates = new ArrayList<>();
-        for (int i = 0; i < parsed.size();) {
-            int j = i + 1;
-            while (j < parsed.size() && parsed.get(j).timeMs == parsed.get(i).timeMs) j++;
-            StringBuilder combined = new StringBuilder();
-            for (int k = i; k < j; k++) {
-                String text = parsed.get(k).text;
-                if (text.length() == 0) {
-                    combined.setLength(0);
-                } else {
-                    if (combined.length() > 0) combined.append('\n');
-                    combined.append(text);
-                }
-            }
-            // Inline timing survives only when this line came from exactly one source line. A
-            // combined line interleaves two texts, so the captured offsets would no longer address
-            // the text they were measured against; dropping them is the only honest option, and it
-            // leaves the visible text untouched either way.
-            candidates.add(j - i == 1 ? parsed.get(i).candidate : null);
-            result.add(new Line(parsed.get(i).timeMs, combined.toString(), true));
-            i = j;
-        }
-        for (int i = 0; i < result.size(); i++) {
-            final Line line = result.get(i);
-            final long nextTimeMs = i + 1 < result.size() ? result.get(i + 1).timeMs : Long.MAX_VALUE;
-            final Segments segments = qualify(candidates.get(i), line.text, line.timeMs, nextTimeMs);
-            if (segments != null) result.set(i, line.withSegments(segments));
-        }
-        if (!result.isEmpty() && !hasUntimedContent) {
+        ArrayList<Line> result = assemble(parsed);        if (!result.isEmpty() && !hasUntimedContent) {
             return new Lyrics(result, source, Kind.SYNCED, Source.NONE);
         }
         if (!result.isEmpty() || hasMalformedTiming || hasTimingSyntax) {
@@ -506,13 +840,20 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
     private static final class Candidate {
         final int[] offsets;
         final long[] times;
+        /** Stated end per tag, or null when the format states none. -1 marks one that did not. */
+        final long[] ends;
         final int count;
         /** A tag matched the inline shape but stated an impossible time, so nothing here is trusted. */
         final boolean malformed;
 
         Candidate(int[] offsets, long[] times, int count, boolean malformed) {
+            this(offsets, times, null, count, malformed);
+        }
+
+        Candidate(int[] offsets, long[] times, long[] ends, int count, boolean malformed) {
             this.offsets = offsets;
             this.times = times;
+            this.ends = ends;
             this.count = count;
             this.malformed = malformed;
         }
@@ -624,7 +965,9 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
         int[] startOffsets = new int[count];
         int[] endOffsets = new int[count];
         long[] startTimes = new long[count];
+        long[] endTimes = candidate.ends == null ? null : new long[count];
         int kept = 0;
+        boolean anyEnd = false;
         for (int a = 0; a < count; a++) {
             final int start = candidate.offsets[a];
             final int end = a + 1 < count ? candidate.offsets[a + 1] : length;
@@ -635,13 +978,23 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
             startOffsets[kept] = start;
             endOffsets[kept] = end;
             startTimes[kept] = candidate.times[a];
+            if (endTimes != null) {
+                // Only a stated end survives, and only when it is actually after its own start and
+                // still inside this line. Anything else is recorded as "not stated" rather than
+                // repaired, because a repaired end would be an invented one.
+                final long stated = candidate.ends[a];
+                final boolean usable = stated > candidate.times[a] && stated <= nextTimeMs;
+                endTimes[kept] = usable ? stated : -1;
+                anyEnd |= usable;
+            }
             kept++;
         }
         if (kept == 0) return null;
         return new Segments(
                 kept == count ? startOffsets : Arrays.copyOf(startOffsets, kept),
                 kept == count ? endOffsets : Arrays.copyOf(endOffsets, kept),
-                kept == count ? startTimes : Arrays.copyOf(startTimes, kept));
+                kept == count ? startTimes : Arrays.copyOf(startTimes, kept),
+                !anyEnd ? null : kept == count ? endTimes : Arrays.copyOf(endTimes, kept));
     }
 
     /** An offset between a high and a low surrogate would cut one character in half. */

@@ -11221,6 +11221,7 @@
     <string name="LyricsOnlineSearchBusy">The lyrics service is busy. Please try again in a moment.</string>
     <string name="LyricsOnlineSearchServerError">The lyrics service could not answer right now.</string>
     <string name="LyricsOnlineSearchInvalidResponse">The lyrics service returned an unexpected response.</string>
+    <string name="LyricsOnlineSearchLineSyncOnly">No word-by-word timing was found for this track. These lyrics are synced line by line.</string>
     <string name="DiscardLyricsChanges">Discard your changes to these lyrics?</string>
     <string name="ArticleAIAddToPage">Add to Page</string>
 

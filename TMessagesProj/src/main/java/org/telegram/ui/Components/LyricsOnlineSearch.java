@@ -95,9 +95,17 @@ public final class LyricsOnlineSearch {
         MALFORMED
     }
 
-    /** Exactly one of {@code lyrics} / {@code error} is non-null. Always called on the UI thread. */
+    /**
+     * Exactly one of {@code lyrics} / {@code error} is non-null. Always called on the UI thread.
+     *
+     * <p>{@code resolved} is what the returned document actually is, which is not always what was
+     * asked for: a {@link Type#KARAOKE} request that no word-timing provider could answer falls
+     * back to line-synced lyrics and says so here. It is never the other way round - a request is
+     * never satisfied by something with less timing than it asked for without this saying so, and
+     * never by something claiming more.
+     */
     public interface Callback {
-        void onResult(String lyrics, Error error);
+        void onResult(String lyrics, Type resolved, Error error);
     }
 
     private static final String HOST = "https://lrclib.net";
@@ -171,12 +179,63 @@ public final class LyricsOnlineSearch {
      * inside the budget, which bounds the whole search at roughly this plus one read timeout - and
      * the user can abandon it at any point from the spinner.
      */
-    private static final long KARAOKE_BUDGET_MS = 15_000;
+    private static final long KARAOKE_BUDGET_MS = 12_000;
     /** Bounds on a word-timed document, checked before anything is allocated from it. */
     private static final int MAX_KARAOKE_LINES = 2000;
     private static final int MAX_KARAOKE_WORDS_PER_LINE = 300;
     /** The largest time the LRC timestamp grammar can express: 999:59.99. */
     private static final long MAX_KARAOKE_TIME_MS = (999L * 60 + 59) * 1000 + 999;
+
+    /**
+     * The AMLL TTML Database's public API, the second genuine word-timing source. The database
+     * itself is <a href="https://github.com/amll-dev/amll-ttml-db">amll-dev/amll-ttml-db</a>, whose
+     * README documents direct access by platform id
+     * ({@code raw.githubusercontent.com/.../am-lyrics/[id].ttml}) - which is no use here, because a
+     * Telegram audio document carries a title and a performer and no catalogue id at all. The
+     * search API is therefore the only reachable entry point, and its two read routes are the only
+     * ones contacted:
+     *
+     * <ul>
+     *   <li>{@code GET /v1/lyrics/search?musicName=...} answers
+     *       {@code {"status":200,"data":{"items":[...],"pagination":{...}}}}, each item carrying
+     *       {@code id}, {@code filename}, {@code musicNames[]}, {@code artistNames[]},
+     *       {@code albumNames[]}, {@code isrcs[]} and the per-platform id arrays.</li>
+     *   <li>{@code GET /v1/lyrics/get?id=...} answers the same shape with the document itself in
+     *       {@code data.lyrics} and its format in {@code data.format}.</li>
+     * </ul>
+     *
+     * <p>Only {@code musicName} is sent. The route is known to accept it; narrowing server-side by
+     * artist is not, and a parameter the deployment ignores would silently widen the result set
+     * while making this client believe it had been narrowed. Artist, album and duration are
+     * therefore judged here, against every row that comes back - see {@link #scoreAmll}.
+     *
+     * <p>Read-only throughout: no write route is reachable from this file, nothing is uploaded, no
+     * credential is sent, and the request carries no account, chat or message identity.
+     */
+    private static final String AMLL_HOST = "https://api.amll.dev";
+    private static final String AMLL_SEARCH_PATH = "/v1/lyrics/search";
+    private static final String AMLL_GET_PATH = "/v1/lyrics/get";
+    private static final int AMLL_CONNECT_TIMEOUT_MS = 6_000;
+    private static final int AMLL_READ_TIMEOUT_MS = 10_000;
+    /** Same shape of bound as the mirror walk: one wall-clock budget for search plus fetches. */
+    private static final long AMLL_BUDGET_MS = 10_000;
+    /**
+     * The ceiling on both word-timing stages together, whatever each is allowed on its own. A
+     * karaoke search that ends in the line-synced fallback pays for this before LRCLIB is even
+     * asked, so the two providers in front of it are bounded jointly rather than one after another.
+     */
+    private static final long WORD_TIMING_BUDGET_MS = 16_000;
+    /** Rows considered from one search page. Anything past this is noise, not a better match. */
+    private static final int AMLL_MAX_CANDIDATES = 24;
+    /** Documents actually downloaded. Ranking decides the order; this bounds the verification. */
+    private static final int AMLL_MAX_FETCHES = 3;
+    /** Floors a candidate must clear on its own before the weighted score is even considered. */
+    private static final double AMLL_MIN_TITLE_SIMILARITY = 0.6;
+    private static final double AMLL_MIN_ARTIST_SIMILARITY = 0.5;
+    /** "If confidence is poor, reject": below this, the line-synced fallback is the better answer. */
+    private static final double AMLL_MIN_CONFIDENCE = 0.72;
+    /** How far a document's last stated time may run past the track before it is a different cut. */
+    private static final long AMLL_DURATION_OVERRUN_MS = 10_000;
 
     private LyricsOnlineSearch() {
     }
@@ -231,20 +290,25 @@ public final class LyricsOnlineSearch {
         final String cleanArtist = sanitize(artist);
         final String cleanTitle = sanitize(title);
         if (type == Type.KARAOKE) {
-            Utilities.externalNetworkQueue.postRunnable(() -> runKaraoke(request, cleanArtist, cleanTitle, callback));
+            Utilities.externalNetworkQueue.postRunnable(() -> runKaraoke(request, cleanArtist, cleanTitle, durationSeconds, callback));
         } else {
-            Utilities.externalNetworkQueue.postRunnable(() -> run(request, cleanArtist, cleanTitle, durationSeconds, type, callback, false));
+            Utilities.externalNetworkQueue.postRunnable(() -> run(request, cleanArtist, cleanTitle, durationSeconds, type, callback, false, null));
         }
         return request;
     }
 
-    private static void run(Request request, String artist, String title, double durationSeconds, Type type, Callback callback, boolean isRetry) {
+    /**
+     * @param carried the most informative failure the word-timing stages saw before falling back
+     *                here, or null for a search that was for this flavour all along. It only ever
+     *                affects the message shown when this stage <em>also</em> fails.
+     */
+    private static void run(Request request, String artist, String title, double durationSeconds, Type type, Callback callback, boolean isRetry, Error carried) {
         if (request.isCancelled()) {
             return;
         }
         if (TextUtils.isEmpty(artist) && TextUtils.isEmpty(title)) {
             // Never send an entirely empty query.
-            deliver(request, callback, null, Error.NOT_FOUND);
+            deliver(request, callback, null, type, worse(carried, Error.NOT_FOUND));
             return;
         }
 
@@ -264,28 +328,28 @@ public final class LyricsOnlineSearch {
                 return;
             }
             if (response.retryAfterMs > 0 && !isRetry) {
-                scheduleRetry(request, artist, title, durationSeconds, type, callback, response.retryAfterMs);
+                scheduleRetry(request, artist, title, durationSeconds, type, callback, response.retryAfterMs, carried);
                 return;
             }
             if (response.error != null) {
-                deliver(request, callback, null, response.error);
+                deliver(request, callback, null, type, worse(carried, response.error));
                 return;
             }
             if (response.status == 200) {
                 Track track = parseTrack(response.body);
                 if (track == null) {
-                    deliver(request, callback, null, Error.MALFORMED);
+                    deliver(request, callback, null, type, worse(carried, Error.MALFORMED));
                     return;
                 }
                 sawAnyRow = true;
                 String lyrics = usableLyrics(track, type);
                 if (lyrics != null) {
-                    deliver(request, callback, lyrics, null);
+                    deliver(request, callback, lyrics, type, null);
                     return;
                 }
                 // Exact hit, wrong flavour: fall through to /api/search rather than substituting.
             } else if (response.status != 404) {
-                deliver(request, callback, null, statusError(response.status));
+                deliver(request, callback, null, type, worse(carried, statusError(response.status)));
                 return;
             }
             // 404 is an exact miss; fall through to /api/search.
@@ -306,21 +370,21 @@ public final class LyricsOnlineSearch {
             return;
         }
         if (response.retryAfterMs > 0 && !isRetry) {
-            scheduleRetry(request, artist, title, durationSeconds, type, callback, response.retryAfterMs);
+            scheduleRetry(request, artist, title, durationSeconds, type, callback, response.retryAfterMs, carried);
             return;
         }
         if (response.error != null) {
-            deliver(request, callback, null, response.error);
+            deliver(request, callback, null, type, worse(carried, response.error));
             return;
         }
         if (response.status != 200) {
-            deliver(request, callback, null, statusError(response.status));
+            deliver(request, callback, null, type, worse(carried, statusError(response.status)));
             return;
         }
 
         ArrayList<Track> tracks = parseTracks(response.body);
         if (tracks == null) {
-            deliver(request, callback, null, Error.MALFORMED);
+            deliver(request, callback, null, type, worse(carried, Error.MALFORMED));
             return;
         }
         if (!tracks.isEmpty()) {
@@ -328,19 +392,19 @@ public final class LyricsOnlineSearch {
         }
         String best = pickBest(tracks, artist, title, durationSeconds, type);
         if (best != null) {
-            deliver(request, callback, best, null);
+            deliver(request, callback, best, type, null);
         } else {
-            deliver(request, callback, null, sawAnyRow ? Error.TYPE_UNAVAILABLE : Error.NOT_FOUND);
+            deliver(request, callback, null, type, worse(carried, sawAnyRow ? Error.TYPE_UNAVAILABLE : Error.NOT_FOUND));
         }
     }
 
-    private static void scheduleRetry(Request request, String artist, String title, double durationSeconds, Type type, Callback callback, long delayMs) {
+    private static void scheduleRetry(Request request, String artist, String title, double durationSeconds, Type type, Callback callback, long delayMs, Error carried) {
         if (request.isCancelled()) {
             return;
         }
         // One bounded retry, re-posted onto the same background queue. Nothing sleeps, and the
         // cancellation check above is repeated when the runnable actually fires.
-        Utilities.externalNetworkQueue.postRunnable(() -> run(request, artist, title, durationSeconds, type, callback, true), delayMs);
+        Utilities.externalNetworkQueue.postRunnable(() -> run(request, artist, title, durationSeconds, type, callback, true, carried), delayMs);
     }
 
     private static Error statusError(int status) {
@@ -354,7 +418,7 @@ public final class LyricsOnlineSearch {
         return Error.SERVER;
     }
 
-    private static void deliver(Request request, Callback callback, String lyrics, Error error) {
+    private static void deliver(Request request, Callback callback, String lyrics, Type resolved, Error error) {
         if (callback == null) {
             return;
         }
@@ -362,7 +426,7 @@ public final class LyricsOnlineSearch {
             if (request.isCancelled()) {
                 return;
             }
-            callback.onResult(lyrics, error);
+            callback.onResult(lyrics, resolved, error);
         });
     }
 
@@ -379,7 +443,8 @@ public final class LyricsOnlineSearch {
     /** Which read-only provider a request is going to, which decides its headers and timeouts. */
     private enum Provider {
         LRCLIB,
-        LYRICS_PLUS
+        LYRICS_PLUS,
+        AMLL
     }
 
     private static Response fetch(Request request, String url) {
@@ -398,8 +463,8 @@ public final class LyricsOnlineSearch {
             connection.setRequestMethod("GET");
             connection.setDoInput(true);
             connection.setUseCaches(false);
-            connection.setConnectTimeout(provider == Provider.LRCLIB ? CONNECT_TIMEOUT_MS : KARAOKE_CONNECT_TIMEOUT_MS);
-            connection.setReadTimeout(provider == Provider.LRCLIB ? READ_TIMEOUT_MS : KARAOKE_READ_TIMEOUT_MS);
+            connection.setConnectTimeout(connectTimeoutMs(provider));
+            connection.setReadTimeout(readTimeoutMs(provider));
             connection.setRequestProperty("Accept", "application/json");
             if (provider == Provider.LRCLIB) {
                 connection.setRequestProperty("Lrclib-Client", CLIENT_ID);
@@ -460,6 +525,22 @@ public final class LyricsOnlineSearch {
             }
         }
         return result;
+    }
+
+    private static int connectTimeoutMs(Provider provider) {
+        switch (provider) {
+            case LRCLIB: return CONNECT_TIMEOUT_MS;
+            case AMLL: return AMLL_CONNECT_TIMEOUT_MS;
+            default: return KARAOKE_CONNECT_TIMEOUT_MS;
+        }
+    }
+
+    private static int readTimeoutMs(Provider provider) {
+        switch (provider) {
+            case LRCLIB: return READ_TIMEOUT_MS;
+            case AMLL: return AMLL_READ_TIMEOUT_MS;
+            default: return KARAOKE_READ_TIMEOUT_MS;
+        }
     }
 
     /** Reads at most {@link #MAX_RESPONSE_BYTES}; returns null if the body is larger than that. */
@@ -926,26 +1007,82 @@ public final class LyricsOnlineSearch {
     // region karaoke
 
     /**
-     * Genuine word timing, or nothing.
+     * The karaoke acquisition chain, in descending order of how much timing the source states:
      *
-     * <p>Walks the mirrors in order within one wall-clock budget. A mirror that cannot be reached,
-     * answers a status other than 200, returns something that is not the documented shape, or has
-     * only line timing for this track is recorded and skipped; the next one is tried. The first
-     * mirror that returns real word timing wins and the walk stops there.
+     * <ol>
+     *   <li>LyricsPlus' Apple Music path - genuine word timing, tried across its mirrors;</li>
+     *   <li>the AMLL TTML Database - genuine word or syllable timing, and the only source here
+     *       that can also state a genuine end per word;</li>
+     *   <li>LRCLIB's {@code syncedLyrics} - <em>line</em> timing, and reported as such.</li>
+     * </ol>
      *
-     * <p>Nothing is ever synthesised on the way. If no mirror states word timing, this reports the
-     * most informative failure it saw and returns no lyrics at all - it never falls back to LRCLIB,
-     * never divides a line among its words, and never presents line timestamps as word timestamps.
+     * <p>Nothing is ever synthesised on the way down. Step 3 is not karaoke and is never dressed up
+     * as it: the result is delivered as {@link Type#SYNCED}, the caller is told, and no word motion
+     * is generated from it anywhere downstream. A line is never divided among its words, and line
+     * timestamps are never presented as word timestamps.
+     *
+     * <p>The chain stops at line timing on purpose. Where LRCLIB has the track but only as plain
+     * text, that is reported rather than delivered: untimed words are not a weaker answer to a
+     * karaoke request but a different kind of thing, and the message the user gets for it names
+     * exactly that, which is also the one they would pick Normal for.
+     *
+     * <p>If every step fails, the most informative failure any of them saw is what the user is
+     * shown - a definitive "this track has no word timing" outranks a mirror that simply did not
+     * answer.
      */
-    private static void runKaraoke(Request request, String artist, String title, Callback callback) {
+    private static void runKaraoke(Request request, String artist, String title, double durationSeconds, Callback callback) {
         if (request.isCancelled()) {
             return;
         }
         if (TextUtils.isEmpty(artist) && TextUtils.isEmpty(title)) {
-            deliver(request, callback, null, Error.NOT_FOUND);
+            deliver(request, callback, null, Type.KARAOKE, Error.NOT_FOUND);
             return;
         }
-        final long deadline = SystemClock.elapsedRealtime() + KARAOKE_BUDGET_MS;
+        final Error wordTimingError = runWordTiming(request, artist, title, durationSeconds, callback);
+        if (wordTimingError == null) {
+            return; // a genuine word-timed document was delivered
+        }
+        if (request.isCancelled()) {
+            return;
+        }
+        // Every word-timing source is out. Line timing is still worth having, so the search
+        // continues into LRCLIB - but as itself: run() delivers Type.SYNCED, which is what the
+        // caller is told it got.
+        run(request, artist, title, durationSeconds, Type.SYNCED, callback, false, wordTimingError);
+    }
+
+    /**
+     * Steps 1 and 2 of the chain, under one wall-clock budget between them. Each stage takes what
+     * is left of it, so two providers that are both unreachable cannot add their timeouts together
+     * and leave the honest line-synced fallback waiting behind them.
+     *
+     * @return null once a genuine word-timed document has been delivered, otherwise the most
+     *         informative failure either stage saw
+     */
+    private static Error runWordTiming(Request request, String artist, String title, double durationSeconds, Callback callback) {
+        final long deadline = SystemClock.elapsedRealtime() + WORD_TIMING_BUDGET_MS;
+        final Error mirrors = runLyricsPlus(request, artist, title, callback,
+                Math.min(deadline, SystemClock.elapsedRealtime() + KARAOKE_BUDGET_MS));
+        if (mirrors == null || request.isCancelled()) {
+            return mirrors;
+        }
+        final Error amll = runAmll(request, artist, title, durationSeconds, callback,
+                Math.min(deadline, SystemClock.elapsedRealtime() + AMLL_BUDGET_MS));
+        if (amll == null) {
+            return null;
+        }
+        return worse(mirrors, amll);
+    }
+
+    /**
+     * Walks the LyricsPlus mirrors in order within one wall-clock budget. A mirror that cannot be
+     * reached, answers a status other than 200, returns something that is not the documented shape,
+     * or has only line timing for this track is recorded and skipped; the next one is tried. The
+     * first mirror that returns real word timing wins, is delivered, and the walk stops there.
+     *
+     * @return null once a result has been delivered, otherwise the most informative failure seen
+     */
+    private static Error runLyricsPlus(Request request, String artist, String title, Callback callback, long deadline) {
         final String query = KARAOKE_PATH
                 + "?title=" + Uri.encode(title)
                 + "&artist=" + Uri.encode(artist)
@@ -953,7 +1090,7 @@ public final class LyricsOnlineSearch {
         Error worst = null;
         for (int a = 0; a < KARAOKE_HOSTS.length; a++) {
             if (request.isCancelled()) {
-                return;
+                return Error.NETWORK;
             }
             if (SystemClock.elapsedRealtime() + KARAOKE_CONNECT_TIMEOUT_MS >= deadline) {
                 // Not enough budget left for another connection to even succeed. Report what has
@@ -963,7 +1100,7 @@ public final class LyricsOnlineSearch {
             }
             final Response response = fetch(request, KARAOKE_HOSTS[a] + query, Provider.LYRICS_PLUS);
             if (request.isCancelled()) {
-                return;
+                return Error.NETWORK;
             }
             if (response.error != null) {
                 worst = worse(worst, response.error);
@@ -983,10 +1120,10 @@ public final class LyricsOnlineSearch {
                 worst = worse(worst, Error.TYPE_UNAVAILABLE);
                 continue;
             }
-            deliver(request, callback, enhanced, null);
-            return;
+            deliver(request, callback, enhanced, Type.KARAOKE, null);
+            return null;
         }
-        deliver(request, callback, null, worst == null ? Error.NETWORK : worst);
+        return worst == null ? Error.NETWORK : worst;
     }
 
     /**
@@ -1339,6 +1476,674 @@ public final class LyricsOnlineSearch {
         }
         final long centis = ms / 10;
         return String.format(Locale.US, "%02d:%02d.%02d", centis / 6000, (centis / 100) % 60, centis % 100);
+    }
+
+    // endregion
+
+    // region amll
+
+    /**
+     * The AMLL TTML Database stage. Searches by music name, judges every row that comes back
+     * against the track's own metadata, then downloads the best few in order and verifies each
+     * document before it is accepted.
+     *
+     * <p>The verification is the point of this stage. A fuzzy title hit is never taken on trust:
+     * a document only wins if its metadata clears the floors in {@link #scoreAmll}, carries no
+     * variant marker the track itself does not carry, and - once fetched - actually parses as
+     * word-timed lyrics whose stated times fit inside the track being played. Anything short of
+     * that is rejected, and the chain drops to honest line timing instead. Beautifully animating
+     * the wrong recording is a worse outcome than a line-synced one that is right.
+     *
+     * @return null once a result has been delivered, otherwise the most informative failure seen
+     */
+    private static Error runAmll(Request request, String artist, String title, double durationSeconds, Callback callback, long deadline) {
+        if (TextUtils.isEmpty(title)) {
+            // The one parameter this API is searched by. Without it there is no query to make.
+            return Error.NOT_FOUND;
+        }
+        if (SystemClock.elapsedRealtime() + AMLL_CONNECT_TIMEOUT_MS >= deadline) {
+            return Error.NETWORK;
+        }
+        final Response search = fetch(request, AMLL_HOST + AMLL_SEARCH_PATH + "?musicName=" + Uri.encode(title), Provider.AMLL);
+        if (request.isCancelled()) {
+            return Error.NETWORK;
+        }
+        if (search.error != null) {
+            return search.error;
+        }
+        if (search.status != 200) {
+            return search.status == 404 ? Error.NOT_FOUND : statusError(search.status);
+        }
+        final ArrayList<AmllCandidate> candidates = readAmllCandidates(search.body);
+        if (candidates == null) {
+            return Error.MALFORMED;
+        }
+        if (candidates.isEmpty()) {
+            return Error.NOT_FOUND;
+        }
+        final ArrayList<AmllCandidate> ranked = rankAmll(candidates, artist, title);
+        if (ranked.isEmpty()) {
+            // Rows came back, but none of them is this recording. That is a definitive answer
+            // about word timing for this track, not a transport failure.
+            return Error.TYPE_UNAVAILABLE;
+        }
+        Error worst = Error.TYPE_UNAVAILABLE;
+        for (int a = 0; a < ranked.size() && a < AMLL_MAX_FETCHES; a++) {
+            if (request.isCancelled()) {
+                return Error.NETWORK;
+            }
+            if (SystemClock.elapsedRealtime() + AMLL_CONNECT_TIMEOUT_MS >= deadline) {
+                // No budget left for another document to arrive; stop rather than start a fetch
+                // whose timeout would run past it.
+                break;
+            }
+            final Response document = fetch(request, AMLL_HOST + AMLL_GET_PATH + "?id=" + Uri.encode(ranked.get(a).id), Provider.AMLL);
+            if (request.isCancelled()) {
+                return Error.NETWORK;
+            }
+            if (document.error != null) {
+                worst = worse(worst, document.error);
+                continue;
+            }
+            if (document.status != 200) {
+                worst = worse(worst, document.status == 404 ? Error.NOT_FOUND : statusError(document.status));
+                continue;
+            }
+            final String ttml = readAmllDocument(document.body);
+            if (ttml == null) {
+                worst = worse(worst, Error.MALFORMED);
+                continue;
+            }
+            if (!isWordTimedTtml(ttml, durationSeconds)) {
+                // Line-only TTML, or a document whose stated times do not fit this track. Either
+                // way it is not an answer to a karaoke request; try the next candidate.
+                worst = worse(worst, Error.TYPE_UNAVAILABLE);
+                continue;
+            }
+            // Delivered as the source wrote it. TTML is the only format here that can state a
+            // genuine end per word, and rewriting it into Enhanced LRC - which has no way to
+            // express one - would throw that timing away for nothing.
+            deliver(request, callback, ttml, Type.KARAOKE, null);
+            return null;
+        }
+        return worst;
+    }
+
+    /**
+     * The ids {@link #runAmll} would download for a search response, best first, and empty when
+     * none of the rows is this recording.
+     *
+     * <p>Public for the same reason {@link #toEnhancedLrc(String)} is: this and the two methods
+     * below are the whole of the accept/reject decision for this provider, they are pure functions
+     * of a response body, they touch no network and keep no state, and a decision this consequential
+     * - it is what stands between the player and animating the wrong recording - is worth being able
+     * to test directly rather than through a socket.
+     */
+    public static ArrayList<String> rankAmllCandidates(String searchBody, String artist, String title) {
+        final ArrayList<String> ids = new ArrayList<>();
+        final ArrayList<AmllCandidate> rows = readAmllCandidates(searchBody);
+        if (rows == null) {
+            return null;
+        }
+        final ArrayList<AmllCandidate> ranked = rankAmll(rows, sanitize(artist), sanitize(title));
+        for (int a = 0; a < ranked.size(); a++) {
+            ids.add(ranked.get(a).id);
+        }
+        return ids;
+    }
+
+    /** One search row, reduced to the fields that can be judged against a Telegram audio file. */
+    private static final class AmllCandidate {
+        final String id;
+        final String[] musicNames;
+        final String[] artistNames;
+        final String[] albumNames;
+        double confidence;
+
+        AmllCandidate(String id, String[] musicNames, String[] artistNames, String[] albumNames) {
+            this.id = id;
+            this.musicNames = musicNames;
+            this.artistNames = artistNames;
+            this.albumNames = albumNames;
+        }
+    }
+
+    /**
+     * Reads the search response. The documented envelope is
+     * {@code {"status":200,"data":{"items":[...]}}}; a bare {@code items} array and a bare array
+     * body are accepted too, so a deployment that answers a slightly flatter shape is read rather
+     * than reported as broken. Anything else returns null, and a single unreadable row is skipped
+     * rather than failing the page.
+     */
+    private static ArrayList<AmllCandidate> readAmllCandidates(String body) {
+        if (body == null) {
+            return null;
+        }
+        try {
+            final JSONTokener tokener = new JSONTokener(body);
+            final Object parsed = tokener.nextValue();
+            if (!hasOnlyTrailingJsonWhitespace(tokener)) {
+                return null;
+            }
+            JSONArray items = null;
+            if (parsed instanceof JSONArray) {
+                items = (JSONArray) parsed;
+            } else if (parsed instanceof JSONObject) {
+                final JSONObject root = (JSONObject) parsed;
+                final Object data = root.opt("data");
+                if (data instanceof JSONArray) {
+                    items = (JSONArray) data;
+                } else if (data instanceof JSONObject) {
+                    items = ((JSONObject) data).optJSONArray("items");
+                }
+                if (items == null) {
+                    items = root.optJSONArray("items");
+                }
+            }
+            if (items == null) {
+                return null;
+            }
+            final ArrayList<AmllCandidate> result = new ArrayList<>();
+            for (int a = 0; a < items.length() && result.size() < AMLL_MAX_CANDIDATES; a++) {
+                final JSONObject row = items.optJSONObject(a);
+                if (row == null) {
+                    continue;
+                }
+                final String id = readAmllId(row);
+                if (id == null) {
+                    continue;
+                }
+                result.add(new AmllCandidate(id,
+                        readAmllStrings(row, "musicNames"),
+                        readAmllStrings(row, "artistNames"),
+                        readAmllStrings(row, "albumNames")));
+            }
+            return result;
+        } catch (Throwable e) {
+            return null;
+        }
+    }
+
+    /**
+     * The row's identifier for {@code /lyrics/get}. It is a string in the documented shape but a
+     * number is accepted as well, because the same API also answers {@code ?id=1}. Anything empty,
+     * oversized or not plain text is refused: it goes straight into a URL.
+     */
+    private static String readAmllId(JSONObject row) {
+        final Object raw = row.opt("id");
+        final String id;
+        if (raw instanceof String) {
+            id = (String) raw;
+        } else if (raw instanceof Integer || raw instanceof Long) {
+            id = raw.toString();
+        } else {
+            return null;
+        }
+        if (id.isEmpty() || id.length() > MAX_QUERY_FIELD_LENGTH || !isWellFormedUtf16(id)) {
+            return null;
+        }
+        for (int a = 0; a < id.length(); a++) {
+            final char c = id.charAt(a);
+            // Identifiers observed here are uuids and decimal ids. Refusing everything else keeps
+            // a hostile row from steering the request, whatever Uri.encode would have done with it.
+            final boolean allowed = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '-' || c == '_';
+            if (!allowed) {
+                return null;
+            }
+        }
+        return id;
+    }
+
+    /** One of the row's parallel name arrays. A missing array is an empty one, never a failure. */
+    private static String[] readAmllStrings(JSONObject row, String name) {
+        final JSONArray array = row.optJSONArray(name);
+        if (array == null) {
+            final String single = row.optString(name, null);
+            return TextUtils.isEmpty(single) ? EMPTY_STRINGS : new String[]{single};
+        }
+        final ArrayList<String> values = new ArrayList<>(Math.min(array.length(), MAX_ARTIST_CREDITS));
+        for (int a = 0; a < array.length() && values.size() < MAX_ARTIST_CREDITS; a++) {
+            final String value = array.optString(a, null);
+            if (!TextUtils.isEmpty(value) && value.length() <= MAX_QUERY_FIELD_LENGTH && isWellFormedUtf16(value)) {
+                values.add(value);
+            }
+        }
+        return values.isEmpty() ? EMPTY_STRINGS : values.toArray(new String[0]);
+    }
+
+    private static final String[] EMPTY_STRINGS = new String[0];
+
+    /**
+     * Scores every candidate and returns the ones worth downloading, best first. A candidate that
+     * fails any floor is not ranked lower - it is dropped, because a poor match is not a weaker
+     * answer to the question but a wrong one.
+     */
+    private static ArrayList<AmllCandidate> rankAmll(ArrayList<AmllCandidate> candidates, String artist, String title) {
+        final ArrayList<AmllCandidate> ranked = new ArrayList<>();
+        for (int a = 0; a < candidates.size(); a++) {
+            final AmllCandidate candidate = candidates.get(a);
+            candidate.confidence = scoreAmll(candidate, artist, title);
+            if (candidate.confidence >= AMLL_MIN_CONFIDENCE) {
+                ranked.add(candidate);
+            }
+        }
+        // Insertion sort by descending confidence: the list is at most AMLL_MAX_CANDIDATES long,
+        // and a stable ordering keeps the server's own ranking as the tie-break.
+        for (int a = 1; a < ranked.size(); a++) {
+            final AmllCandidate moving = ranked.get(a);
+            int b = a - 1;
+            while (b >= 0 && ranked.get(b).confidence < moving.confidence) {
+                ranked.set(b + 1, ranked.get(b));
+                b--;
+            }
+            ranked.set(b + 1, moving);
+        }
+        return ranked;
+    }
+
+    /**
+     * How much this row looks like the track that is playing, in 0..1, or 0 for "not this
+     * recording at all".
+     *
+     * <p>What is available to judge with, and what is not, is worth being exact about. A Telegram
+     * audio document states a title and a performer and nothing else: there is no album, no
+     * duration in the search index, and no ISRC or platform id on our side, so the row's
+     * {@code isrcs} and per-platform id arrays have nothing to be compared against and are not
+     * used for matching. Duration <em>is</em> checked, but later and from the document itself -
+     * see {@link #isWordTimedTtml}. Album is used in the one way it can be without a reference:
+     * as another place a variant marker can show up.
+     *
+     * <p>The floors matter more than the weighting. A title that does not really match, or an
+     * artist that does not match when one is known, drops the row outright; so does a variant
+     * marker that is on one side and not the other, which is what keeps a live take, a remix, a
+     * sped-up edit or a re-recording from being animated over the studio master.
+     */
+    private static double scoreAmll(AmllCandidate candidate, String artist, String title) {
+        final String wantTitle = variantBase(title);
+        if (wantTitle.isEmpty()) {
+            return 0;
+        }
+        final double titleScore = bestSimilarity(wantTitle, candidate.musicNames);
+        if (titleScore < AMLL_MIN_TITLE_SIMILARITY) {
+            return 0;
+        }
+        if (variantMismatch(title, candidate)) {
+            return 0;
+        }
+        final String wantArtist = variantBase(artist);
+        double artistScore;
+        if (wantArtist.isEmpty()) {
+            // Nothing to check against. The row is not rewarded for it, and the title alone has
+            // to carry the whole score past the threshold - which, at 0.6 of it, it cannot.
+            artistScore = 0;
+        } else {
+            artistScore = artistScore(artist, candidate.artistNames, wantArtist);
+            if (artistScore < AMLL_MIN_ARTIST_SIMILARITY) {
+                return 0;
+            }
+        }
+        return 0.6 * titleScore + 0.4 * artistScore;
+    }
+
+    /**
+     * How well the row's performers match the track's, in 0..1, where 0 means "someone else".
+     *
+     * <p>Two readings of the track's performer field are tried, because a Telegram audio tag is
+     * written by whoever made the file and both are common:
+     *
+     * <ul>
+     *   <li>as a credit list - "A feat. B", "A &amp; B", "A, B" - split the same way on both sides
+     *       and matched name against name. The track's <em>first</em> credit has to be found among
+     *       the row's, which is what stops "Artist" from being satisfied by "Other Artist": half
+     *       its words agreeing is not the same artist.</li>
+     *   <li>as one opaque name, compared whole against the row's credits joined back together.
+     *       This is what lets a tag that separates two performers with nothing but a space still
+     *       match a row that lists them separately - but it has to be a near-identical match to
+     *       count, because on this reading there is no primary credit to anchor it.</li>
+     * </ul>
+     */
+    private static double artistScore(String artist, String[] artistNames, String wantArtist) {
+        final String[] wanted = splitArtists(artist);
+        double bySplit = 0;
+        if (wanted.length > 0 && artistNames.length > 0) {
+            final ArrayList<String> offered = new ArrayList<>();
+            for (int a = 0; a < artistNames.length; a++) {
+                final String[] split = splitArtists(artistNames[a]);
+                for (int b = 0; b < split.length; b++) {
+                    offered.add(split[b]);
+                }
+            }
+            int matched = 0;
+            boolean primary = false;
+            for (int a = 0; a < wanted.length; a++) {
+                for (int b = 0; b < offered.size(); b++) {
+                    if (similarity(wanted[a], offered.get(b)) >= NAME_MATCH_SIMILARITY) {
+                        matched++;
+                        primary |= a == 0;
+                        break;
+                    }
+                }
+            }
+            if (primary) {
+                // Credited lists routinely disagree about the features either side names, so the
+                // shorter list is what the agreement is measured against. The primary credit above
+                // is the gate; this only rewards the rest agreeing too.
+                bySplit = matched / (double) Math.min(wanted.length, offered.size());
+            }
+        }
+        final double byJoin = similarity(wantArtist, variantBase(join(artistNames)));
+        return Math.max(bySplit, byJoin >= NAME_MATCH_SIMILARITY ? byJoin : 0);
+    }
+
+    /** How alike two performer names must be to be the same performer. */
+    private static final double NAME_MATCH_SIMILARITY = 0.8;
+
+    /**
+     * Separators a performer field uses to list several performers. Applied to the track's tag and
+     * to the row's names alike, so a credit written "A &amp; B" on one side and listed as two
+     * names on the other reduces to the same pair. Splitting is deliberately done before
+     * {@link #normalize}, which folds "&amp;", "," and "/" into spaces and would erase them.
+     */
+    private static final Pattern ARTIST_SEPARATOR = Pattern.compile(
+            "\\s*(?:[,;&/+\u00d7\uff06]|\\b(?:feat|ft|featuring|with|vs|versus|and)\\b)\\s*",
+            Pattern.CASE_INSENSITIVE);
+    /** A credit list longer than this is not a list any more; the joined reading covers it. */
+    private static final int MAX_ARTIST_CREDITS = 8;
+
+    private static String[] splitArtists(String value) {
+        if (TextUtils.isEmpty(value)) {
+            return EMPTY_STRINGS;
+        }
+        final String[] raw = ARTIST_SEPARATOR.split(value);
+        final ArrayList<String> names = new ArrayList<>(Math.min(raw.length, MAX_ARTIST_CREDITS));
+        for (int a = 0; a < raw.length && names.size() < MAX_ARTIST_CREDITS; a++) {
+            final String name = variantBase(raw[a]);
+            if (!name.isEmpty()) {
+                names.add(name);
+            }
+        }
+        return names.isEmpty() ? EMPTY_STRINGS : names.toArray(new String[0]);
+    }
+
+    /** The best similarity between one wanted value and any of the row's alternatives for it. */
+    private static double bestSimilarity(String want, String[] values) {
+        double best = 0;
+        for (int a = 0; a < values.length; a++) {
+            best = Math.max(best, similarity(want, variantBase(values[a])));
+            if (best >= 1) {
+                break;
+            }
+        }
+        return best;
+    }
+
+    private static String join(String[] values) {
+        if (values.length == 0) {
+            return "";
+        }
+        if (values.length == 1) {
+            return values[0];
+        }
+        final StringBuilder builder = new StringBuilder();
+        for (int a = 0; a < values.length; a++) {
+            if (a > 0) {
+                builder.append(' ');
+            }
+            builder.append(values[a]);
+        }
+        return builder.toString();
+    }
+
+    /**
+     * Token-set similarity in 0..1: how much of the larger token set the two share. Dividing by
+     * the larger set - rather than by the union or the smaller set - is what makes "song" and
+     * "song live at wembley" score poorly instead of perfectly, so extra words in either title
+     * cost the row something even when no variant marker was recognised in them.
+     */
+    private static double similarity(String a, String b) {
+        if (a.isEmpty() || b.isEmpty()) {
+            return 0;
+        }
+        if (a.equals(b)) {
+            return 1;
+        }
+        final String[] left = a.split(" ");
+        final String[] right = b.split(" ");
+        int shared = 0;
+        final boolean[] taken = new boolean[right.length];
+        for (int i = 0; i < left.length; i++) {
+            for (int j = 0; j < right.length; j++) {
+                if (!taken[j] && left[i].equals(right[j])) {
+                    taken[j] = true;
+                    shared++;
+                    break;
+                }
+            }
+        }
+        return shared / (double) Math.max(left.length, right.length);
+    }
+
+    /**
+     * Words that mark a different recording rather than a different pressing of the same one. A
+     * marker present on one side and absent on the other is a rejection: the studio master and the
+     * live take share a title, share an artist, and do not share a single word boundary.
+     */
+    private static final String[] VARIANT_MARKERS = {
+            "live", "remix", "remixed", "rmx", "acoustic", "instrumental", "karaoke", "cover",
+            "demo", "reprise", "edit", "extended", "sped", "slowed", "reverb", "nightcore",
+            "unplugged", "rerecorded", "session", "sessions", "mix", "dub", "version", "medley",
+            "interlude", "intro", "outro", "clean", "explicit", "orchestral", "symphonic",
+    };
+
+    /**
+     * Phrases that name a different master of the same performance, which is not a different
+     * recording in any way that moves a word. They are removed from both sides before anything is
+     * compared, so "Song - 2011 Remastered Version" and "Song" match, and - because the removal
+     * takes the trailing "version" with the rest of the phrase - the marker test above is not
+     * tripped by it either.
+     */
+    private static final Pattern VARIANT_NEUTRAL = Pattern.compile(
+            "\\b(?:\\d{4} )?(?:digitally )?remaster(?:ed|s)?(?: version| mix)?\\b"
+                    + "|\\b(?:mono|stereo)(?: version| mix)?\\b"
+                    + "|\\b(?:bonus track|deluxe(?: edition)?|album version|single version|original (?:mix|version)|radio edit)\\b");
+
+    /**
+     * The comparable form of a title or artist: normalised the same way LRCLIB ranking normalises,
+     * then with the neutral remaster/pressing phrases removed and the whitespace collapsed again.
+     */
+    private static String variantBase(String value) {
+        final String normalized = normalize(value);
+        if (normalized.isEmpty()) {
+            return "";
+        }
+        final String stripped = VARIANT_NEUTRAL.matcher(normalized).replaceAll(" ");
+        final StringBuilder builder = new StringBuilder(stripped.length());
+        boolean pendingSpace = false;
+        for (int a = 0; a < stripped.length(); a++) {
+            final char c = stripped.charAt(a);
+            if (c == ' ') {
+                pendingSpace = builder.length() > 0;
+                continue;
+            }
+            if (pendingSpace) {
+                builder.append(' ');
+                pendingSpace = false;
+            }
+            builder.append(c);
+        }
+        return dropLeadingArticle(builder.toString());
+    }
+
+    /**
+     * Definite and indefinite articles that catalogues and file tags disagree about - "Beatles"
+     * against "The Beatles" is the same band, and one leading article should not cost a row half
+     * its similarity. Dropped from both sides, and only when something is left afterwards.
+     */
+    private static final String[] LEADING_ARTICLES = {"the", "a", "an", "el", "la", "los", "las", "le", "les", "der", "die", "das"};
+
+    private static String dropLeadingArticle(String value) {
+        final int space = value.indexOf(' ');
+        if (space <= 0) {
+            return value;
+        }
+        final String first = value.substring(0, space);
+        for (int a = 0; a < LEADING_ARTICLES.length; a++) {
+            if (first.equals(LEADING_ARTICLES[a])) {
+                return value.substring(space + 1);
+            }
+        }
+        return value;
+    }
+
+    /**
+     * True when the row and the track disagree about what kind of recording this is. The track's
+     * side is its title alone, which is all a Telegram audio file states; the row's side is every
+     * name it carries, its albums included, because "Live at Wembley" is as often the album as it
+     * is the title.
+     */
+    private static boolean variantMismatch(String title, AmllCandidate candidate) {
+        final int wanted = variantMarkers(variantBase(title));
+        if (wanted != rowVariantMarkers(candidate.musicNames, wanted)) {
+            return true;
+        }
+        // The album only ever adds a marker; an album that names none says nothing either way.
+        final int album = rowVariantMarkers(candidate.albumNames, wanted);
+        return (album & ~wanted) != 0;
+    }
+
+    /**
+     * The markers the row states, as a bit set. When several names are offered the one that agrees
+     * with the track is the one believed: a row that lists both "Song" and "Song (Live)" is
+     * ambiguous, and the disagreement is only real when no name it states agrees.
+     */
+    private static int rowVariantMarkers(String[] values, int wanted) {
+        if (values.length == 0) {
+            return 0;
+        }
+        int best = -1;
+        for (int a = 0; a < values.length; a++) {
+            final int markers = variantMarkers(variantBase(values[a]));
+            if (markers == wanted) {
+                return markers;
+            }
+            if (best == -1 || Integer.bitCount(markers ^ wanted) < Integer.bitCount(best ^ wanted)) {
+                best = markers;
+            }
+        }
+        return best;
+    }
+
+    /** Which of {@link #VARIANT_MARKERS} appear as whole tokens of an already-normalised value. */
+    private static int variantMarkers(String normalized) {
+        if (normalized.isEmpty()) {
+            return 0;
+        }
+        int markers = 0;
+        final String[] tokens = normalized.split(" ");
+        for (int a = 0; a < tokens.length; a++) {
+            for (int b = 0; b < VARIANT_MARKERS.length; b++) {
+                if (tokens[a].equals(VARIANT_MARKERS[b])) {
+                    markers |= 1 << b;
+                    break;
+                }
+            }
+        }
+        return markers;
+    }
+
+    /**
+     * Pulls the document out of a {@code /lyrics/get} response. The documented envelope carries it
+     * in {@code data.lyrics} with {@code data.format} naming the format; a body that is already the
+     * document is accepted as well. A format the client cannot read, or a document too large for
+     * the editor's own limit, is refused here rather than half-imported.
+     */
+    public static String readAmllDocument(String body) {
+        if (body == null) {
+            return null;
+        }
+        final String trimmed = body.trim();
+        if (trimmed.startsWith("<")) {
+            return acceptableTtml(trimmed);
+        }
+        try {
+            final JSONTokener tokener = new JSONTokener(body);
+            final Object parsed = tokener.nextValue();
+            if (!(parsed instanceof JSONObject) || !hasOnlyTrailingJsonWhitespace(tokener)) {
+                return null;
+            }
+            final JSONObject root = (JSONObject) parsed;
+            final JSONObject data = root.optJSONObject("data");
+            final JSONObject holder = data != null ? data : root;
+            final String format = holder.optString("format", null);
+            if (!TextUtils.isEmpty(format) && !"ttml".equalsIgnoreCase(format)) {
+                // The row was served in some other format. Nothing here can read it, and guessing
+                // would be the one thing this must not do.
+                return null;
+            }
+            String lyrics = holder.optString("lyrics", null);
+            if (TextUtils.isEmpty(lyrics)) {
+                lyrics = holder.optString("content", null);
+            }
+            return TextUtils.isEmpty(lyrics) ? null : acceptableTtml(lyrics.trim());
+        } catch (Throwable e) {
+            return null;
+        }
+    }
+
+    private static String acceptableTtml(String document) {
+        if (!isWellFormedUtf16(document) || exceedsUtf8Bytes(document, MAX_LYRICS_BYTES)) {
+            return null;
+        }
+        return document;
+    }
+
+    /**
+     * The last gate, and the only one that cannot be fooled by a hand-written check: read the
+     * document back with the parser that will actually play it.
+     *
+     * <p>Three things have to hold, and all of them are about what the source states:
+     * <ol>
+     *   <li>the parser agrees the document is line-synced;</li>
+     *   <li>at least one line carries captured word timing, so this really is word or syllable
+     *       timed rather than a TTML document with one time per line;</li>
+     *   <li>nothing it states runs past the end of the track being played. This is the one
+     *       direction of the duration check that is unambiguous - lyrics may legitimately stop
+     *       long before a track does, because outros exist, but a document whose words are still
+     *       arriving after the audio has ended is timed against a different cut of the song.</li>
+     * </ol>
+     */
+    public static boolean isWordTimedTtml(String ttml, double durationSeconds) {
+        final SyncedLyricsController.Lyrics parsed;
+        try {
+            parsed = SyncedLyricsController.parse(ttml);
+        } catch (Throwable e) {
+            return false;
+        }
+        if (parsed.kind != SyncedLyricsController.Kind.SYNCED) {
+            return false;
+        }
+        final boolean comparable = durationSeconds >= MIN_DURATION_SECONDS && durationSeconds <= MAX_DURATION_SECONDS;
+        final long limit = comparable ? Math.round(durationSeconds * 1000) + AMLL_DURATION_OVERRUN_MS : Long.MAX_VALUE;
+        boolean anyWordTiming = false;
+        for (int a = 0; a < parsed.lines.size(); a++) {
+            final SyncedLyricsController.Line line = parsed.lines.get(a);
+            if (line.timeMs > limit) {
+                return false;
+            }
+            final SyncedLyricsController.Segments segments = line.segments;
+            if (segments == null) {
+                continue;
+            }
+            anyWordTiming = true;
+            final int last = segments.size() - 1;
+            if (segments.startTimeMs(last) > limit) {
+                return false;
+            }
+            if (segments.hasEndTime(last) && segments.endTimeMs(last) > limit) {
+                return false;
+            }
+        }
+        return anyWordTiming;
     }
 
     // endregion

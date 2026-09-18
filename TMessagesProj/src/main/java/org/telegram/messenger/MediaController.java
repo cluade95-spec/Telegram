@@ -2894,6 +2894,59 @@ public class MediaController implements AudioManager.OnAudioFocusChangeListener,
         return playMessage(current);
     }
 
+    /**
+     * Plays one track whose playback context is itself: a downloaded file, a single shared audio,
+     * an inline result. Distinguishes the three things a play request can mean, which is what
+     * {@link #playMessage(MessageObject)} on its own cannot express:
+     *
+     * <ul>
+     *   <li>the track already playing - nothing about the context changes;</li>
+     *   <li>a track the current playlist genuinely owns - play inside it, keeping the playlist,
+     *       its source, its paging and its shuffle order;</li>
+     *   <li>anything else - the track is its own context, so the previous playlist and everything
+     *       that identified where it came from are replaced rather than inherited.</li>
+     * </ul>
+     *
+     * <p>Without the third case a standalone track keeps whatever playlist happened to be loaded:
+     * the player goes on showing the profile or chat it came from, next and previous walk that
+     * list, and loadMoreMusic keeps paging a search the user has left. Voice messages and round
+     * videos have their own playlist handling and are passed straight through.
+     */
+    public boolean playStandaloneMessage(MessageObject messageObject) {
+        if (messageObject == null) {
+            return false;
+        }
+        if (!messageObject.isMusic()) {
+            return playMessage(messageObject);
+        }
+        if (isSamePlayingMessage(messageObject)) {
+            return playMessage(messageObject);
+        }
+        final int existing = playlist.indexOf(messageObject);
+        if (existing >= 0) {
+            // The very object this playlist holds, so this is a play within it, not a new context.
+            currentPlaylistNum = existing;
+            if (SharedConfig.shuffleMusic) {
+                buildShuffledPlayList();
+            }
+            return playMessage(messageObject);
+        }
+        // Same bookkeeping setPlaylist does for a replacement, minus the two things that would
+        // pull a context back in: it must not load the originating dialog's music (that is what
+        // rebuilt the chat playlist), and it must not force the current list to loop, so repeat
+        // and stop-at-end keep behaving normally for a single track.
+        playMusicAgain = !playlist.isEmpty();
+        clearPlaylist();
+        forceLoopCurrentPlaylist = false;
+        playlist.add(messageObject);
+        playlistMap.put(messageObject.getId(), messageObject);
+        currentPlaylistNum = 0;
+        if (SharedConfig.shuffleMusic) {
+            buildShuffledPlayList();
+        }
+        return playMessage(messageObject);
+    }
+
     private void sortPlaylist() {
         Collections.sort(playlist, (o1, o2) -> {
             int mid1 = o1.getId();

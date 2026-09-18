@@ -527,7 +527,9 @@ public class SearchDownloadsContainer extends FrameLayout implements Notificatio
                 SharedAudioCell sharedAudioCell = new SharedAudioCell(parent.getContext()) {
                     @Override
                     public boolean needPlayMessage(MessageObject messageObject) {
-                        return MediaController.getInstance().playMessage(messageObject);
+                        // Downloads has no playlist of its own; without this the track inherits
+                        // the last one that was loaded.
+                        return MediaController.getInstance().playStandaloneMessage(messageObject);
                     }
                 };
                 view = sharedAudioCell;
