@@ -93,19 +93,18 @@ android {
             ndk.debugSymbolLevel = 'FULL'
         }
 
-        // A release build in every respect - same minification, same proguard rules, same release
-        // manifest, same signing identity, same ABIs, same versionCode - that installs under
-        // org.telegram.messenger.beta instead of org.telegram.messenger.
+        // QA build: release-style APK packaging with the same beta/debug Telegram runtime
+        // identity that the previously working test APK used.
         //
-        // The base release applicationId is the Google Play Telegram package, so a QA build of it
-        // cannot be installed alongside the store app and would replace it. The ".beta" suffix is
-        // the same one the debug build already uses, and both are signed with
-        // TMessagesProj/config/release.keystore, so this artifact UPDATES the existing test app.
+        // TMessagesProj has no qaRelease build type. Falling back to "debug" here is intentional:
+        // it keeps BuildVars.DEBUG_VERSION / DEBUG_PRIVATE_VERSION and the beta login/SMS runtime
+        // behaviour from the known-good test build, while this application variant itself remains
+        // non-debuggable, minified and signed with the existing release keystore.
         //
-        // The suffix is deliberately NOT added to the release build type itself: the real release
-        // package must stay exactly what it is.
+        // The ".beta" suffix keeps the APK on org.telegram.messenger.beta so it updates the test
+        // app and never targets the Google Play Telegram package.
         qaRelease {
-            matchingFallbacks = ['release']
+            matchingFallbacks = ['debug']
             applicationIdSuffix ".beta"
             debuggable false
             jniDebuggable false
@@ -113,7 +112,7 @@ android {
             minifyEnabled true
             shrinkResources false
             multiDexEnabled true
-            proguardFiles getDefaultProguardFile('proguard-android.txt'), '../TMessagesProj/proguard-rules.pro'
+            proguardFiles getDefaultProguardFile('proguard-android.txt'), '../TMessagesProj/proguard-rules.pro', '../TMessagesProj/proguard-rules-beta.pro'
             ndk.debugSymbolLevel = 'FULL'
         }
     }
