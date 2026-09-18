@@ -3577,22 +3577,27 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
      */
     static final float KARAOKE_LIFT_DP = 0.9f;
     /**
-     * How many graphemes share one drawn height.
+     * The unit the decoration is DRAWN in: one displayed word, never less.
      *
-     * <p>The lift is a continuous function of the playback position and is never quantised. The
-     * DRAWING still has to group graphemes, because each group costs one clipped pass over the
-     * row's laid-out text - but the grouping is by position in the text, fixed for as long as the
-     * line is on screen, so a grapheme never changes group and therefore never steps. Quantising
-     * the HEIGHT instead, which is what the previous build did, gave every grapheme a small
-     * vertical jump at each level crossing, and device QA saw exactly that as shaking.
+     * <p>This is the correction device QA forced. The previous build cut a word into groups of
+     * four graphemes and gave each group its own height, then drew each group by clipping the row
+     * to that group's columns. A glyph does not stay inside its own advance box - kerning pairs
+     * overhang, accents lean, italics slope, ligatures are one shape over two clusters and Arabic
+     * joins are continuous strokes - so those cuts fell straight through glyph ink, and the two
+     * halves of one letter were drawn at two different heights. That is what "letters change
+     * shape, gain and lose spacing, jump left and right" is.
      *
-     * <p>Four is derived, not chosen: the steepest the rise ever gets is 1.875 (smootherstep's
-     * peak slope), so two graphemes {@code n} apart differ by at most
-     * {@code 1.875 * n * STAGGER_MS / RISE_MS} of the travel - about 0.015 each at the wave's own
-     * constants. Four of them is under a sixth of a pixel of spread inside one group on a normal
-     * screen, which is below anything that can be drawn.
+     * <p>A word, by contrast, has whitespace on both sides. Cutting there cuts nothing. So the
+     * whole word is drawn once, at one height, and no shaped glyph is ever divided for the sake
+     * of the lift.
+     *
+     * <p>Nothing is lost by it: the per-letter offsets are capped at
+     * {@link KaraokeWave#SPREAD_MAX_MS} across the whole word, which at this amplitude is a
+     * twentieth of a pixel between the first letter and the last. The letter wave was never
+     * something a screen could show; the wave that can be seen, and that the reference has, is
+     * between words.
      */
-    static final int KARAOKE_WAVE_RUN_GRAPHEMES = 4;
+    static final boolean KARAOKE_WAVE_DRAWN_PER_WORD = true;
 
     /** Resolved once per document: true only when some line genuinely states inline word timing. */
     private boolean lyricsWordTimed;
@@ -4192,31 +4197,42 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
          * says how fast the singing is, exactly and from the source's own times. The decoration
          * says only that the word has begun, and it says it at the same unhurried speed every time.
          *
-         * <p>A full second. Half of that still read as quick on device: the word arrived at its
-         * raised position while the singer was plainly still on it. At this length the travel is
-         * under three pixels spread over a second, which is slow enough to be felt rather than
-         * watched.
+         * <p>A second and a half. A full second still arrived too soon, and the curve below spends
+         * most of that length on the last stretch: at half the duration the letter is only two
+         * thirds of the way up, and the final twentieth of the travel takes a quarter of a second
+         * on its own. The motion is meant to stop being noticeable before it stops.
          */
-        public static final long RISE_MS = 1000;
+        public static final long RISE_MS = 1500;
         /**
          * How far behind its neighbour each grapheme sets off.
          *
-         * <p>Tiny on purpose - under a hundredth of {@link #RISE_MS}, so every letter of a word is
-         * in motion together and merely a shade out of step: a soft wave passing along the word
-         * rather than a typewriter working through it. At 26ms, which is what device QA saw, the
-         * letters visibly followed one another; the fourth letter of a word did not set off until
-         * the first was a fifth of the way up.
+         * <p>Tiny on purpose, and BOUNDED as a whole by {@link #SPREAD_MAX_MS}. A fixed delay per
+         * letter is fine for a short word and wrong for a long one: at eight milliseconds each, a
+         * fourteen-letter word accumulated a tenth of a second between its first letter and its
+         * last, which device QA saw as the letters still following one another - most obviously on
+         * slow songs, where there is time to watch them do it.
          */
         public static final long STAGGER_MS = 8;
         /**
-         * Floor on the compression, for the degenerate case only.
+         * The most a whole word's letters may spread out, first to last, however long the word is.
          *
-         * <p>A word whose line changes a handful of milliseconds after it starts cannot be given a
-         * meaningful rise at all, and dividing by that room would produce a sub-millisecond one.
-         * It is deliberately far below anything a real line reaches, so every genuine late word is
-         * compressed by exactly what it needs and no more.
+         * <p>This is the number that decides whether the letters read as one movement. At this
+         * spread the head and the tail of a word are under a twentieth of a pixel apart for the
+         * whole of the rise, so they travel together and the wave is carried between words, where
+         * it is big enough to see. It is a property of the word's length alone - never of how long
+         * the word was sung, which is what made slow songs look different from fast ones.
          */
-        public static final float MIN_COMPRESSION = 0.02f;
+        public static final long SPREAD_MAX_MS = 24;
+        /**
+         * Floor on the compression: the fastest the decoration is ever allowed to travel.
+         *
+         * <p>At this floor the rise still takes about a fifth of a second, which is a movement
+         * rather than a pop. A word whose line changes sooner than that cannot be given a graceful
+         * wave by anyone - so it is given the fastest graceful one instead of an instant snap, and
+         * is simply still rising as the row goes. That is the least-bad of the two, and it is a
+         * deliberate choice: the previous floor allowed a thirty-millisecond flick.
+         */
+        public static final float MIN_COMPRESSION = 0.15f;
 
         /** Number of DISPLAYED words on the line. */
         public int count;
@@ -4316,9 +4332,28 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             availableMs = java.util.Arrays.copyOf(availableMs, grown);
         }
 
+        /**
+         * The delay between one letter of a word and the next, in milliseconds.
+         *
+         * <p>{@link #STAGGER_MS} for a short word, and less for a long one - whatever keeps the
+         * whole word inside {@link #SPREAD_MAX_MS} from its first letter to its last. Depends only
+         * on how many letters the word has.
+         */
+        public static float staggerMs(int graphemes) {
+            final int gaps = Math.max(0, graphemes - 1);
+            if (gaps == 0) return 0f;
+            final float even = SPREAD_MAX_MS / (float) gaps;
+            return even < STAGGER_MS ? even : STAGGER_MS;
+        }
+
+        /** First letter to last: never more than {@link #SPREAD_MAX_MS}. */
+        public static float spreadMs(int graphemes) {
+            return staggerMs(graphemes) * Math.max(0, graphemes - 1);
+        }
+
         /** How long the whole wave across {@code graphemes} letters takes at normal speed. */
         public static long spanMs(int graphemes) {
-            return RISE_MS + (long) Math.max(0, graphemes - 1) * STAGGER_MS;
+            return RISE_MS + (long) Math.ceil(spreadMs(graphemes));
         }
 
         /**
@@ -4352,31 +4387,43 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
          * nothing waits for anything - the next letter sets off while this one is still climbing,
          * and so does the next word.
          */
-        public static float graphemeLift(long positionMs, long wordStartMs, int graphemeIndex, float compression) {
+        public static float graphemeLift(long positionMs, long wordStartMs, int graphemeIndex,
+                                        int graphemeCount, float compression) {
             final float scale = compression > 0f ? compression : 1f;
             final float rise = RISE_MS * scale;
             if (rise <= 0f) return 1f;
-            final float elapsed = positionMs - wordStartMs - Math.max(0, graphemeIndex) * STAGGER_MS * scale;
+            final float offset = Math.max(0, graphemeIndex) * staggerMs(graphemeCount) * scale;
+            final float elapsed = positionMs - wordStartMs - offset;
             if (elapsed <= 0f) return 0f;
             if (elapsed >= rise) return 1f;
             return ease(elapsed / rise);
         }
 
         /**
-         * Smootherstep: zero velocity AND zero acceleration at both ends.
+         * Sets off gently, reaches its quickest a third of the way in, and slows for the whole of
+         * the rest: {@code 1 - (1-t)^3 * (1 + 3t)}, whose velocity is {@code 12t(1-t)^2}.
          *
-         * <p>Smoothstep, which this replaces, leaves the baseline with a rising acceleration and
-         * arrives with a falling one; over half a second that read as setting off and getting
-         * there rather than as drifting. This spends longer near both ends and does its travelling
-         * in the middle, which is the calm, continuous motion the reference has.
+         * <p>This replaces smootherstep, which device QA read as wrong in a specific way.
+         * Smootherstep is symmetric - it accelerates for the first half and decelerates for the
+         * second - so the middle of the travel is its fastest part and the motion reads as setting
+         * off, getting there, and stopping. The reference motion is not symmetric: it begins
+         * without a jump, and from very early on it is continuously slowing, spending a long time
+         * creeping the last little way.
          *
-         * <p>Monotonic on [0,1] and bounded by it, so there is no overshoot, no spring and nothing
-         * to come back down from.
+         * <p>This curve is exactly that. Velocity is zero at the start, so there is no flick; it
+         * peaks at a third of the duration and then falls for the remaining two thirds; and it
+         * reaches zero at the end, so the letter settles rather than arriving. It is two thirds of
+         * the way up at half time, 95% at three quarters, and spends the last quarter of the
+         * duration on the final twentieth of the travel.
+         *
+         * <p>Monotonic on [0,1] and bounded by it: no overshoot, no spring, nothing to come back
+         * down from.
          */
         public static float ease(float t) {
             if (t <= 0f) return 0f;
             if (t >= 1f) return 1f;
-            return t * t * t * (t * (6f * t - 15f) + 10f);
+            final float r = 1f - t;
+            return 1f - r * r * r * (1f + 3f * t);
         }
     }
 
@@ -4866,6 +4913,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         private int[] waveStartOffset = new int[8];
         private int[] waveEndOffset = new int[8];
         private long[] waveStartMs = new long[8];
+        private int[] waveGraphemes = new int[8];
         private float[] waveCompression = new float[8];
 
         // --- grapheme clusters of this row ---------------------------------------------------
@@ -5015,8 +5063,10 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                     waveStartOffset[w] = wave.startOffset[w];
                     waveEndOffset[w] = wave.endOffset[w];
                     waveStartMs[w] = wave.startMs[w];
-                    waveCompression[w] = KaraokeWave.compression(wave.availableMs[w],
-                            graphemesBetween(wave.startOffset[w], wave.endOffset[w]));
+                    // The word's own letter count decides both how far its letters may spread and
+                    // how much room its whole wave needs, so it is counted once, here.
+                    waveGraphemes[w] = graphemesBetween(wave.startOffset[w], wave.endOffset[w]);
+                    waveCompression[w] = KaraokeWave.compression(wave.availableMs[w], waveGraphemes[w]);
                 }
             }
             rebuildRunGrouping();
@@ -5067,7 +5117,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                         value = 0f;
                     } else {
                         value = KaraokeWave.graphemeLift(positionMs, waveStartMs[word], grapheme,
-                                waveCompression[word]);
+                                waveGraphemes[word], waveCompression[word]);
                         if (!isBlankCluster(i)) grapheme++;
                     }
                 }
@@ -5080,15 +5130,18 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         }
 
         /**
-         * Groups the row's graphemes into the units the drawing actually translates.
+         * Groups the row's graphemes into the units the drawing actually translates: one
+         * DISPLAYED WORD each, and nothing smaller.
          *
-         * <p>Decided from the text and the wave's word boundaries only, so a grapheme belongs to
-         * the same group for as long as the line is on screen. That is the whole point: a group's
-         * height is a continuous function of the playback position, and because nothing ever
-         * changes group, no grapheme can jump from one height to another. Groups break at
-         * displayed-word boundaries - where there is whitespace, so no glyph straddles the cut -
-         * and every {@link AudioPlayerAlert#KARAOKE_WAVE_RUN_GRAPHEMES} graphemes inside a word,
-         * which keeps the spread inside one group below a fifth of a pixel.
+         * <p>See {@link AudioPlayerAlert#KARAOKE_WAVE_DRAWN_PER_WORD}. A word has whitespace on
+         * both sides, so the cut between two groups falls where there is no ink and cannot divide
+         * a kerning pair, a ligature, an accent or an Arabic joining stroke. Anything finer cuts
+         * through glyphs, and two halves of one letter drawn at two heights is what device QA saw
+         * as letters changing shape and spacing.
+         *
+         * <p>Membership comes from the text and the wave's word boundaries only, never from the
+         * clock, so a grapheme belongs to the same group for as long as the line is on screen and
+         * can never step from one height to another.
          */
         private void rebuildRunGrouping() {
             if (clusterCount == 0) return;
@@ -5100,18 +5153,15 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             int run = 0;
             int word = 0;
             int currentWord = Integer.MIN_VALUE;
-            int inRun = 0;
             for (int i = 0; i < clusterCount; i++) {
                 final int offset = clusterStart[i];
                 while (word < waveCount && offset >= waveEndOffset[word]) word++;
                 final int owner = word >= waveCount || offset < waveStartOffset[word] ? -1 : word;
-                if (owner != currentWord || inRun >= KARAOKE_WAVE_RUN_GRAPHEMES) {
+                if (owner != currentWord) {
                     currentWord = owner;
                     run++;
-                    inRun = 0;
                 }
                 clusterRun[i] = run;
-                inRun++;
             }
         }
 
@@ -5229,30 +5279,36 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
          *
          * <p>With one, the row is cut into vertical strips and each strip is one pass: the same
          * laid-out text, clipped to that strip, translated to that strip's height, coloured for
-         * that strip's side of the fill. The strips tile the row exactly - they are cut at the
-         * boundaries between graphemes and at the fill front, every cut is shared by the two
-         * strips either side of it, and the outermost cuts run off the ends of the visual line -
-         * so every pixel of every glyph is rasterised exactly once, by exactly one pass.
+         * that strip's side of the fill. The strips tile the row exactly - every cut is shared by
+         * the two strips either side of it, and the outermost cuts run off the ends of the visual
+         * line - so every pixel of every glyph is rasterised exactly once, by exactly one pass.
          *
-         * <p>Three properties of that are what the previous build got wrong, and device QA saw all
-         * three:
+         * <p>Where the cuts fall is the whole of the correctness, and it is what two rounds of
+         * device QA were spent on:
          *
          * <ul>
-         *     <li><b>The cuts are rectangles, not paths.</b> {@code clipPath} is ANTIALIASED. Two
-         *     passes tiling complementary sides of the same boundary each covered the boundary
-         *     column partially and each composited the glyph against the background separately, so
-         *     that column came out lighter than a single draw - a one-pixel seam at every cut,
-         *     moving with the wave and with the fill. That reads exactly as letters changing
-         *     weight and shape. A rectangular clip has no partial coverage, so two strips meeting
-         *     at a cut reconstruct the glyph exactly.</li>
+         *     <li><b>A cut for the LIFT only ever falls between displayed words</b>, where there
+         *     is whitespace. Cutting anywhere else divides glyph ink - a kerning pair, an accent,
+         *     a ligature, an Arabic joining stroke - and if the two sides then get different
+         *     heights, one letter is drawn in two pieces at two heights. That is exactly the
+         *     "letters change shape, gain and lose spacing, jump sideways" of the last report, and
+         *     it came from cutting every four graphemes inside a word.</li>
+         *     <li><b>A cut for the COLOUR may fall inside a glyph</b>, because it has to - the fill
+         *     travels across letters. It is safe precisely because both sides keep the SAME
+         *     translation: the identical float, from the same variable. Same geometry, same
+         *     rasterisation, complementary pixels, so the glyph is reconstructed exactly and only
+         *     its colour changes.</li>
+         *     <li><b>The cuts are rectangles, not paths.</b> {@code clipPath} is ANTIALIASED, so
+         *     two passes tiling the same boundary each covered the boundary column partially and
+         *     composited it separately - a lighter one-pixel seam at every cut. A rectangular clip
+         *     has no partial coverage.</li>
          *     <li><b>Every cut is snapped to a whole pixel</b> and both sides are given the same
-         *     snapped value, so the two strips can neither overlap nor leave a gap however the
-         *     device rounds.</li>
-         *     <li><b>The fill front is not a special case.</b> It used to be lifted out of the
-         *     other passes and drawn on its own with a different kind of clip, which is why the
-         *     instability tracked the sweep. It is now simply one more cut inside whichever strip
-         *     it falls in; the two halves share that strip's height and differ only in colour.</li>
+         *     snapped value, so two strips can neither overlap nor leave a gap however the device
+         *     rounds.</li>
          * </ul>
+         *
+         * <p>Neighbouring strips standing at exactly the same height are merged, so the settled
+         * part of a line and the part not yet reached are one pass each and carry no cut at all.
          *
          * <p>Each pass is the platform drawing the row's real {@link Layout}, so the glyphs are the
          * same shaped, kerned, wrapped and bidirectionally reordered glyphs throughout. There is no
@@ -5287,9 +5343,15 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 int end = at;
                 int latest = first;
                 boolean carriesFront = first == frontCluster;
+                final float height = clusterLift[first];
                 while (end + 1 < clusterOrderCount) {
                     final int next = clusterOrder[end + 1];
-                    if (clusterLine[next] != line || clusterRun[next] != run) break;
+                    if (clusterLine[next] != line) break;
+                    // Two neighbouring words standing at EXACTLY the same height need no cut
+                    // between them, and one cut fewer is one fewer place anything can go wrong.
+                    // This is what collapses the settled part of the line, and the part not yet
+                    // reached, into one pass each.
+                    if (clusterRun[next] != run && clusterLift[next] != height) break;
                     if (next == frontCluster) carriesFront = true;
                     if (next > latest) latest = next;
                     last = next;
@@ -5300,13 +5362,12 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 // so a glyph that overhangs its own advance box is still drawn, once, by whichever
                 // strip owns the column it lands in.
                 final float left = at > 0 && clusterLine[clusterOrder[at - 1]] == line
-                        ? snap(0.5f * (clusterRight[clusterOrder[at - 1]] + clusterLeft[first]))
+                        ? cutBetween(clusterOrder[at - 1], first)
                         : -LINE_EDGE_OVERRUN_PX;
                 final float right = end + 1 < clusterOrderCount && clusterLine[clusterOrder[end + 1]] == line
-                        ? snap(0.5f * (clusterRight[last] + clusterLeft[clusterOrder[end + 1]]))
+                        ? cutBetween(last, clusterOrder[end + 1])
                         : LINE_EDGE_OVERRUN_PX;
                 // -1 is the "no frame pushed yet" marker; it rests at the baseline like 0 does.
-                final float height = clusterLift[first];
                 final float lift = height > 0f ? -height * liftAmplitude : 0f;
                 final float top = clusterTop[first];
                 final float bottom = clusterBottom[first];
@@ -5338,6 +5399,29 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             if (shown < 0f) shown = 0f;
             if (shown > width) shown = width;
             return snap(clusterRtl[i] ? clusterRight[i] - shown : clusterLeft[i] + shown);
+        }
+
+        /**
+         * Where to cut between two graphemes that sit side by side on a visual line.
+         *
+         * <p>Through the middle of the whitespace wherever there is any. A cut placed on the
+         * boundary itself sits exactly on the following glyph's origin, and a glyph whose ink
+         * starts left of its origin - a negative side bearing from a kerning pair, a leaning
+         * stroke - would have that sliver drawn by the strip next door, at the wrong height.
+         * Aiming at the centre of the space puts several pixels of nothing on either side of every
+         * cut that matters, which is the whole reason the drawn unit is a word.
+         *
+         * <p>Both strips either side of a cut ask for it with the same two graphemes, so both are
+         * given the same number, and it is snapped to a whole pixel so they cannot overlap or gap.
+         */
+        private float cutBetween(int leftCluster, int rightCluster) {
+            if (isBlankCluster(leftCluster)) {
+                return snap(0.5f * (clusterLeft[leftCluster] + clusterRight[leftCluster]));
+            }
+            if (isBlankCluster(rightCluster)) {
+                return snap(0.5f * (clusterLeft[rightCluster] + clusterRight[rightCluster]));
+            }
+            return snap(0.5f * (clusterRight[leftCluster] + clusterLeft[rightCluster]));
         }
 
         /** Whole pixels, so two strips meeting at a cut are given exactly the same edge. */
@@ -5490,6 +5574,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             waveStartOffset = java.util.Arrays.copyOf(waveStartOffset, grown);
             waveEndOffset = java.util.Arrays.copyOf(waveEndOffset, grown);
             waveStartMs = java.util.Arrays.copyOf(waveStartMs, grown);
+            waveGraphemes = java.util.Arrays.copyOf(waveGraphemes, grown);
             waveCompression = java.util.Arrays.copyOf(waveCompression, grown);
         }
 
