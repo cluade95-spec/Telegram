@@ -28,10 +28,12 @@ import android.graphics.Color;
 import android.graphics.LinearGradient;
 import android.graphics.Matrix;
 import android.graphics.Paint;
+import android.graphics.Path;
 import android.graphics.PorterDuff;
 import android.graphics.PorterDuffColorFilter;
 import android.graphics.PorterDuffXfermode;
 import android.graphics.RectF;
+import android.graphics.RenderEffect;
 import android.graphics.Shader;
 import android.graphics.Typeface;
 import android.graphics.drawable.BitmapDrawable;
@@ -40,6 +42,7 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.SystemClock;
+import android.text.Layout;
 import android.text.Spannable;
 import android.text.SpannableStringBuilder;
 import android.text.Spanned;
@@ -2581,9 +2584,17 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             cancelLyricsFollow();
             currentLyrics = lyrics;
             visibleLyrics.clear();
+            lyricsWordTimed = false;
             for (int i = 0; i < lyrics.lines.size(); i++) {
-                if (lyrics.kind == SyncedLyricsController.Kind.PLAIN || !TextUtils.isEmpty(lyrics.lines.get(i).text)) visibleLyrics.add(i);
+                final SyncedLyricsController.Line line = lyrics.lines.get(i);
+                if (lyrics.kind == SyncedLyricsController.Kind.PLAIN || !TextUtils.isEmpty(line.text)) visibleLyrics.add(i);
+                // The karaoke presentation is a property of the document, not of one line: a file
+                // that genuinely states word timing anywhere is laid out as a karaoke page
+                // throughout, so its rows never differ in size or weight from one another. A file
+                // that states none is left exactly as it was.
+                if (line.timed && line.segments != null && !TextUtils.isEmpty(line.text)) lyricsWordTimed = true;
             }
+            lyricsWordTimed &= lyrics.isSynced();
             updateLyricsPadding();
             activeLyricsLine = Integer.MIN_VALUE;
             activeLyricsRow = RecyclerView.NO_POSITION;
@@ -3414,70 +3425,102 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
 
     // ---------------------------------------------------------------------------------------
     // Word-level karaoke. Only the line whose OWN timestamp has already passed can show word
-    // highlighting, and inside it a range lights up only once the time the source stated for that
-    // range has passed. Nothing here derives a time from a word's length, from the line's
+    // highlighting, and inside it a word lights up only once the time the source stated for that
+    // word has passed. Nothing here derives a semantic time from a word's length, from the line's
     // duration, or from anything other than the timestamps captured out of the source, and a line
     // that states none simply keeps the whole-line behaviour it always had.
+    //
+    // The presentation has exactly three parts, and all three are pure functions of the playback
+    // position: the type/depth hierarchy of the page, a tiny lift on the word that has just begun,
+    // and a horizontal fill that travels across that word's glyphs. Nothing keeps animation state
+    // that a seek, a pause or a rebind would have to unwind.
     // ---------------------------------------------------------------------------------------
 
-    /**
-     * How long a single range takes to reach its full colour once its stated time has passed. It
-     * is an appearance transition, bounded by the gap to the next stated time, so a word can never
-     * still be arriving when the next one begins. It never moves a boundary.
-     */
-    private static final long KARAOKE_TRANSITION_MS = 150;
-    /**
-     * How much of the active colour text that has not been sung yet is allowed to take. Enough that
-     * the line reads as the current one from the moment it arrives, while still leaving the sung
-     * text unmistakably ahead of it.
-     */
-    private static final float KARAOKE_UNSUNG_EMPHASIS = 0.38f;
+    /** Lyric size for a document that genuinely states word timing. Constant for the whole page. */
+    private static final int KARAOKE_TEXT_SIZE_DP = 22;
+    /** Opacity of a karaoke line at the focus centre but not current. */
+    private static final float KARAOKE_REST_ALPHA = 0.74f;
+    /** How much of that opacity the distance falloff is allowed to take. */
+    private static final float KARAOKE_REST_ALPHA_FALLOFF = 0.20f;
+    /** Opacity of the current line. Deliberately only a little above its neighbours. */
+    private static final float KARAOKE_ACTIVE_ALPHA = 0.96f;
+    /** Blur, in dp, a karaoke line furthest from the focus centre carries. Small on purpose. */
+    private static final float KARAOKE_BLUR_MAX_DP = 2.4f;
+    /** How much of the active colour sung text takes on a line that is not the current one. */
+    private static final float KARAOKE_SUNG_REST = 0.50f;
+    /** How much of it text that has not been sung takes, at rest and on the current line. */
+    private static final float KARAOKE_MUTED_REST = 0.10f;
+    private static final float KARAOKE_MUTED_ACTIVE = 0.30f;
+    /** Amplitude, in dp, of the lift the word that has just begun makes. Draw-time only. */
+    private static final float KARAOKE_LIFT_DP = 3f;
 
-    private final SyncedLyricsController.Karaoke karaoke = new SyncedLyricsController.Karaoke();
+    /** Resolved once per document: true only when some line genuinely states inline word timing. */
+    private boolean lyricsWordTimed;
+
+    /** The frame the current line is painting. Scratch for one tick; carries nothing between two. */
+    private final KaraokeFrame karaoke = new KaraokeFrame();
     /** Scratch holder for painting one row; never carries state between two calls. */
-    private final SyncedLyricsController.Karaoke rowKaraoke = new SyncedLyricsController.Karaoke();
+    private final KaraokeFrame rowKaraoke = new KaraokeFrame();
     /** The line the playback position is actually inside, whether or not it states word timing. */
     private int karaokeLine = Integer.MIN_VALUE;
     private long karaokePositionMs;
     private int karaokeRow = RecyclerView.NO_POSITION;
-    private int paintedKaraokeEnd = -1;
-    private boolean paintedKaraokeSettled;
+    /** Stated start of the next timed line, cached per line so no tick walks the document. */
+    private long karaokeNextLineTimeMs = Long.MAX_VALUE;
+    /** The palette the rows were last painted with, so a theme change repaints them all once. */
+    private int karaokeMutedSource;
+    private int karaokeSungSource;
 
     /**
      * Resolves the word state for the line the position is actually inside, and repaints what
      * changed. Deliberately driven by the real position rather than by the follow animation: the
      * follow promotes the next line up to a pre-roll early, and no word of that line may light up
      * before its own stated time.
+     *
+     * <p>Within one line only the current row can change, so a tick costs one binary search and, if
+     * the frame actually moved, one invalidate on one row. A settled row costs nothing.
      */
     private void updateKaraoke(int line, long positionMs) {
-        final boolean resolved = currentLyrics != null && currentLyrics.isSynced()
-                && line >= 0 && line < currentLyrics.lines.size()
-                && karaoke.resolve(currentLyrics.lines.get(line), positionMs, KARAOKE_TRANSITION_MS);
-        if (!resolved) karaoke.clear();
+        final boolean resolvable = currentLyrics != null && lyricsWordTimed
+                && line >= 0 && line < currentLyrics.lines.size();
         karaokePositionMs = positionMs;
-        final boolean lineChanged = line != karaokeLine;
-        final boolean rangeChanged = karaoke.sungEnd != paintedKaraokeEnd || !paintedKaraokeSettled;
-        karaokeLine = line;
-        karaokeRow = resolved ? rowForLyricsLine(line) : RecyclerView.NO_POSITION;
-        paintedKaraokeEnd = karaoke.sungEnd;
-        paintedKaraokeSettled = karaoke.fadeProgress >= 1f;
-        if (lineChanged) {
+        if (line != karaokeLine) {
+            karaokeLine = line;
+            karaokeNextLineTimeMs = nextLyricsLineTimeMs(line);
+            karaokeMutedSource = getThemedColor(Theme.key_player_time);
+            karaokeSungSource = getThemedColor(Theme.key_player_actionBarTitle);
+            karaokeRow = resolvable ? rowForLyricsLine(line) : RecyclerView.NO_POSITION;
             // Every attached row derives its own state from which side of the current line it is
             // on, so a line change - including a seek across several lines - repaints them all.
             updateLyricsDepth();
             return;
         }
-        // Within one line only that line can change: a settled range repaints nothing until the
-        // next one arrives, so a long word costs no work per tick.
-        if (karaokeRow != RecyclerView.NO_POSITION && rangeChanged) {
-            repaintLyricsRow(karaokeRow);
+        // A theme swapped underneath an open player changes the palette but not the position, so
+        // it costs two lookups a tick to notice and one repaint of the page to answer.
+        final int inactiveColor = getThemedColor(Theme.key_player_time);
+        final int activeColor = getThemedColor(Theme.key_player_actionBarTitle);
+        if (inactiveColor != karaokeMutedSource || activeColor != karaokeSungSource) {
+            karaokeMutedSource = inactiveColor;
+            karaokeSungSource = activeColor;
+            updateLyricsDepth();
+            return;
+        }
+        if (!resolvable || karaokeRow == RecyclerView.NO_POSITION || lyricsLayoutManager == null) return;
+        final View child = lyricsLayoutManager.findViewByPosition(karaokeRow);
+        if (!(child instanceof LyricsTextView)) return;
+        if (karaoke.resolveRow(currentLyrics.lines.get(line), line, karaokeLine, positionMs, karaokeNextLineTimeMs)) {
+            ((LyricsTextView) child).setKaraokeFrame(karaoke.wordStart, karaoke.wordEnd, karaoke.sweep, karaoke.lift);
         }
     }
 
-    private void repaintLyricsRow(int row) {
-        if (lyricsListView == null || lyricsLayoutManager == null || row == RecyclerView.NO_POSITION) return;
-        final View child = lyricsLayoutManager.findViewByPosition(row);
-        if (child != null) applyLyricsDepth(child);
+    /** Stated start of the first timed line after {@code line}, or MAX_VALUE when there is none. */
+    private long nextLyricsLineTimeMs(int line) {
+        if (currentLyrics == null || line < 0) return Long.MAX_VALUE;
+        for (int i = line + 1; i < currentLyrics.lines.size(); i++) {
+            final SyncedLyricsController.Line next = currentLyrics.lines.get(i);
+            if (next.timed) return next.timeMs;
+        }
+        return Long.MAX_VALUE;
     }
 
     private void resetKaraoke() {
@@ -3486,17 +3529,21 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         karaokeLine = Integer.MIN_VALUE;
         karaokePositionMs = 0;
         karaokeRow = RecyclerView.NO_POSITION;
-        paintedKaraokeEnd = -1;
-        paintedKaraokeSettled = false;
+        karaokeNextLineTimeMs = Long.MAX_VALUE;
     }
 
     private void applyLyricsDepth(View child) {
         if (lyricsListView.getHeight() == 0) return;
+        final LyricsTextView textView = child instanceof LyricsTextView ? (LyricsTextView) child : null;
         if (currentLyrics == null || !currentLyrics.isSynced()) {
             // Untimed lyrics are read, not followed: no invented focus, no depth falloff.
             child.setAlpha(1f);
             child.setScaleX(1f);
             child.setScaleY(1f);
+            if (textView != null) {
+                textView.clearKaraoke();
+                textView.setDepthBlur(0f);
+            }
             return;
         }
         final RecyclerView.ViewHolder holder = lyricsListView.findContainingViewHolder(child);
@@ -3511,46 +3558,50 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         // subordinate is the point. Linear distance did the opposite of both.
         final float linear = Math.min(1f, distance);
         final float depth = linear * linear * (3f - 2f * linear);
-        final float restAlpha = 0.84f - depth * .46f;
-        final float restScale = 0.978f - depth * .03f;
-        child.setAlpha(lerp(restAlpha, 1f, emphasis));
-        final float scale = lerp(restScale, 1f, emphasis);
-        child.setScaleX(scale);
-        child.setScaleY(scale);
-        if (child instanceof LyricsTextView) {
-            final LyricsTextView textView = (LyricsTextView) child;
+        if (lyricsWordTimed) {
+            // Depth is carried by opacity and a small real blur, and by nothing else. There is no
+            // scale here: a karaoke page is meant to read as one layered surface, and a zoom on the
+            // current line would fight the word motion that is the point of it.
+            child.setAlpha(lerp(KARAOKE_REST_ALPHA - depth * KARAOKE_REST_ALPHA_FALLOFF, KARAOKE_ACTIVE_ALPHA, emphasis));
+            child.setScaleX(1f);
+            child.setScaleY(1f);
+            if (textView != null) {
+                textView.setDepthBlur(lerp(depth * dp(KARAOKE_BLUR_MAX_DP), 0f, emphasis));
+            }
+        } else {
+            final float restAlpha = 0.84f - depth * .46f;
+            final float restScale = 0.978f - depth * .03f;
+            child.setAlpha(lerp(restAlpha, 1f, emphasis));
+            final float scale = lerp(restScale, 1f, emphasis);
+            child.setScaleX(scale);
+            child.setScaleY(scale);
+            if (textView != null) textView.setDepthBlur(0f);
+        }
+        if (textView != null) {
             final int inactiveColor = getThemedColor(Theme.key_player_time);
             final int activeColor = getThemedColor(Theme.key_player_actionBarTitle);
             final SyncedLyricsController.Line lyricLine = lineForLyricsRow(row);
-            if (lyricLine != null && rowKaraoke.resolveRow(lyricLine, visibleLyrics.get(row), karaokeLine,
-                    karaokePositionMs, KARAOKE_TRANSITION_MS)) {
-                // Word timing splits what used to be one colour into two: a range takes the active
-                // colour only once the time stated for it has passed, and what is still to come
-                // keeps a hint of it so the line still reads as the current one. A line already
-                // passed is wholly sung and fades out with the emphasis exactly as a whole-line
-                // highlight always did; a line the pre-roll is bringing in early shows nothing lit
-                // until its own time. Every other part of the line's prominence - alpha, scale,
-                // weight, movement - is untouched.
-                final int sungColor = ColorUtils.blendARGB(inactiveColor, activeColor, emphasis);
-                final int unsungColor = ColorUtils.blendARGB(inactiveColor, activeColor, emphasis * KARAOKE_UNSUNG_EMPHASIS);
-                // The range that has just begun eases into its colour instead of ramping linearly,
-                // so a word catches the light quickly and settles rather than sliding. Only the
-                // colour is eased: the boundary it applies to is the one the source stated, and
-                // KARAOKE_TRANSITION_MS cannot move it.
-                final float arrived = CubicBezierInterpolator.EASE_OUT.getInterpolation(
-                        Math.max(0f, Math.min(1f, rowKaraoke.fadeProgress)));
-                textView.setTextColor(unsungColor);
-                textView.applyKaraoke(rowKaraoke.fadeStart, rowKaraoke.sungEnd, sungColor,
-                        ColorUtils.blendARGB(unsungColor, sungColor, arrived));
+            if (lyricsWordTimed && lyricLine != null && rowKaraoke.resolveRow(lyricLine, visibleLyrics.get(row),
+                    karaokeLine, karaokePositionMs, karaokeNextLineTimeMs)) {
+                // Word timing splits what used to be one colour into two: text the source has
+                // reached takes the active colour, text it has not stays muted, and the word that
+                // is being sung right now is filled from the muted colour into the active one by a
+                // clip that travels across its glyphs. A line already passed is wholly sung; a line
+                // the pre-roll is bringing in early shows nothing lit until its own time.
+                final int sungColor = ColorUtils.blendARGB(inactiveColor, activeColor, lerp(KARAOKE_SUNG_REST, 1f, emphasis));
+                final int mutedColor = ColorUtils.blendARGB(inactiveColor, activeColor, lerp(KARAOKE_MUTED_REST, KARAOKE_MUTED_ACTIVE, emphasis));
+                textView.setLyricTextColor(mutedColor);
+                textView.setKaraokeColors(mutedColor, sungColor);
+                textView.setKaraokeFrame(rowKaraoke.wordStart, rowKaraoke.wordEnd, rowKaraoke.sweep, rowKaraoke.lift);
             } else {
                 textView.clearKaraoke();
-                textView.setTextColor(ColorUtils.blendARGB(inactiveColor, activeColor, emphasis));
+                textView.setLyricTextColor(ColorUtils.blendARGB(inactiveColor, activeColor, emphasis));
             }
-            // Emphasis is carried by colour, opacity and scale alone. Weight is deliberately not
-            // part of it: a typeface is metric-affecting, so switching it re-measures the row, can
-            // re-wrap a long line into a different height and move every row below it, and it can
-            // only ever cross over at one point rather than interpolate. Scale is a draw-time
-            // transform, so it expresses the same hierarchy continuously and never reflows text.
+            // Emphasis is carried by colour, opacity and blur alone. Weight and size are
+            // deliberately not part of it: a typeface or a text size is metric-affecting, so
+            // switching it re-measures the row, can re-wrap a long line into a different height and
+            // move every row below it, and it can only ever cross over at one point rather than
+            // interpolate. Both are chosen once when the row is bound and never touched again.
         }
     }
 
@@ -3805,89 +3856,243 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
     }
 
     /**
-     * A lyrics row. Identical to the plain {@link TextView} it replaces in every layout respect -
-     * same gravity, padding, sizing and text direction - it only adds the two colour spans word
-     * highlighting needs.
+     * Everything the large player needs to paint one lyric line at one playback position, and
+     * nothing else. It is a pure function of the position and of the times the source stated: the
+     * same position always produces the same frame, so a seek, a pause, a track change, a theme
+     * change or a recycled row rebinding all reconstruct the correct picture immediately, and no
+     * part of the presentation has state of its own that would have to be unwound.
      *
-     * <p>Highlighting is done with character spans rather than by clipping or measuring text.
-     * That hands wrapping, bidirectional reordering and grapheme boundaries back to the platform:
-     * a highlighted range that wraps onto a second visual line, or that is a logical range inside
-     * RTL text and therefore paints as several visual runs, is drawn by exactly the code that
-     * draws a text selection. Both spans change colour only and neither affects metrics, so the
-     * line is never re-measured, never re-wrapped and never moves while it is being sung.
+     * <p>Note what is <em>not</em> here: nothing invents a word's end, stores one, or lets a visual
+     * interval feed back into which word or line is current. {@link #wordStart}/{@link #wordEnd}
+     * come straight from the source's offsets and {@link #sweep} is decided after them, never the
+     * other way round.
      */
-    private static class LyricsTextView extends TextView {
+    public static final class KaraokeFrame {
+        /**
+         * Longest a fill derived for start-only word timing (Enhanced LRC) may take. It is a
+         * rendering constant, not a claim about how long the word lasts; where the source states a
+         * genuine end, that end is used instead and this is ignored.
+         */
+        public static final long SWEEP_DERIVED_MAX_MS = 320;
+        /** Used only when start-only timing gives nothing at all to bound the fill with. */
+        public static final long SWEEP_DERIVED_FALLBACK_MS = 260;
+        /** Shortest and longest the lift may take, so a very quick word still visibly moves. */
+        public static final long LIFT_MIN_MS = 60;
+        public static final long LIFT_MAX_MS = 260;
+        /** Fraction of the lift spent rising; the rest is the settle back to the normal position. */
+        private static final float LIFT_RISE = 0.34f;
+
+        /** True when this line has genuine inline timing to show at the resolved position. */
+        public boolean active;
+        /**
+         * Exclusive UTF-16 end, in {@link SyncedLyricsController.Line#text}, of the text the source
+         * has finished. Always a segment boundary, so it never falls inside a surrogate pair.
+         */
+        public int sungEnd;
+        /** Range of the word being sung right now. Empty when no word has begun on this line. */
+        public int wordStart;
+        public int wordEnd;
+        /** 0..1 across the word at {@link #wordStart}: how much of it the fill has travelled. */
+        public float sweep;
+        /** 0..1 amplitude of the word's lift, starting and ending at 0. */
+        public float lift;
+
+        public void clear() {
+            active = false;
+            sungEnd = 0;
+            wordStart = 0;
+            wordEnd = 0;
+            sweep = 0f;
+            lift = 0f;
+        }
+
+        /**
+         * Resolves this holder for one line of a document, given which line the position is
+         * currently inside. This is the whole of the decision: a line the position has already
+         * left has had every word it states started, so all of it has been sung; a line the
+         * position has not reached yet states nothing that has happened, so none of it has, even
+         * if a player is already moving it into view. Only the current line is resolved against
+         * the clock.
+         *
+         * <p>Returning false means this line has no genuine inline timing at all, and is the
+         * signal to render it exactly the way it was rendered before word timing existed.
+         */
+        public boolean resolveRow(SyncedLyricsController.Line line, int lineIndex, int currentLine,
+                                  long positionMs, long nextLineTimeMs) {
+            clear();
+            if (line == null || line.segments == null || line.text.isEmpty()) return false;
+            if (lineIndex == currentLine) {
+                if (resolve(line, positionMs, nextLineTimeMs)) return true;
+                clear(); // the line's own timestamp has not been reached, so nothing has happened
+            } else if (lineIndex < currentLine) {
+                // Already left behind: every word it states has started, so all of it is sung. This
+                // is also what keeps a fast line's last word from being swallowed - it finishes
+                // lit rather than being caught mid-fill by the line change.
+                sungEnd = wordStart = wordEnd = line.text.length();
+            }
+            // Everything else is a line the position has not reached - including one a player is
+            // already moving into view - and clear() has left every boundary at zero.
+            active = true;
+            return true;
+        }
+
+        /**
+         * Resolves this holder against one line at one playback position, and reports whether the
+         * line has genuine timing to show.
+         *
+         * <p>Returning false is the fallback path: a line with no inline timing, a line whose own
+         * timestamp has not been reached, and an untimed line all land there, and the consumer is
+         * expected to fall back to line-level behaviour rather than invent anything.
+         *
+         * @param nextLineTimeMs the stated start of the line after this one, or
+         *                       {@link Long#MAX_VALUE} when there is none. It is one of the genuine
+         *                       times a derived fill may be bounded by; it is never stored as a
+         *                       word's end.
+         */
+        public boolean resolve(SyncedLyricsController.Line line, long positionMs, long nextLineTimeMs) {
+            clear();
+            if (line == null || line.segments == null || line.text.isEmpty()) return false;
+            if (!line.timed || positionMs < line.timeMs) return false;
+            final SyncedLyricsController.Segments segments = line.segments;
+            final int index = segments.indexAt(positionMs);
+            if (index < 0) {
+                // The line is current but its first stated tag has not been reached. Any text
+                // before that tag carries no timing of its own; it belongs to the line and takes
+                // the line's own granularity, which is the only thing stated about it.
+                sungEnd = wordStart = wordEnd = segments.startOffset(0);
+                active = true;
+                return true;
+            }
+            wordStart = segments.startOffset(index);
+            wordEnd = Math.max(wordStart, segments.endOffset(index));
+            sungEnd = wordStart;
+            final long start = segments.startTimeMs(index);
+            final long elapsed = Math.max(0L, positionMs - start);
+            final long sweepMs = sweepWindowMs(segments, index, nextLineTimeMs);
+            sweep = sweepMs <= 0 ? 1f : clamp01(elapsed / (float) sweepMs);
+            final long liftMs = Math.max(LIFT_MIN_MS, Math.min(LIFT_MAX_MS, sweepMs <= 0 ? LIFT_MIN_MS : sweepMs));
+            lift = liftCurve(elapsed / (float) liftMs);
+            active = true;
+            return true;
+        }
+
+        /**
+         * How long the fill across one word takes, in milliseconds.
+         *
+         * <p>Where the source stated an end for the word - TTML does, per span - that stated
+         * interval <em>is</em> the answer: the fill is 0 at the stated start and 1 at the stated
+         * end, and nothing shortens or lengthens it. Where the source stated a start only -
+         * Enhanced LRC always does - there is no end to follow, so the fill is given a short
+         * completion interval bounded by the next genuine timestamp: the next word's stated start,
+         * or failing that the next line's. That interval exists only to draw with. It is never
+         * written back, never stored on the word, and never decides which word is current.
+         */
+        public static long sweepWindowMs(SyncedLyricsController.Segments segments, int index, long nextLineTimeMs) {
+            final long start = segments.startTimeMs(index);
+            if (segments.hasEndTime(index)) return segments.endTimeMs(index) - start;
+            long bound = -1;
+            if (index + 1 < segments.size()) {
+                bound = segments.startTimeMs(index + 1) - start;
+            } else if (nextLineTimeMs != Long.MAX_VALUE) {
+                bound = nextLineTimeMs - start;
+            }
+            if (bound <= 0) return SWEEP_DERIVED_FALLBACK_MS;
+            return Math.min(bound, SWEEP_DERIVED_MAX_MS);
+        }
+
+        /**
+         * Normal position, a quick rise, then a smooth settle back to the normal position. It
+         * starts and ends at exactly 0 and never goes below it, so the word lifts and settles
+         * rather than bouncing, and it reaches most of its travel early so a word that lasts only
+         * a few frames still moves visibly instead of dying halfway up a ramp.
+         */
+        public static float liftCurve(float t) {
+            if (t <= 0f || t >= 1f) return 0f;
+            if (t < LIFT_RISE) {
+                final float p = t / LIFT_RISE;
+                return 1f - (1f - p) * (1f - p);
+            }
+            final float p = (t - LIFT_RISE) / (1f - LIFT_RISE);
+            return 1f - p * p * (3f - 2f * p);
+        }
+
+        private static float clamp01(float value) {
+            return value < 0f ? 0f : value > 1f ? 1f : value;
+        }
+    }
+
+    /**
+     * The draw-time half of the karaoke presentation: where the word being sung actually sits on
+     * the page, how far across it the fill has travelled, and which side it is read from. Every
+     * method here is pure, so the picture is decided by the playback position and the row's own
+     * {@link Layout} and by nothing that has to be kept, cancelled or unwound.
+     *
+     * <p>Nothing here measures text. The one method that asks where something is asks the
+     * {@link Layout} the row is already drawing from, so shaping, kerning, wrapping, bidirectional
+     * reordering and grapheme clusters stay the platform's answer rather than becoming this class's
+     * approximation of it.
+     */
+    public static final class KaraokeGeometry {
         private static final int ZERO_WIDTH_JOINER = 0x200D;
 
-        private final KaraokeSpan sungSpan = new KaraokeSpan();
-        private final KaraokeSpan arrivingSpan = new KaraokeSpan();
-        /** The view's own mutable copy of the text, or null for a line with no inline timing. */
-        private Spannable karaokeText;
-        private int spanStart = -1;
-        private int spanEnd = -1;
-        /** The last offsets asked for, before snapping, so an unchanged frame rescans nothing. */
-        private int requestedStart = -1;
-        private int requestedEnd = -1;
-
-        LyricsTextView(Context context) {
-            super(context);
-        }
+        private KaraokeGeometry() {}
 
         /**
-         * Binds the row's text. Only a line that genuinely states inline timing is kept spannable;
-         * every other row is a plain string, exactly as before.
+         * Horizontal position of one offset on one visual line.
+         *
+         * <p>{@link Layout#getPrimaryHorizontal} resolves an offset that sits exactly on a wrap to
+         * the <em>following</em> line, so the end of a word that wraps would be reported at the
+         * start of the next line rather than at the end of this one. Such an offset is taken from
+         * this line's own visible extent instead - past the trailing whitespace where there is any,
+         * and from the line's measured edge where the wrap fell mid-word and there is none.
          */
-        void setLyricText(CharSequence text, boolean wordTimed) {
-            detachSpans();
-            if (wordTimed) {
-                // TextView always makes its own spannable copy here, so the one to colour is the
-                // one it ends up holding, not the one handed in.
-                setText(text, BufferType.SPANNABLE);
-                final CharSequence bound = getText();
-                karaokeText = bound instanceof Spannable ? (Spannable) bound : null;
-            } else {
-                setText(text);
-                karaokeText = null;
-            }
-        }
-
-        /**
-         * Paints {@code [0, arrivingStart)} as sung, {@code [arrivingStart, sungEnd)} in the
-         * colour the caller has eased for the range that is currently arriving, and leaves the
-         * rest to the view's own text colour. Both offsets come from the parser, so they are
-         * always on a character boundary; {@link #clusterEnd} then keeps them off the inside of a
-         * grapheme cluster as well.
-         */
-        void applyKaraoke(int arrivingStart, int sungEnd, int sungColor, int arrivingColor) {
-            if (karaokeText == null) return;
-            boolean changed = false;
-            // A settled line is repainted for its colours alone on every emphasis frame, and the
-            // boundaries it asks for are then identical; there is nothing to look at again.
-            if (requestedStart != arrivingStart || requestedEnd != sungEnd) {
-                requestedStart = arrivingStart;
-                requestedEnd = sungEnd;
-                final int start = clusterEnd(karaokeText, arrivingStart);
-                final int end = Math.max(start, clusterEnd(karaokeText, sungEnd));
-                if (spanStart != start || spanEnd != end) {
-                    spanStart = start;
-                    spanEnd = end;
-                    setRange(sungSpan, 0, start);
-                    setRange(arrivingSpan, start, end);
-                    changed = true;
+        public static float horizontalAt(Layout layout, int line, int offset) {
+            final int lineStart = layout.getLineStart(line);
+            final int lineEnd = layout.getLineEnd(line);
+            if (offset <= lineStart) return layout.getPrimaryHorizontal(lineStart);
+            if (offset >= lineEnd) {
+                final int visibleEnd = layout.getLineVisibleEnd(line);
+                if (visibleEnd > lineStart && visibleEnd < lineEnd) {
+                    return layout.getPrimaryHorizontal(visibleEnd);
                 }
+                return layout.getParagraphDirection(line) == Layout.DIR_RIGHT_TO_LEFT
+                        ? layout.getLineLeft(line) : layout.getLineRight(line);
             }
-            changed |= sungSpan.setColor(sungColor);
-            changed |= arrivingSpan.setColor(arrivingColor);
-            // SpannableString does not report span changes to a SpanWatcher, and a colour changed
-            // in place is not a change the text could report anyway, so every repaint here is this
-            // one. It is also the reason nothing in this class can trigger a re-measure.
-            if (changed) invalidate();
+            return layout.getPrimaryHorizontal(offset);
+        }
+
+        /**
+         * Which way the fill travels across one visual run, taken from where the run's two ends
+         * actually landed: an RTL word's logical start is its right edge, so it fills right to
+         * left. The paragraph's direction is only the tie-break for a run too narrow to tell.
+         */
+        public static boolean isRightToLeft(float from, float to, boolean paragraphRightToLeft) {
+            if (to < from) return true;
+            if (to > from) return false;
+            return paragraphRightToLeft;
+        }
+
+        /**
+         * How much of one visual line's share of the word is filled, given how much of the word has
+         * been filled in total and how much of it the earlier lines account for. A word that wraps
+         * therefore fills its first line completely before its second begins, which is the order it
+         * is read in.
+         */
+        public static float revealedWidth(float reveal, float consumedBefore, float lineWidth) {
+            final float shown = reveal - consumedBefore;
+            if (shown <= 0f) return 0f;
+            return shown > lineWidth ? lineWidth : shown;
+        }
+
+        /** Left edge of the filled rectangle, grown from whichever side the run is read from. */
+        public static float revealedLeft(float left, float right, float revealed, boolean rightToLeft) {
+            return rightToLeft ? right - revealed : left;
         }
 
         /**
          * Moves a highlight boundary off the inside of a grapheme cluster, forward to its end.
          *
-         * <p>A stated offset is always a whole character - the parser will not split a surrogate
+         * <p>A stated offset is normally a whole character - the parser will not split a surrogate
          * pair - but a whole character can still be the middle of something that has to be drawn
          * as one unit: a base and its combining marks, the two halves of a ZWJ emoji sequence, a
          * variation selector, a flag. Colouring half of one would show a lit letter under a dim
@@ -3897,10 +4102,14 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
          * timestamp, and for the way real files are tagged - at word boundaries - it changes
          * nothing at all.
          */
-        private static int clusterEnd(CharSequence text, int offset) {
+        public static int clusterEnd(CharSequence text, int offset) {
             final int length = text.length();
             int end = Math.max(0, Math.min(length, offset));
             while (end > 0 && end < length) {
+                if (Character.isLowSurrogate(text.charAt(end)) && Character.isHighSurrogate(text.charAt(end - 1))) {
+                    end++; // never leave a boundary between the two halves of one code point
+                    continue;
+                }
                 final int next = Character.codePointAt(text, end);
                 final int previous = Character.codePointBefore(text, end);
                 if (previous == ZERO_WIDTH_JOINER || isMark(next) || isVariationSelector(next)) {
@@ -3943,12 +4152,321 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             }
             return count;
         }
+    }
+
+    /**
+     * A lyrics row. Identical to the plain {@link TextView} it replaces in every layout respect -
+     * same gravity, padding, sizing and text direction - it adds only what the karaoke
+     * presentation draws: three colour spans, a tiny draw-time lift on the word being sung, and a
+     * clip that fills that word across its glyphs.
+     *
+     * <p>Every one of those is a draw-time effect. The spans change colour only, the lift is a
+     * canvas translation, and the fill is a clip: none of them is metric-affecting, none changes
+     * the row's measured width or height, and none moves a character of the surrounding text. The
+     * line is never re-measured, never re-wrapped and never reflows while it is being sung.
+     *
+     * <p>The text itself is always drawn by the platform, from the row's own {@link Layout}. That
+     * hands shaping, kerning, wrapping, bidirectional reordering and grapheme clusters back to
+     * Android: a word that wraps onto a second visual line, or that is a logical range inside RTL
+     * text, is laid out and drawn by exactly the code that would have drawn it unhighlighted.
+     */
+    private static class LyricsTextView extends TextView {
+        /** Text the source has finished, the word being sung, and text it has not reached. */
+        private final KaraokeSpan sungSpan = new KaraokeSpan();
+        private final KaraokeSpan wordSpan = new KaraokeSpan();
+        private final KaraokeSpan tailSpan = new KaraokeSpan();
+        /** The view's own mutable copy of the text, or null for a line with no inline timing. */
+        private Spannable karaokeText;
+
+        private boolean karaokeActive;
+        private int mutedColor;
+        private int sungColor;
+        /** The last offsets asked for, before snapping, so an unchanged frame rescans nothing. */
+        private int requestedStart = -1;
+        private int requestedEnd = -1;
+        /** The cluster-snapped range actually painted. */
+        private int wordStart;
+        private int wordEnd;
+        private float sweep;
+        private float lift;
+        private final float liftAmplitude = dp(KARAOKE_LIFT_DP);
+        /** Cached so a repaint with an unchanged colour never allocates a ColorStateList. */
+        private int lyricTextColor;
+        private boolean lyricTextColorSet;
+        /** Quantised blur radius currently on the view, or -1 when nothing has been applied yet. */
+        private int appliedBlur = -1;
+
+        /** Per-visual-line geometry of the word being sung, rebuilt only when it can have moved. */
+        private Layout geometryLayout;
+        private int geometryStart = -1;
+        private int geometryEnd = -1;
+        private int geometryCount;
+        private float geometryTotal;
+        private float[] geometryLeft = new float[4];
+        private float[] geometryRight = new float[4];
+        private float[] geometryTop = new float[4];
+        private float[] geometryBottom = new float[4];
+        private boolean[] geometryRtl = new boolean[4];
+        private final Path sweepClip = new Path();
+
+        LyricsTextView(Context context) {
+            super(context);
+        }
+
+        /**
+         * Binds the row's text. Only a line that genuinely states inline timing is kept spannable;
+         * every other row is a plain string, exactly as before. A recycled row is fully reset here,
+         * so it can never keep a previous line's word state.
+         */
+        void setLyricText(CharSequence text, boolean wordTimed) {
+            detachSpans();
+            karaokeActive = false;
+            if (wordTimed) {
+                // TextView always makes its own spannable copy here, so the one to colour is the
+                // one it ends up holding, not the one handed in.
+                setText(text, BufferType.SPANNABLE);
+                final CharSequence bound = getText();
+                karaokeText = bound instanceof Spannable ? (Spannable) bound : null;
+            } else {
+                setText(text);
+                karaokeText = null;
+            }
+        }
+
+        /** Sets the text colour without the ColorStateList a repeated call would allocate. */
+        void setLyricTextColor(int color) {
+            if (lyricTextColorSet && lyricTextColor == color) return;
+            lyricTextColor = color;
+            lyricTextColorSet = true;
+            setTextColor(color);
+        }
+
+        void setKaraokeColors(int muted, int sung) {
+            if (mutedColor == muted && sungColor == sung) return;
+            mutedColor = muted;
+            sungColor = sung;
+            if (karaokeActive) invalidate();
+        }
+
+        /**
+         * Pushes one resolved frame. Everything about it is a boundary the source stated plus two
+         * scalars derived from the playback position, so pushing the same position twice is a
+         * no-op and a settled word costs nothing per tick.
+         */
+        void setKaraokeFrame(int start, int end, float sweepProgress, float liftProgress) {
+            if (karaokeText == null) return;
+            // A row that was not painting karaoke a moment ago - a fresh bind, a recycled view, a
+            // line that has just become relevant - carries no spans at all, so its first frame
+            // always attaches them rather than trusting the offsets it happens to hold.
+            final boolean wasInactive = !karaokeActive;
+            karaokeActive = true;
+            boolean changed = wasInactive;
+            if (wasInactive || requestedStart != start || requestedEnd != end) {
+                requestedStart = start;
+                requestedEnd = end;
+                final int snappedStart = KaraokeGeometry.clusterEnd(karaokeText, start);
+                final int snappedEnd = Math.max(snappedStart, KaraokeGeometry.clusterEnd(karaokeText, end));
+                if (wasInactive || wordStart != snappedStart || wordEnd != snappedEnd) {
+                    wordStart = snappedStart;
+                    wordEnd = snappedEnd;
+                    setRange(sungSpan, 0, snappedStart);
+                    setRange(wordSpan, snappedStart, snappedEnd);
+                    setRange(tailSpan, snappedEnd, karaokeText.length());
+                    changed = true;
+                }
+            }
+            if (Math.abs(sweep - sweepProgress) > 0.0015f) {
+                sweep = sweepProgress;
+                changed = true;
+            }
+            if (Math.abs(lift - liftProgress) > 0.0015f) {
+                lift = liftProgress;
+                changed = true;
+            }
+            // SpannableString does not report span changes to a SpanWatcher, and a colour changed
+            // in place is not a change the text could report anyway, so every repaint here is this
+            // one. It is also the reason nothing in this class can trigger a re-measure.
+            if (changed) invalidate();
+        }
 
         /** Returns the row to plain, uniformly coloured text. */
         void clearKaraoke() {
-            if (spanStart < 0 && spanEnd < 0) return;
+            if (!karaokeActive && requestedStart < 0 && requestedEnd < 0) return;
+            karaokeActive = false;
             detachSpans();
             invalidate();
+        }
+
+        /**
+         * Depth, as a real blur on the view's own render node. This is the platform's GPU blur -
+         * one property on a RenderNode Android is already compositing - so a blurred row costs no
+         * bitmap, no allocation and no per-frame work of ours. The radius is quantised to a half
+         * pixel so a moving page sets the property only when it has visibly changed, and below
+         * Android 12, where there is no such effect, depth is carried by opacity alone rather than
+         * by anything expensive standing in for it.
+         */
+        void setDepthBlur(float radiusPx) {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return;
+            final int quantized = radiusPx <= 0.25f ? 0 : Math.min(24, Math.round(radiusPx * 2f));
+            if (quantized == appliedBlur) return;
+            appliedBlur = quantized;
+            setRenderEffect(quantized == 0 ? null
+                    : RenderEffect.createBlurEffect(quantized / 2f, quantized / 2f, Shader.TileMode.DECAL));
+        }
+
+        /**
+         * Draws the row. Without a word being sung this is exactly {@link TextView}'s own drawing.
+         * With one it is the same drawing two or three times over, each pass showing a different
+         * part of the same laid-out text:
+         *
+         * <ol>
+         *     <li>the whole line, with the current word suppressed while it is lifted, so no ghost
+         *     of it is left behind at its resting position;</li>
+         *     <li>the current word alone, muted, at its lifted position;</li>
+         *     <li>the current word alone again, in the sung colour, clipped to how far the fill has
+         *     travelled across its glyphs.</li>
+         * </ol>
+         *
+         * <p>Every pass is the platform drawing the row's real {@link Layout}, so the glyphs in the
+         * overlay are the same shaped, kerned, wrapped and reordered glyphs as in the base - there
+         * is no second measurement of the word anywhere, and nothing here can move a boundary.
+         */
+        @Override
+        protected void onDraw(Canvas canvas) {
+            if (!karaokeActive || karaokeText == null) {
+                super.onDraw(canvas);
+                return;
+            }
+            if (wordEnd <= wordStart) {
+                // A line with no word in flight: everything before the boundary is sung, the rest
+                // is muted, and there is nothing to lift or fill.
+                applyPassColors(sungColor, sungColor, mutedColor);
+                super.onDraw(canvas);
+                return;
+            }
+            ensureSweepGeometry();
+            final float offset = lift * liftAmplitude;
+            if (offset <= 0.05f) {
+                applyPassColors(sungColor, mutedColor, mutedColor);
+                super.onDraw(canvas);
+                drawSweep(canvas);
+            } else {
+                applyPassColors(sungColor, Color.TRANSPARENT, mutedColor);
+                super.onDraw(canvas);
+                canvas.save();
+                canvas.translate(0f, -offset);
+                applyPassColors(Color.TRANSPARENT, mutedColor, Color.TRANSPARENT);
+                super.onDraw(canvas);
+                drawSweep(canvas);
+                canvas.restore();
+            }
+        }
+
+        /** Redraws the word in the sung colour, clipped to the part of it the fill has reached. */
+        private void drawSweep(Canvas canvas) {
+            if (sweep <= 0f || geometryCount == 0 || geometryTotal <= 0f) return;
+            if (!buildSweepClip()) return;
+            canvas.save();
+            canvas.clipPath(sweepClip);
+            applyPassColors(Color.TRANSPARENT, sungColor, Color.TRANSPARENT);
+            super.onDraw(canvas);
+            canvas.restore();
+        }
+
+        /**
+         * Builds the clip for the current fill progress: one rectangle per visual line the word
+         * occupies, each grown from the side the word is actually read from, and the lines filled
+         * in order so a word that wraps fills the first line before the second.
+         */
+        private boolean buildSweepClip() {
+            final float reveal = sweep * geometryTotal;
+            if (reveal <= 0f) return false;
+            // The row never scrolls, so the layout sits at exactly the total padding.
+            final float originX = getTotalPaddingLeft();
+            final float originY = getTotalPaddingTop();
+            sweepClip.rewind();
+            float consumed = 0f;
+            boolean any = false;
+            for (int i = 0; i < geometryCount; i++) {
+                final float width = geometryRight[i] - geometryLeft[i];
+                final float shown = KaraokeGeometry.revealedWidth(reveal, consumed, width);
+                consumed += width;
+                if (shown <= 0f) break;
+                final float left = KaraokeGeometry.revealedLeft(geometryLeft[i], geometryRight[i], shown, geometryRtl[i]);
+                final float right = left + shown;
+                sweepClip.addRect(originX + left, originY + geometryTop[i],
+                        originX + right, originY + geometryBottom[i], Path.Direction.CW);
+                any = true;
+            }
+            return any;
+        }
+
+        /**
+         * Caches where the word actually is, asking the row's own {@link Layout} rather than
+         * measuring anything: which visual lines it falls on, how far across each one it runs, and
+         * which side of each one it is read from. It is rebuilt only when the layout object or the
+         * word's range changes, so a word being sung for two seconds is measured once.
+         */
+        private void ensureSweepGeometry() {
+            final Layout layout = getLayout();
+            if (layout == geometryLayout && geometryStart == wordStart && geometryEnd == wordEnd) return;
+            geometryLayout = layout;
+            geometryStart = wordStart;
+            geometryEnd = wordEnd;
+            geometryCount = 0;
+            geometryTotal = 0f;
+            if (layout == null || wordEnd <= wordStart || wordEnd > layout.getText().length()) return;
+            // A stated range runs to the start of the next one, so it usually carries the space
+            // after the word. The colour is welcome to cover it - a space has no glyph to colour -
+            // but the fill must not spend a quarter of its travel crossing one, so the geometry is
+            // the word's own glyphs and the fill therefore completes exactly when the word does.
+            final CharSequence text = layout.getText();
+            int from = wordStart;
+            int to = wordEnd;
+            while (to > from && Character.isWhitespace(text.charAt(to - 1))) to--;
+            while (from < to && Character.isWhitespace(text.charAt(from))) from++;
+            if (to <= from) return;
+            final int firstLine = layout.getLineForOffset(from);
+            final int lastLine = layout.getLineForOffset(to - 1);
+            for (int line = firstLine; line <= lastLine; line++) {
+                final int start = Math.max(from, layout.getLineStart(line));
+                final int end = Math.min(to, layout.getLineEnd(line));
+                if (end <= start) continue;
+                final float from = KaraokeGeometry.horizontalAt(layout, line, start);
+                final float to = KaraokeGeometry.horizontalAt(layout, line, end);
+                final float left = Math.min(from, to);
+                final float right = Math.max(from, to);
+                if (right - left <= 0.01f) continue;
+                ensureGeometryCapacity(geometryCount + 1);
+                geometryLeft[geometryCount] = left;
+                geometryRight[geometryCount] = right;
+                geometryTop[geometryCount] = layout.getLineTop(line);
+                geometryBottom[geometryCount] = layout.getLineBottom(line);
+                // The word's own visual direction, taken from where its two ends actually landed,
+                // so an RTL word fills from its right edge and an LTR one from its left. The
+                // paragraph direction is only the tie-break for a word too narrow to tell.
+                geometryRtl[geometryCount] = KaraokeGeometry.isRightToLeft(from, to,
+                        layout.getParagraphDirection(line) == Layout.DIR_RIGHT_TO_LEFT);
+                geometryTotal += right - left;
+                geometryCount++;
+            }
+        }
+
+        private void ensureGeometryCapacity(int size) {
+            if (size <= geometryLeft.length) return;
+            final int grown = Math.max(size, geometryLeft.length * 2);
+            geometryLeft = java.util.Arrays.copyOf(geometryLeft, grown);
+            geometryRight = java.util.Arrays.copyOf(geometryRight, grown);
+            geometryTop = java.util.Arrays.copyOf(geometryTop, grown);
+            geometryBottom = java.util.Arrays.copyOf(geometryBottom, grown);
+            geometryRtl = java.util.Arrays.copyOf(geometryRtl, grown);
+        }
+
+        /** Colours for one draw pass. Read live by the spans, so it never invalidates anything. */
+        private void applyPassColors(int sung, int word, int tail) {
+            sungSpan.setColor(sung);
+            wordSpan.setColor(word);
+            tailSpan.setColor(tail);
         }
 
         private void setRange(KaraokeSpan span, int start, int end) {
@@ -3963,12 +4481,20 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         private void detachSpans() {
             if (karaokeText != null) {
                 karaokeText.removeSpan(sungSpan);
-                karaokeText.removeSpan(arrivingSpan);
+                karaokeText.removeSpan(wordSpan);
+                karaokeText.removeSpan(tailSpan);
             }
-            spanStart = -1;
-            spanEnd = -1;
+            wordStart = 0;
+            wordEnd = 0;
+            sweep = 0f;
+            lift = 0f;
             requestedStart = -1;
             requestedEnd = -1;
+            geometryLayout = null;
+            geometryStart = -1;
+            geometryEnd = -1;
+            geometryCount = 0;
+            geometryTotal = 0f;
         }
     }
 
@@ -3979,10 +4505,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
     private static final class KaraokeSpan extends CharacterStyle implements UpdateAppearance {
         private int color;
 
-        boolean setColor(int value) {
-            if (color == value) return false;
+        void setColor(int value) {
             color = value;
-            return true;
         }
 
         @Override
@@ -4035,17 +4559,33 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             boolean stanzaSpace = !synced && TextUtils.isEmpty(lyricLine.text);
             // Identical viewport, typography, sizes, spacing and margins for timed and untimed
             // lyrics; only the timed visual hierarchy is synced-only.
-            textView.setMinHeight(dp(stanzaSpace ? 24 : 56));
-            textView.setPadding(dp(24), dp(stanzaSpace ? 0 : 12), dp(24), dp(stanzaSpace ? 0 : 12));
-            textView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16);
+            // Typography is decided once, here, and is identical for every row of the document.
+            // Nothing below ever changes it again: a size or a weight is metric-affecting, so
+            // switching one when a line or a word becomes active would re-measure the row, possibly
+            // re-wrap it and move everything under it. A karaoke page is deliberately large and
+            // bold and airy; every other kind of lyrics keeps exactly the metrics it always had.
+            if (lyricsWordTimed) {
+                textView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, KARAOKE_TEXT_SIZE_DP);
+                textView.setTypeface(AndroidUtilities.bold());
+                textView.setLineSpacing(dp(3), 1f);
+                textView.setMinHeight(dp(stanzaSpace ? 26 : 64));
+                textView.setPadding(dp(22), dp(stanzaSpace ? 0 : 13), dp(22), dp(stanzaSpace ? 0 : 13));
+            } else {
+                textView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16);
+                textView.setTypeface(Typeface.DEFAULT);
+                textView.setLineSpacing(0f, 1f);
+                textView.setMinHeight(dp(stanzaSpace ? 24 : 56));
+                textView.setPadding(dp(24), dp(stanzaSpace ? 0 : 12), dp(24), dp(stanzaSpace ? 0 : 12));
+            }
+            // A recycled row must never arrive carrying the previous line's depth; the attach
+            // callback re-derives it from the row's real position immediately afterwards.
+            textView.setDepthBlur(0f);
             // Timed rows get their emphasis from applyLyricsDepth(), which runs on attach and on
             // every frame of the transition; binding it here as well would reintroduce the pop.
             if (synced) {
-                textView.setTypeface(Typeface.DEFAULT);
-                textView.setTextColor(getThemedColor(Theme.key_player_time));
+                textView.setLyricTextColor(getThemedColor(Theme.key_player_time));
             } else {
-                textView.setTypeface(Typeface.DEFAULT);
-                textView.setTextColor(getThemedColor(Theme.key_player_actionBarTitle));
+                textView.setLyricTextColor(getThemedColor(Theme.key_player_actionBarTitle));
                 textView.setAlpha(1f);
                 textView.setScaleX(1f);
                 textView.setScaleY(1f);
