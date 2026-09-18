@@ -1,4 +1,4 @@
-name: Build Telegram QA APK
+name: Build Telegram Lyrics QA APK
 
 on:
   workflow_dispatch:
@@ -23,8 +23,6 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
-        with:
-          packages: ''
 
       - name: Install Android dependencies
         run: |
@@ -37,38 +35,98 @@ jobs:
       - name: Make Gradle executable
         run: chmod +x gradlew
 
-      # The afat flavour crossed with the qaRelease build type. qaRelease is release in every
-      # respect - minified, non-debuggable, release proguard rules, release manifest, signed with
-      # signingConfigs.release (TMessagesProj/config/release.keystore) - with one difference:
-      # applicationIdSuffix ".beta", so it installs as org.telegram.messenger.beta.
+      # QA-only: the credentials and the package suffix are changed in the Actions workspace and
+      # nowhere else. Nothing here is committed, and nothing here is printed.
       #
-      # The plain release variant is deliberately NOT built here: its applicationId is
-      # org.telegram.messenger, the Google Play Telegram package, so installing it would replace
-      # the store app rather than update the test build.
-      - name: Build QA release APK
-        run: ./gradlew :TMessagesProj_App:assembleAfatQaRelease --no-daemon
+      # This runs BEFORE the long build on purpose: a missing or malformed secret must cost
+      # seconds, not the whole compile, and an APK built on Telegram's published APP_ID = 4 would
+      # hit API_ID_PUBLISHED_FLOOD on first login and be useless for device QA.
+      - name: Configure production QA application
+        env:
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          api_id = os.environ.get("TELEGRAM_API_ID", "")
+          api_hash = os.environ.get("TELEGRAM_API_HASH", "")
+          if not api_id.isdecimal() or not re.fullmatch(r"[0-9a-fA-F]{32}", api_hash):
+              raise SystemExit("Required Telegram API secrets are missing or invalid")
+          if api_id == "4":
+              raise SystemExit("TELEGRAM_API_ID is Telegram's published sample id")
+
+          build_vars = Path("TMessagesProj/src/main/java/org/telegram/messenger/BuildVars.java")
+          source = build_vars.read_text()
+          source, id_count = re.subn(r"public static int APP_ID = \d+;", f"public static int APP_ID = {api_id};", source, count=1)
+          source, hash_count = re.subn(r'public static String APP_HASH = "[^"]*";', f'public static String APP_HASH = "{api_hash}";', source, count=1)
+          # Telegram's own source says passkeys only work on official application ids, so a fork
+          # must not offer them. This does not affect ordinary phone/code login.
+          source, passkey_count = re.subn(r"public static boolean SUPPORTS_PASSKEYS = true;", "public static boolean SUPPORTS_PASSKEYS = false;", source, count=1)
+          if (id_count, hash_count, passkey_count) != (1, 1, 1):
+              raise SystemExit("BuildVars QA placeholders did not match expected source")
+          build_vars.write_text(source)
+
+          standalone = Path("TMessagesProj_AppStandalone/build.gradle")
+          source = standalone.read_text()
+          source, suffix_count = re.subn(r'applicationIdSuffix "\.web"', 'applicationIdSuffix ".beta"', source)
+          if suffix_count != 2:
+              raise SystemExit("Standalone package suffix did not match expected source")
+          standalone.write_text(source)
+          PY
+
+      # Read-only assertions on the workspace the compiler is about to see. They report only
+      # whether each placeholder was replaced - never the value it was replaced with.
+      - name: Verify build inputs
+        run: |
+          set -eu
+          BUILD_VARS=TMessagesProj/src/main/java/org/telegram/messenger/BuildVars.java
+          if grep -q 'public static int APP_ID = 4;' "$BUILD_VARS"; then
+            echo "FAIL: APP_ID is still Telegram's published sample id"
+            exit 1
+          fi
+          if grep -q 'public static String APP_HASH = "014b35b6184100b085b0d0572f9b5103";' "$BUILD_VARS"; then
+            echo "FAIL: APP_HASH is still Telegram's published sample hash"
+            exit 1
+          fi
+          echo "OK: APP_ID and APP_HASH replaced with the repository secrets"
+          grep -q 'public static boolean SUPPORTS_PASSKEYS = false;' "$BUILD_VARS"
+          echo "OK: SUPPORTS_PASSKEYS = false"
+          grep -q 'applicationIdSuffix ".beta"' TMessagesProj_AppStandalone/build.gradle
+          if grep -q 'applicationIdSuffix ".web"' TMessagesProj_AppStandalone/build.gradle; then
+            echo "FAIL: a .web suffix survived the rewrite"
+            exit 1
+          fi
+          echo "OK: standalone package suffix is .beta"
+
+      # TMessagesProj_AppStandalone's standalone build type: debuggable false, jniDebuggable
+      # false, minifyEnabled true, release proguard rules, release keystore, and the ordinary
+      # production Telegram runtime - so no Debug/Test Backend UI. The regular release variant of
+      # TMessagesProj_App is deliberately NOT built: its applicationId is org.telegram.messenger,
+      # the Google Play Telegram package.
+      - name: Build production standalone QA APK
+        run: ./gradlew :TMessagesProj_AppStandalone:assembleAfatStandalone --no-daemon
 
       - name: Collect APK
         run: |
-          mkdir -p apk
-          QA_APK=TMessagesProj_App/build/outputs/apk/afat/qaRelease/app.apk
-          if [ ! -f "$QA_APK" ]; then
-            echo "QA release APK not found at $QA_APK"
-            find TMessagesProj_App/build/outputs/apk -name '*.apk' -print
+          mapfile -t apks < <(find TMessagesProj_AppStandalone/build/outputs/apk -type f -name "*.apk")
+          if [ "${#apks[@]}" -ne 1 ]; then
+            printf 'Expected exactly one final standalone APK, found %s\n' "${#apks[@]}" >&2
             exit 1
           fi
-          cp "$QA_APK" apk/Telegram-Lyrics-QA-Release.apk
-          ls -lh apk
+          cp "${apks[0]}" Telegram-Lyrics-QA.apk
+          test -s Telegram-Lyrics-QA.apk
 
-      # Everything below is asserted against the built file, not against the Gradle config, because
-      # the point of the whole change is what the APK actually declares.
-      - name: Verify package, debuggable flag and signature
+      # Everything below is asserted against the built file rather than against the Gradle config,
+      # and none of it changes what was built.
+      - name: Verify package, debuggable flag, minification and signature
         run: |
           set -eu
           BT="$ANDROID_HOME/build-tools/36.0.0"
-          APK=apk/Telegram-Lyrics-QA-Release.apk
+          APK=Telegram-Lyrics-QA.apk
           BADGING=$("$BT/aapt" dump badging "$APK")
-          echo "$BADGING" | head -5
 
           PACKAGE=$(echo "$BADGING" | sed -n "s/^package: name='\([^']*\)'.*/\1/p")
           echo "package: $PACKAGE"
@@ -76,10 +134,7 @@ jobs:
             echo "FAIL: expected org.telegram.messenger.beta, got '$PACKAGE'"
             exit 1
           fi
-          if [ "$PACKAGE" = "org.telegram.messenger" ]; then
-            echo "FAIL: this is the Google Play Telegram package"
-            exit 1
-          fi
+          echo "OK: not the Google Play Telegram package"
 
           if echo "$BADGING" | grep -q "application-debuggable"; then
             echo "FAIL: the APK is debuggable"
@@ -89,21 +144,22 @@ jobs:
 
           # R8 only writes a mapping file when minifyEnabled is on, so its presence is proof the
           # variant was genuinely minified rather than a debug build wearing a release name.
-          MAPPING=TMessagesProj_App/build/outputs/mapping/afatQaRelease/mapping.txt
+          MAPPING=TMessagesProj_AppStandalone/build/outputs/mapping/afatStandalone/mapping.txt
           if [ ! -s "$MAPPING" ]; then
-            MAPPING=$(find TMessagesProj_App/build/outputs/mapping -name mapping.txt -print -quit || true)
+            MAPPING=$(find TMessagesProj_AppStandalone/build/outputs/mapping -name mapping.txt -print -quit || true)
           fi
           if [ -z "${MAPPING:-}" ] || [ ! -s "$MAPPING" ]; then
             echo "FAIL: no R8 mapping file, so the variant was not minified"
-            find TMessagesProj_App/build/outputs/mapping -type f -print || true
+            find TMessagesProj_AppStandalone/build/outputs/mapping -type f -print || true
             exit 1
           fi
           echo "OK: minified ($MAPPING, $(wc -l < "$MAPPING") lines)"
 
           "$BT/apksigner" verify --verbose --print-certs "$APK"
 
-          # The certificate has to be the repository keystore the existing test (debug) build is
-          # signed with, or Android will refuse the update rather than apply it.
+          # The certificate has to be the repository keystore the existing test app is signed
+          # with, or Android will refuse the update rather than apply it. Only public certificate
+          # digests are read here; no private key material is touched or printed.
           APK_SHA=$("$BT/apksigner" verify --print-certs "$APK" \
             | sed -n 's/.*SHA-256 digest: *//p' | head -1 | tr 'A-F' 'a-f')
           KEYSTORE_SHA=$(keytool -list -v \
@@ -116,10 +172,11 @@ jobs:
             echo "FAIL: the APK is not signed with TMessagesProj/config/release.keystore"
             exit 1
           fi
-          echo "OK: signed with the repository release keystore - this updates the existing test app"
+          echo "OK: signed with the repository release keystore"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: Telegram-Android-QA-Release
-          path: apk/Telegram-Lyrics-QA-Release.apk
+          name: Telegram-Lyrics-QA
+          path: Telegram-Lyrics-QA.apk
+          if-no-files-found: error

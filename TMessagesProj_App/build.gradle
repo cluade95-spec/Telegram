@@ -92,29 +92,6 @@ android {
             proguardFiles getDefaultProguardFile('proguard-android.txt'), '../TMessagesProj/proguard-rules.pro'
             ndk.debugSymbolLevel = 'FULL'
         }
-
-        // QA build: release-style APK packaging with the same beta/debug Telegram runtime
-        // identity that the previously working test APK used.
-        //
-        // TMessagesProj has no qaRelease build type. Falling back to "debug" here is intentional:
-        // it keeps BuildVars.DEBUG_VERSION / DEBUG_PRIVATE_VERSION and the beta login/SMS runtime
-        // behaviour from the known-good test build, while this application variant itself remains
-        // non-debuggable, minified and signed with the existing release keystore.
-        //
-        // The ".beta" suffix keeps the APK on org.telegram.messenger.beta so it updates the test
-        // app and never targets the Google Play Telegram package.
-        qaRelease {
-            matchingFallbacks = ['debug']
-            applicationIdSuffix ".beta"
-            debuggable false
-            jniDebuggable false
-            signingConfig signingConfigs.release
-            minifyEnabled true
-            shrinkResources false
-            multiDexEnabled true
-            proguardFiles getDefaultProguardFile('proguard-android.txt'), '../TMessagesProj/proguard-rules.pro', '../TMessagesProj/proguard-rules-beta.pro'
-            ndk.debugSymbolLevel = 'FULL'
-        }
     }
 
     sourceSets.debug {
@@ -126,10 +103,6 @@ android {
     }
 
     sourceSets.release {
-        manifest.srcFile '../TMessagesProj/config/release/AndroidManifest.xml'
-    }
-
-    sourceSets.qaRelease {
         manifest.srcFile '../TMessagesProj/config/release/AndroidManifest.xml'
     }
 
@@ -169,9 +142,6 @@ android {
                 manifest.srcFile '../TMessagesProj/config/debug/AndroidManifest_SDK23.xml'
             }
             sourceSets.release {
-                manifest.srcFile '../TMessagesProj/config/release/AndroidManifest_SDK23.xml'
-            }
-            sourceSets.qaRelease {
                 manifest.srcFile '../TMessagesProj/config/release/AndroidManifest_SDK23.xml'
             }
             sourceSets.standalone {

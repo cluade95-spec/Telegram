@@ -15,6 +15,7 @@ import org.telegram.messenger.SyncedLyricsController.Line
 import org.telegram.messenger.SyncedLyricsController.parse
 import org.telegram.ui.Components.AudioPlayerAlert.KaraokeFrame
 import org.telegram.ui.Components.AudioPlayerAlert.KaraokeGeometry
+import org.telegram.ui.Components.AudioPlayerAlert.KaraokeWave
 
 /**
  * The large player's lyric rendering maths.
@@ -100,48 +101,126 @@ class LyricsKaraokeRenderingTest {
         }
     }
 
-    @Test
-    fun aLongWordAlsoMovesForAsLongAsItIsSung() {
-        // The lift shares the word's interval, so what movement there is is slow on a held note
-        // instead of being the same quick canned gesture on every word. `lift` is travel as a
-        // fraction of KARAOKE_LIFT_DP, already scaled by how much room the word had.
-        for (duration in longArrayOf(1500, 1000, 800)) {
-            val line = pairWithGap(duration)
-            val frame = KaraokeFrame()
-            frame.resolve(line, 320, Long.MAX_VALUE)
-            assertTrue("${duration}ms word is still moving at 320ms: ${frame.lift}", frame.lift > 0.05f)
-            // Its peak lands around a third of the way in, not in the first fifth of a second.
-            frame.resolve(line, (duration * 0.38f).toLong(), Long.MAX_VALUE)
-            assertEquals("${duration}ms word peaks late", 1f, frame.lift, 0.01f)
-        }
-    }
-
-    // ============================================== the lift is decoration, and stays out of sight
-    // Device QA: "the words move up/down too much - in fast lyrics it feels like the text is
-    // dancing." The fill already says which word is being sung. The lift is an accent on top of
-    // that, and an accent the eye tracks is not an accent.
+    // ============================================ the vertical decoration is a grapheme wave
+    // Device QA, comparing against a polished reference: "vertical motion is a VERY subtle upward
+    // wave through the letters. Letters do not wait for one another. Words do not wait for the
+    // previous word. It is slow and smooth even when the sung timing is fast. There is no normal
+    // downward return."
+    //
+    // So the whole of the decoration is KaraokeWave: a fixed, slow rise per grapheme, started at
+    // its own displayed word's genuine time plus a tiny offset along the word. Nothing about it is
+    // derived from how long the word was sung, and nothing about it can hold anything back.
 
     @Test
     fun theWholeTravelIsATinyFractionOfALine() {
-        // Roughly a tenth of the 22dp type, and less than half of what device QA called too much.
-        assertTrue("the lift must stay around 1-1.5dp: ${AudioPlayerAlert.KARAOKE_LIFT_DP}",
-            AudioPlayerAlert.KARAOKE_LIFT_DP <= 1.5f)
+        // Smaller than the model it replaces, which device QA still called too much.
+        assertTrue("the lift must stay around 0.9dp: ${AudioPlayerAlert.KARAOKE_LIFT_DP}",
+            AudioPlayerAlert.KARAOKE_LIFT_DP <= 1.0f)
         assertTrue("but not be removed entirely", AudioPlayerAlert.KARAOKE_LIFT_DP > 0f)
         assertTrue("and stay far under the type size",
             AudioPlayerAlert.KARAOKE_LIFT_DP < AudioPlayerAlert.LYRICS_TEXT_SIZE_DP / 8f)
     }
 
     @Test
-    fun aFastPassageGetsEssentiallyNoVerticalMovement() {
-        // Everything at singing speed or faster: the amplitude has to be gone, not merely small.
-        for (window in longArrayOf(30, 50, 80, 100, 150)) {
-            assertEquals("a ${window}ms word must not move at all",
-                0f, KaraokeFrame.liftAmplitudeScale(window), 0.001f)
+    fun theRiseIsSlowAndNeverComesBackDown() {
+        // A. Monotonic for the whole of forward playback, and it ends raised.
+        var previous = -1f
+        for (position in 0L..4000L step 3L) {
+            val value = KaraokeWave.graphemeLift(position, 1000, 2, 1f)
+            assertTrue("never travels downward at $position: $previous -> $value",
+                value >= previous - 0.0001f)
+            assertTrue("never beyond the raised position at $position", value <= 1.0001f)
+            previous = value
         }
-        // And only a genuinely held word reaches the full travel.
-        assertTrue("a 300ms word stays subtle: ${KaraokeFrame.liftAmplitudeScale(300)}",
-            KaraokeFrame.liftAmplitudeScale(300) < 0.35f)
-        assertEquals("a held word gets the whole of it", 1f, KaraokeFrame.liftAmplitudeScale(900), 0.0001f)
+        assertEquals("and it stays raised", 1f, previous, 0f)
+        // F. Once there, it is there for good.
+        for (position in longArrayOf(2000, 5000, 60000, 600000)) {
+            assertEquals("still raised at $position", 1f,
+                KaraokeWave.graphemeLift(position, 1000, 0, 1f), 0f)
+        }
+        // Eases away from rest rather than kicking off it.
+        assertTrue("eases out of rest", KaraokeWave.graphemeLift(1005, 1000, 0, 1f) < 0.01f)
+        // And it really is slow: not even half way after a fifth of a second.
+        assertTrue("a fifth of a second is not most of the travel",
+            KaraokeWave.graphemeLift(1200, 1000, 0, 1f) < 0.5f)
+        assertTrue("the normal rise is in the half-second territory",
+            KaraokeWave.RISE_MS in 400L..700L)
+    }
+
+    @Test
+    fun theSameSlowRiseIsUsedWhateverTheWordsOwnDuration() {
+        // B. One word owns 150ms, the other 900ms. Their fills differ by six times; their
+        // decorative rise is the same function, sampled at the same elapsed times.
+        val fast = pairWithGap(150)
+        val slow = pairWithGap(900)
+        val fastWave = KaraokeWave().apply { build(fast, Long.MAX_VALUE) }
+        val slowWave = KaraokeWave().apply { build(slow, Long.MAX_VALUE) }
+        assertEquals("both fixtures state two displayed words", 2, fastWave.count)
+        assertEquals(2, slowWave.count)
+        assertEquals("neither first word is bounded, so neither is compressed",
+            Long.MAX_VALUE, fastWave.availableMs[0])
+        assertEquals(Long.MAX_VALUE, slowWave.availableMs[0])
+        val fastStart = fastWave.startMs[0]
+        val slowStart = slowWave.startMs[0]
+        for (elapsed in longArrayOf(0, 40, 130, 260, 400, 520, 900)) {
+            assertEquals("at ${elapsed}ms into each word the two are at the same height",
+                KaraokeWave.graphemeLift(fastStart + elapsed, fastStart, 0, 1f),
+                KaraokeWave.graphemeLift(slowStart + elapsed, slowStart, 0, 1f), 0f)
+        }
+        // The genuine difference stays where it belongs: in the fill.
+        val frame = KaraokeFrame()
+        frame.resolve(fast, 75, Long.MAX_VALUE)
+        assertEquals("the 150ms word is half filled at 75ms", 0.5f, frame.sweep, 0.02f)
+        frame.resolve(slow, 75, Long.MAX_VALUE)
+        assertTrue("the 900ms word is barely filled at 75ms: ${frame.sweep}", frame.sweep < 0.12f)
+        // And the 150ms word's decoration is still climbing long after its fill has finished.
+        frame.resolve(fast, 149, Long.MAX_VALUE)
+        assertTrue("its fill is essentially done", frame.sweep > 0.95f)
+        assertTrue("while its letters are still rising",
+            KaraokeWave.graphemeLift(149, 0, 0, 1f) < 0.5f)
+    }
+
+    @Test
+    fun adjacentGraphemesOverlapHeavilyRatherThanQueueing() {
+        // D. A soft wave, not a typewriter: the trail between neighbours is a small fraction of
+        // the rise, so a whole word is in motion at once.
+        assertTrue("the stagger is tens of milliseconds",
+            KaraokeWave.STAGGER_MS in 10L..60L)
+        assertTrue("and far smaller than the rise it trails",
+            KaraokeWave.STAGGER_MS * 6 < KaraokeWave.RISE_MS)
+        val at = 200L
+        var previous = 2f
+        for (grapheme in 0..5) {
+            val value = KaraokeWave.graphemeLift(at, 0, grapheme, 1f)
+            assertTrue("grapheme $grapheme trails the one before it: $previous -> $value",
+                value < previous)
+            assertTrue("but is already moving with it: $value", value > 0f)
+            previous = value
+        }
+        // The last letter of a nine-letter word starts long before the first has finished.
+        val lastStarts = KaraokeWave.STAGGER_MS * 8
+        assertTrue("letter 9 sets off while letter 1 is still climbing",
+            lastStarts < KaraokeWave.RISE_MS)
+        assertTrue("and letter 1 is nowhere near done when it does",
+            KaraokeWave.graphemeLift(lastStarts, 0, 0, 1f) < 0.85f)
+    }
+
+    @Test
+    fun aWordBeginsItsWaveAtItsOwnTimeWhileTheWordBeforeIsStillRising() {
+        // C. Word A at 10.000, word B at 10.180, a rise of about half a second. At 10.250 both
+        // are in motion. There is no queue and nothing waits.
+        val aStart = 10000L
+        val bStart = 10180L
+        val at = 10250L
+        val a = KaraokeWave.graphemeLift(at, aStart, 0, 1f)
+        val b = KaraokeWave.graphemeLift(at, bStart, 0, 1f)
+        assertTrue("A is still rising: $a", a > 0f && a < 1f)
+        assertTrue("B is already rising: $b", b > 0f && b < 1f)
+        assertTrue("and B really did start on its own millisecond",
+            KaraokeWave.graphemeLift(bStart - 1, bStart, 0, 1f) == 0f &&
+                KaraokeWave.graphemeLift(bStart + 5, bStart, 0, 1f) > 0f)
+        // The overlap is genuine, not a rounding artefact: A is well past half way.
+        assertTrue("A is substantially ahead of B: $a vs $b", a > b + 0.2f)
     }
 
     @Test
@@ -216,134 +295,124 @@ class LyricsKaraokeRenderingTest {
         assertEquals(0.5f, frame.sweep, 0.02f)
     }
 
-    // ================================================================== restrained word motion
-    // "The words move up/down too rapidly - they look like they are dancing." A 30ms word cannot
-    // be given a 3dp rise and settle; it must be given almost none.
+    // ============================================== only a skipped last word is ever hurried
+    // The reference behaviour has one exception to the fixed speed: a final word that genuinely
+    // starts so late that its normal wave would still be climbing when the line is carried away.
+    // Only that word, only by as much as it needs, and continuously rather than at a threshold.
 
     @Test
-    fun aVeryShortWordIsNotForcedThroughAFullRise() {
-        val tiny = floatArrayOf(
-            KaraokeFrame.liftAmplitudeScale(30),
-            KaraokeFrame.liftAmplitudeScale(50),
-            KaraokeFrame.liftAmplitudeScale(60)
-        )
-        for (scale in tiny) {
-            assertTrue("a word this short must barely move at all: $scale", scale < 0.02f)
-        }
-        // And the frame really does hand back that reduced amplitude, not a full one.
-        for (duration in longArrayOf(30, 50, 60, 100, 150)) {
-            val line = pairWithGap(duration)
-            val frame = KaraokeFrame()
-            var peak = 0f
-            for (position in 0..duration) {
-                frame.resolve(line, position, Long.MAX_VALUE)
-                if (frame.lift > peak) peak = frame.lift
-            }
-            assertTrue("${duration}ms word must not dance: peak $peak", peak < 0.02f)
-        }
+    fun aFinalWordWithEnoughRoomKeepsTheNormalSlowRise() {
+        // G. Six letters need RISE + 5 * STAGGER to finish. Given more than that, nothing changes.
+        val needed = KaraokeWave.spanMs(6)
+        assertEquals("nothing is compressed when the room is ample", 1f,
+            KaraokeWave.compression(needed + 200, 6), 0f)
+        assertEquals("nor when it exactly fits", 1f, KaraokeWave.compression(needed, 6), 0f)
+        assertEquals("nor when nothing bounds it at all", 1f,
+            KaraokeWave.compression(Long.MAX_VALUE, 6), 0f)
     }
 
     @Test
-    fun amplitudeGrowsSmoothlyWithTheRoomTheWordHasRatherThanSteppingAtAThreshold() {
-        var previous = -1f
-        for (window in 0L..600L step 5L) {
-            val scale = KaraokeFrame.liftAmplitudeScale(window)
-            assertTrue("never negative at $window", scale >= 0f)
-            assertTrue("never beyond full at $window", scale <= 1f)
-            assertTrue("never decreases at $window", scale >= previous - 0.0001f)
-            if (previous >= 0f) {
-                assertTrue("no visible step at $window: $previous -> $scale", scale - previous < 0.08f)
-            }
+    fun aFinalWordThatWouldBeSkippedIsCompressedJustEnoughToFinish() {
+        // H. The same six letters with far less room. The lift is shortened only as much as it
+        // must be, and it really does complete before the line goes.
+        for (room in longArrayOf(500, 400, 280, 200)) {
+            val scale = KaraokeWave.compression(room, 6)
+            assertTrue("${room}ms: compressed", scale < 1f)
+            assertTrue("${room}ms: but never to nothing", scale >= KaraokeWave.MIN_COMPRESSION)
+            assertTrue("${room}ms: the last letter is raised by the transition, not skipped",
+                KaraokeWave.graphemeLift(room, 0, 5, scale) >= 0.999f)
+        }
+        // Continuous: a millisecond more room never changes the character of the motion.
+        var previous = KaraokeWave.compression(100, 6)
+        for (room in 101L..900L) {
+            val scale = KaraokeWave.compression(room, 6)
+            assertTrue("never decreases as room grows at $room", scale >= previous - 0.0001f)
+            assertTrue("no visible step at $room", scale - previous < 0.02f)
             previous = scale
         }
-        // A held word gets the whole of the intended travel.
-        assertEquals(1f, KaraokeFrame.liftAmplitudeScale(620), 0.0001f)
-        assertEquals(1f, KaraokeFrame.liftAmplitudeScale(1500), 0.0001f)
-        // A word of middling length gets a modest fraction of it, not most of it.
-        val medium = KaraokeFrame.liftAmplitudeScale(400)
-        assertTrue("a 400ms word moves, but modestly: $medium", medium > 0.2f && medium < 0.8f)
+        assertEquals("and it lands on the normal speed rather than jumping to it", 1f, previous, 0f)
     }
 
     @Test
-    fun theLiftLeavesAndReturnsToRestWithoutAKickACornerOrABounce() {
-        var previous = 0f
-        var peak = 0f
-        for (step in 0..2000) {
-            val t = step / 2000f
-            val value = KaraokeFrame.liftCurve(t)
-            assertTrue("never below the resting position at $t", value >= -0.0001f)
-            assertTrue("never beyond full travel at $t", value <= 1.0001f)
-            if (t < 0.38f) assertTrue("rises without wobbling at $t", value >= previous - 0.0001f)
-            if (t > 0.38f) assertTrue("settles without wobbling at $t", value <= previous + 0.0001f)
-            if (value > peak) peak = value
-            previous = value
+    fun anOrdinaryFastWordIsNeverHurried() {
+        // I. Speed is not the trigger; being the last word with no room is. A three-word line's
+        // middle word owns 40ms and is still given the full, slow rise.
+        val line = lrc("[00:00.000]<00:00.000>aa <00:00.040>bb <00:00.080>cc")
+        val wave = KaraokeWave().apply { build(line, 5000) }
+        assertEquals(3, wave.count)
+        assertEquals("only the final word is ever bounded", Long.MAX_VALUE, wave.availableMs[0])
+        assertEquals(Long.MAX_VALUE, wave.availableMs[1])
+        assertEquals("and the final word is bounded by the next line's stated time",
+            5000L - 80L, wave.availableMs[2])
+        for (index in 0..1) {
+            assertEquals("word $index keeps the normal speed however fast it is sung", 1f,
+                KaraokeWave.compression(wave.availableMs[index], 2), 0f)
         }
-        assertEquals("reaches full travel exactly once", 1f, peak, 0.001f)
-        assertEquals(0f, KaraokeFrame.liftCurve(0f), 0f)
-        assertEquals(0f, KaraokeFrame.liftCurve(1f), 0f)
-        assertEquals(0f, KaraokeFrame.liftCurve(1.5f), 0f)
-        assertEquals(0f, KaraokeFrame.liftCurve(-1f), 0f)
-        // Eases away from rest and into rest: the first and last percent of the travel are tiny,
-        // which is what stops the motion reading as a flick.
-        assertTrue("eases out of rest: ${KaraokeFrame.liftCurve(0.01f)}", KaraokeFrame.liftCurve(0.01f) < 0.01f)
-        assertTrue("eases into rest: ${KaraokeFrame.liftCurve(0.99f)}", KaraokeFrame.liftCurve(0.99f) < 0.01f)
+        // The last word here has plenty of room too, so nothing on this line is hurried at all.
+        assertEquals(1f, KaraokeWave.compression(wave.availableMs[2], 2), 0f)
     }
 
-    // ===================================================================== the word hand-over
-    // At the exact moment the next word becomes current, the outgoing word must already be back at
-    // its baseline. This is the group the old tests structurally could not contain: they used
-    // single-word fixtures, so there was no hand-over to look at.
+    @Test
+    fun theWaveCarriesNoTimingOfItsOwnIntoTheSemantics() {
+        // J. Everything the source stated is still exactly what it was.
+        val stated = statedEnds()
+        assertEquals("a stated TTML end still drives the fill", 800L,
+            KaraokeFrame.sweepWindowMs(stated.segments, 0, Long.MAX_VALUE))
+        assertEquals(600L, KaraokeFrame.sweepWindowMs(stated.segments, 1, Long.MAX_VALUE))
+        val starts = startsOnly()
+        assertEquals("start-only timing still fills to the next stated start", 200L,
+            KaraokeFrame.sweepWindowMs(starts.segments, 0, Long.MAX_VALUE))
+        assertEquals("and the word is still the one indexAt selects", 1,
+            starts.segments.indexAt(1250))
+        assertEquals(0, starts.segments.indexAt(1199))
+        assertEquals(-1, starts.segments.indexAt(999))
+        // The wave reads those stated starts and invents nothing.
+        val wave = KaraokeWave().apply { build(starts, Long.MAX_VALUE) }
+        assertEquals(3, wave.count)
+        assertEquals(1000L, wave.startMs[0])
+        assertEquals(1200L, wave.startMs[1])
+        assertEquals(1400L, wave.startMs[2])
+    }
 
     @Test
-    fun theOutgoingWordIsAtRestBeforeTheNextOneTakesOver() {
+    fun ownershipStillPassesExactlyOnTheStatedMillisecond() {
+        // The hand-over is the source's, not the decoration's: whatever any letter is doing, the
+        // next stated time takes the frame on its own millisecond and its fill starts at zero.
         for (gap in longArrayOf(1500, 1000, 800, 500, 300, 200, 100, 50, 30)) {
             val line = pairWithGap(gap)
             val frame = KaraokeFrame()
             frame.resolve(line, gap - 1, Long.MAX_VALUE)
-            val leaving = frame.lift
             assertEquals("${gap}ms word still owns the frame one millisecond before hand-over",
                 start(line, 0), frame.wordStart)
             frame.resolve(line, gap, Long.MAX_VALUE)
-            assertEquals("${gap}ms: ownership passes exactly on the stated time", start(line, 1), frame.wordStart)
-            val arriving = frame.lift
-            // Nothing may jump. The outgoing word has already settled and the incoming one starts
-            // from rest, so the step across the boundary is imperceptible at any amplitude.
-            assertTrue("${gap}ms outgoing word must be at rest, was $leaving", leaving < 0.01f)
-            assertEquals("${gap}ms incoming word starts at rest", 0f, arriving, 0.0001f)
-            assertTrue("${gap}ms hand-over step: ${Math.abs(leaving - arriving)}",
-                Math.abs(leaving - arriving) < 0.01f)
+            assertEquals("${gap}ms: ownership passes exactly on the stated time",
+                start(line, 1), frame.wordStart)
+            assertEquals("${gap}ms: and its fill starts immediately", 0f, frame.sweep, 0.0001f)
         }
     }
 
     @Test
-    fun aRunOfVeryShortWordsNeverSawtooths() {
-        // Three words 30ms apart - the passage that read as the text dancing.
+    fun aRunOfVeryShortWordsStillFillsAtTheSpeedItIsSung() {
+        // Three words 30ms apart - the passage that used to read as the text dancing. The fill is
+        // allowed to be quick, because the words genuinely are. Only the decoration is not.
         val line = lrc("[00:00.000]<00:00.000>a <00:00.030>b <00:00.060>c")
         val nextLine = 90L
         val frame = KaraokeFrame()
-        var peak = 0f
-        var worstStep = 0f
-        var previous = 0f
-        for (position in 0..89L) {
-            frame.resolve(line, position, nextLine)
-            if (frame.lift > peak) peak = frame.lift
-            val step = Math.abs(frame.lift - previous)
-            if (step > worstStep) worstStep = step
-            previous = frame.lift
-        }
-        assertTrue("a 30ms passage must stay calm: peak $peak", peak < 0.02f)
-        assertTrue("and never step: worst $worstStep", worstStep < 0.01f)
-        // The sweep is still allowed to be quick, because the words genuinely are.
         frame.resolve(line, 29, nextLine)
         assertTrue(frame.sweep > 0.95f)
         frame.resolve(line, 30, nextLine)
         assertEquals(start(line, 1), frame.wordStart)
+        // Every one of them still gets the same unhurried rise: none is a final word short of room.
+        val wave = KaraokeWave().apply { build(line, nextLine) }
+        assertEquals(3, wave.count)
+        assertEquals(1f, KaraokeWave.compression(wave.availableMs[0], 1), 0f)
+        assertEquals(1f, KaraokeWave.compression(wave.availableMs[1], 1), 0f)
     }
 
     @Test
-    fun overlappingTtmlSpansStillSettleBeforeOwnershipChanges() {
+    fun anOverlappingTtmlSpanStillFillsForItsOwnStatedLength() {
         // A span stated as held for two seconds, with the next span starting 300ms in. The stated
-        // end still drives the fill; ownership still bounds the lift, so there is nothing to snap.
+        // end still drives the fill, and the next word still takes over on its stated time.
         val line = ttml(
             """<p begin="00:00.000" end="00:05.000">""" +
                 """<span begin="00:00.000" end="00:02.000">Held</span> """ +
@@ -351,27 +420,11 @@ class LyricsKaraokeRenderingTest {
         )
         assertEquals("the fill follows the stated end", 2000L,
             KaraokeFrame.sweepWindowMs(line.segments, 0, Long.MAX_VALUE))
-        assertEquals("the lift is bounded by the next displayed word", 300L,
-            KaraokeFrame.liftWindowMs(line.text, line.segments, 0, Long.MAX_VALUE))
         val frame = KaraokeFrame()
         frame.resolve(line, 299, Long.MAX_VALUE)
-        assertTrue("outgoing word at rest before the overlap takes over: ${frame.lift}", frame.lift < 0.01f)
         assertTrue("its fill is still honestly mid-way: ${frame.sweep}", frame.sweep < 0.2f)
         frame.resolve(line, 300, Long.MAX_VALUE)
         assertEquals(start(line, 1), frame.wordStart)
-        assertEquals(0f, frame.lift, 0.0001f)
-    }
-
-    @Test
-    fun theLiftNeverOutlastsTheWordsOwnership() {
-        // The property behind every case above, asserted directly.
-        for (gap in longArrayOf(30, 50, 80, 120, 200, 400, 900, 2000, 4000)) {
-            val line = pairWithGap(gap)
-            val ownership = KaraokeFrame.ownershipWindowMs(line.segments, 0, Long.MAX_VALUE)
-            val lift = KaraokeFrame.liftWindowMs(line.text, line.segments, 0, Long.MAX_VALUE)
-            assertEquals("ownership is the stated gap", gap, ownership)
-            assertTrue("lift window $lift must fit inside ownership $ownership", lift <= ownership)
-        }
     }
 
     // ============================================= split / syllable-timed displayed words
@@ -402,38 +455,31 @@ class LyricsKaraokeRenderingTest {
     }
 
     @Test
-    fun aSplitWordLiftsOnceAcrossTheWholeWordInsteadOfOncePerSyllable() {
+    fun aSplitWordIsOneWaveAcrossTheWholeWordInsteadOfOncePerSyllable() {
+        // E. "beau|ti|ful day" states four times and shows two words. The wave has two entries,
+        // and the first of them begins at the FIRST of the three syllable times.
         val line = syllables()
-        // One window for all three syllables: 0 -> 800, not three windows of 200.
-        for (index in 0..2) {
-            assertEquals("segment $index shares the displayed word's window", 800L,
-                KaraokeFrame.liftWindowMs(line.text, line.segments, index, Long.MAX_VALUE))
+        val wave = KaraokeWave().apply { build(line, Long.MAX_VALUE) }
+        assertEquals("three stated syllables are one displayed word", 2, wave.count)
+        assertEquals("and its wave starts at the first of them", 0L, wave.startMs[0])
+        assertEquals("the next displayed word keeps its own stated start", 800L, wave.startMs[1])
+        assertEquals("the word covers the whole of the written word",
+            0, wave.startOffset[0])
+        assertTrue("and runs up to the next one", wave.endOffset[0] >= "beautiful".length)
+        assertEquals(wave.endOffset[0], wave.startOffset[1])
+        // One continuous rise across it: sampled at the syllable boundaries the source states,
+        // the travel never returns to the baseline and never restarts.
+        var previous = -1f
+        for (position in 0L..800L) {
+            val value = KaraokeWave.graphemeLift(position, wave.startMs[0], 0, 1f)
+            assertTrue("no restart at $position: $previous -> $value", value >= previous - 0.0001f)
+            previous = value
         }
-        // Sampled across the whole word, the travel rises once and settles once. A per-syllable
-        // lift would cross zero at 200 and 400 and peak three times.
-        val frame = KaraokeFrame()
-        var peaks = 0
-        var previous = 0f
-        var rising = true
-        var maxLift = 0f
-        for (position in 0..800L) {
-            frame.resolve(line, position, Long.MAX_VALUE)
-            if (frame.lift > maxLift) maxLift = frame.lift
-            if (rising && frame.lift < previous - 0.0005f) {
-                peaks++
-                rising = false
-            } else if (!rising && frame.lift > previous + 0.0005f) {
-                rising = true
-            }
-            previous = frame.lift
+        assertEquals("and it is fully raised well before the word ends", 1f, previous, 0f)
+        for (boundary in longArrayOf(200, 400)) {
+            assertTrue("the stated syllable at $boundary does not drop it back",
+                KaraokeWave.graphemeLift(boundary, wave.startMs[0], 0, 1f) > 0f)
         }
-        assertEquals("exactly one rise and one settle across the displayed word", 1, peaks)
-        assertEquals("and it does reach the full travel once", 1f, maxLift, 0.01f)
-        // Zero at both ends of the displayed word.
-        frame.resolve(line, 0, Long.MAX_VALUE)
-        assertEquals(0f, frame.lift, 0.0001f)
-        frame.resolve(line, 800, Long.MAX_VALUE)
-        assertEquals("the next displayed word starts from rest", 0f, frame.lift, 0.0001f)
     }
 
     @Test
@@ -464,7 +510,7 @@ class LyricsKaraokeRenderingTest {
             val line = pairWithGap(gap)
             val frame = KaraokeFrame()
             frame.resolve(line, gap - 1, Long.MAX_VALUE)
-            val liftBefore = frame.lift
+            val liftBefore = KaraokeWave.graphemeLift(gap - 1, 0, 0, 1f)
             assertEquals("${gap}ms: still the first word", start(line, 0), frame.wordStart)
             frame.resolve(line, gap, Long.MAX_VALUE)
             assertEquals("${gap}ms: the next word is current on its stated millisecond, " +
@@ -476,10 +522,12 @@ class LyricsKaraokeRenderingTest {
     @Test
     fun aSplitWordThatIsStillLiftingDoesNotHoldBackTheNextDisplayedWord() {
         val line = syllables()
+        val wave = KaraokeWave().apply { build(line, Long.MAX_VALUE) }
         val frame = KaraokeFrame()
-        // Mid-word, the decoration is in flight.
-        frame.resolve(line, 500, Long.MAX_VALUE)
-        assertTrue("the word is mid-lift here: ${frame.lift}", frame.lift > 0f)
+        // Mid-word the decoration is in flight - its later letters are still climbing at 800.
+        val stillRising = KaraokeWave.graphemeLift(800, wave.startMs[0], 8, 1f)
+        assertTrue("the first word is still rising when the next one starts: $stillRising",
+            stillRising < 1f)
         // "day" still becomes current on its own stated millisecond.
         frame.resolve(line, 800, Long.MAX_VALUE)
         assertEquals(start(line, 3), frame.wordStart)
@@ -509,7 +557,13 @@ class LyricsKaraokeRenderingTest {
             frame.resolve(line, nextLine - 1, nextLine)
             assertTrue("${tail}ms tail: complete before the line can change, not swallowed by it",
                 frame.sweep > 0.98f)
-            assertTrue("${tail}ms tail: and at rest by then", frame.lift < 0.02f)
+            // And its decoration is compressed exactly as far as it has to be to be seen at all.
+            val wave = KaraokeWave().apply { build(line, nextLine) }
+            val scale = KaraokeWave.compression(wave.availableMs[1], 4)
+            assertTrue("${tail}ms tail: the last word is raised by the transition, not skipped",
+                KaraokeWave.graphemeLift(nextLine, wave.startMs[1], 3, scale) >= 0.999f)
+            assertTrue("${tail}ms tail: and compressed only as far as it had to be",
+                scale <= 1f && scale >= KaraokeWave.MIN_COMPRESSION)
         }
     }
 
@@ -520,7 +574,8 @@ class LyricsKaraokeRenderingTest {
         assertTrue(frame.resolveRow(line, 0, 1, 1150, 1600))
         assertEquals(line.text.length, frame.sungEnd)
         assertEquals(frame.wordStart, frame.wordEnd)
-        assertEquals("nothing is left lifted on a line that has been left", 0f, frame.lift, 0.0001f)
+        assertEquals("a line already left keeps the height its letters reached, it does not drop",
+            1f, frame.uniformLift, 0f)
     }
 
     // ============================================= semantic current line versus the pre-roll
@@ -536,7 +591,7 @@ class LyricsKaraokeRenderingTest {
         assertEquals(0, frame.sungEnd)
         assertEquals(frame.wordStart, frame.wordEnd)
         assertEquals(0f, frame.sweep, 0.0001f)
-        assertEquals(0f, frame.lift, 0.0001f)
+        assertEquals("nothing on it is raised either", 0f, frame.uniformLift, 0f)
     }
 
     @Test
@@ -662,26 +717,29 @@ class LyricsKaraokeRenderingTest {
     }
 
     @Test
-    fun theLiftIsSeparableSoItCanSettleWhileTheFillStaysFrozen() {
-        // Pause is a multiplier on the lift and on nothing else. Whatever it is scaled by, the
-        // word and the fill are untouched - which is what lets the settle be wall-clock while the
-        // semantics stay on the playback clock.
+    fun pausingDoesNotAnimateTheLettersBackDown() {
+        // The whole of the decoration is a function of the playback position, so there is nothing
+        // for a pause to do. The letters stay exactly where the clock left them - no settle, no
+        // replay on resume, and no wall-clock animator to cancel.
         val line = pairWithGap(1000)
-        val frame = KaraokeFrame()
-        for (position in longArrayOf(120, 380, 700)) {
-            frame.resolve(line, position, Long.MAX_VALUE)
-            val word = frame.wordStart
-            val sweep = frame.sweep
-            for (scale in floatArrayOf(1f, 0.6f, 0.2f, 0f)) {
-                val lift = frame.lift * scale
-                assertTrue("scaled lift stays within travel at $position", lift >= 0f && lift <= 1f)
-                assertEquals("scaling the lift cannot move the word", word, frame.wordStart)
-                assertEquals("scaling the lift cannot move the fill", sweep, frame.sweep, 0f)
+        val wave = KaraokeWave().apply { build(line, Long.MAX_VALUE) }
+        for (position in longArrayOf(60, 120, 380, 700, 2000)) {
+            val held = KaraokeWave.graphemeLift(position, wave.startMs[0], 0, 1f)
+            for (again in 0..4) {
+                assertEquals("a paused position yields the same height every time it is asked",
+                    held, KaraokeWave.graphemeLift(position, wave.startMs[0], 0, 1f), 0f)
             }
-            assertEquals("fully settled means exactly rest", 0f, frame.lift * 0f, 0f)
+            // Resuming a millisecond later continues upward; it never starts from rest again.
+            assertTrue("resuming continues rather than replaying",
+                KaraokeWave.graphemeLift(position + 1, wave.startMs[0], 0, 1f) >= held)
         }
-        assertTrue("the settle must be short enough to read as a settle",
-            AudioPlayerAlert.KARAOKE_LIFT_SETTLE_MS >= 80L && AudioPlayerAlert.KARAOKE_LIFT_SETTLE_MS <= 400L)
+        val frame = KaraokeFrame()
+        frame.resolve(line, 380, Long.MAX_VALUE)
+        val word = frame.wordStart
+        val sweep = frame.sweep
+        frame.resolve(line, 380, Long.MAX_VALUE)
+        assertEquals("the paused word never moves", word, frame.wordStart)
+        assertEquals("the paused fill never moves", sweep, frame.sweep, 0f)
     }
 
     @Test
@@ -694,7 +752,7 @@ class LyricsKaraokeRenderingTest {
         resumed.resolve(line, 380, Long.MAX_VALUE)
         assertEquals(paused.wordStart, resumed.wordStart)
         assertEquals(paused.sweep, resumed.sweep, 0f)
-        assertEquals(paused.lift, resumed.lift, 0f)
+        assertEquals(paused.uniformLift, resumed.uniformLift, 0f)
         // And a moment after resuming, it has moved on rather than started again.
         resumed.resolve(line, 420, Long.MAX_VALUE)
         assertTrue("the fill continues forward", resumed.sweep > paused.sweep)
@@ -772,7 +830,6 @@ class LyricsKaraokeRenderingTest {
         frame.resolve(line, 9000, Long.MAX_VALUE)
         assertEquals(start(line, 2), frame.wordStart)
         assertEquals(1f, frame.sweep, 0.0001f)
-        assertEquals(0f, frame.lift, 0.0001f)
     }
 
     @Test
@@ -781,13 +838,17 @@ class LyricsKaraokeRenderingTest {
         val frame = KaraokeFrame()
         frame.resolve(line, 1150, 1600)
         val sweep = frame.sweep
-        val lift = frame.lift
         val word = frame.wordStart
         frame.resolve(line, 9000, Long.MAX_VALUE)
         frame.resolve(line, 1150, 1600)
         assertEquals(sweep, frame.sweep, 0f)
-        assertEquals(lift, frame.lift, 0f)
         assertEquals(word, frame.wordStart)
+        // The decoration is reconstructed just as exactly, because it too is a pure function of
+        // the position: a seek backwards lowers the letters again rather than leaving them stuck.
+        assertEquals(KaraokeWave.graphemeLift(1150, 1000, 0, 1f),
+            KaraokeWave.graphemeLift(1150, 1000, 0, 1f), 0f)
+        assertEquals("a position before the word states no lift at all", 0f,
+            KaraokeWave.graphemeLift(999, 1000, 0, 1f), 0f)
     }
 
     @Test
@@ -1025,6 +1086,56 @@ class LyricsKaraokeRenderingTest {
         val jamo = "각b"
         assertNeverSplits(jamo, "Hangul jamo")
         assertEquals("L+V+T is one syllable", 3, KaraokeGeometry.clusterEnd(jamo, 1))
+    }
+
+    /**
+     * The enumeration the row itself uses to decide what a "letter" of the wave is: walk the text
+     * cluster by cluster with [clusterEnd], exactly as LyricsTextView.ensureClusters does.
+     */
+    private fun waveGraphemes(text: String): List<String> {
+        val out = ArrayList<String>()
+        var offset = 0
+        while (offset < text.length) {
+            val next = KaraokeGeometry.clusterEnd(text, offset + 1)
+            val end = if (next <= offset) offset + 1 else minOf(next, text.length)
+            out.add(text.substring(offset, end))
+            offset = end
+        }
+        return out
+    }
+
+    @Test
+    fun theWaveRisesThroughWholeGraphemesAndNeverThroughHalfOfOne() {
+        // K. A letter of the wave is a user-visible grapheme cluster, never a UTF-16 char. Every
+        // piece the row would raise separately has to be a piece the platform segmenter agrees is
+        // one, or the wave would be built by cutting a character in half.
+        val breaks = java.text.BreakIterator.getCharacterInstance()
+        for (text in listOf(
+            "Hello world",
+            "ȩ́x ábc",
+            "😀 and 👨\u200D👩\u200D👧\u200D👦 and 🇪🇹 and 👍🏽",
+            "ሰላም ለዓለም",
+            "مرحبا بالعالم",
+            "नमस्ते दुनिया"
+        )) {
+            val pieces = waveGraphemes(text)
+            assertEquals("the pieces must reassemble the text exactly", text, pieces.joinToString(""))
+            breaks.setText(text)
+            var offset = 0
+            for (piece in pieces) {
+                assertTrue("$text: a wave letter must be a whole cluster, got '$piece' at $offset",
+                    breaks.isBoundary(offset))
+                offset += piece.length
+            }
+            assertTrue("$text: and the walk must terminate on the end", offset == text.length)
+            assertTrue("$text: a wave of one letter is not a wave", pieces.size > 1)
+        }
+        // A four-person family emoji is ONE letter of the wave, not eleven.
+        assertEquals(1, waveGraphemes("👨\u200D👩\u200D👧\u200D👦").size)
+        assertEquals(1, waveGraphemes("🇪🇹").size)
+        assertEquals(1, waveGraphemes("👍🏽").size)
+        assertEquals("a combining mark rides its base", 1, waveGraphemes("ȩ́").size)
+        assertEquals("an Amharic syllable is one letter", 4, waveGraphemes("ሰላም ").size)
     }
 
     @Test

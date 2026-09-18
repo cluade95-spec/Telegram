@@ -2060,9 +2060,10 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             updateTitle(id == NotificationCenter.messagePlayingDidReset && (Boolean) args[1]);
             if (id == NotificationCenter.messagePlayingPlayStateChanged) {
                 updateLyricsFollow(true);
-                // A pause must not leave a word hanging above its baseline, and a resume must pick
-                // the lift back up from wherever the clock has since moved on to.
-                updateKaraokeLiftScale();
+                // Nothing to do for the word motion: the whole of it is a function of the playback
+                // position, so a pause freezes it exactly where the clock stopped and a resume
+                // carries on from wherever the clock has since moved on to. There is no animator
+                // to settle, nothing to replay, and no pop either way.
             }
             if (id == NotificationCenter.messagePlayingDidReset || id == NotificationCenter.messagePlayingPlayStateChanged) {
                 int count = listView.getChildCount();
@@ -3555,16 +3556,23 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
     private static final float KARAOKE_MUTED_REST = 0.10f;
     private static final float KARAOKE_MUTED_ACTIVE = 0.30f;
     /**
-     * Amplitude, in dp, of the lift a displayed word with room to make it takes. Draw-time only.
+     * Amplitude, in dp, of the raised position a grapheme settles at. Draw-time only.
      *
-     * <p>Deliberately small. The lift is decoration, not state: the horizontal fill is what says
-     * which word is being sung, and the fill says it unambiguously. At three times this the eye
-     * started tracking the motion instead of reading the words, and a fast passage read as the
-     * text dancing. It is meant to register as a breath, not as an animation.
+     * <p>Deliberately tiny. The lift is decoration, not state: the horizontal fill is what says
+     * which word is being sung, and the fill says it unambiguously. On device even a third more
+     * than this had the eye tracking the motion instead of reading the words. It is meant to be
+     * visible only to someone watching for it.
      */
-    static final float KARAOKE_LIFT_DP = 1.25f;
-    /** How long a paused lift takes to settle back, and a resumed one to come back. Wall clock. */
-    static final long KARAOKE_LIFT_SETTLE_MS = 200;
+    static final float KARAOKE_LIFT_DP = 0.9f;
+    /**
+     * How many discrete heights the lift is quantised to for drawing.
+     *
+     * <p>The wave is a continuous function of the playback position, but the picture is painted by
+     * clipping the row's own laid-out text once per distinct height, so the number of heights is
+     * the number of extra draw passes. At this amplitude one step is well under half a pixel on
+     * any real density, so quantising costs nothing visible and bounds the drawing.
+     */
+    static final int KARAOKE_LIFT_LEVELS = 5;
 
     /** Resolved once per document: true only when some line genuinely states inline word timing. */
     private boolean lyricsWordTimed;
@@ -3584,16 +3592,13 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
     // karaokeLine, so no word of a line the pre-roll is merely carrying into place can light up
     // before its own stated time, however bright the line itself has become.
 
-    /**
-     * Wall-clock multiplier on the lift alone, so a pause cannot leave a word hanging in the air.
-     * It scales an amplitude and nothing else: which word is current, which line is current and
-     * how far the fill has travelled are all still read straight off the playback position.
-     */
-    private float karaokeLiftScale = 1f;
-    private ValueAnimator karaokeLiftScaleAnimator;
-
     /** The frame the current line is painting. Scratch for one tick; carries nothing between two. */
     private final KaraokeFrame karaoke = new KaraokeFrame();
+    /**
+     * The decorative grapheme wave of the line being sung. Rebuilt once per line, never per tick,
+     * and shared by every frame that paints that line.
+     */
+    private final KaraokeWave karaokeWave = new KaraokeWave();
     /** Scratch holder for painting one row; never carries state between two calls. */
     private final KaraokeFrame rowKaraoke = new KaraokeFrame();
     /** The line the playback position is actually inside, whether or not it states word timing. */
@@ -3622,6 +3627,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         if (line != karaokeLine) {
             karaokeLine = line;
             karaokeNextLineTimeMs = nextLyricsLineTimeMs(line);
+            karaokeWave.build(resolvable ? currentLyrics.lines.get(line) : null, karaokeNextLineTimeMs);
             karaokeMutedSource = getThemedColor(Theme.key_player_time);
             karaokeSungSource = getThemedColor(Theme.key_player_actionBarTitle);
             karaokeRow = resolvable ? rowForLyricsLine(line) : RecyclerView.NO_POSITION;
@@ -3654,7 +3660,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         if (karaoke.resolveRow(currentLyrics.lines.get(karaokeLine), karaokeLine, karaokeLine,
                 karaokePositionMs, karaokeNextLineTimeMs)) {
             ((LyricsTextView) child).setKaraokeFrame(karaoke.wordStart, karaoke.wordEnd,
-                    karaoke.sweep, karaoke.lift * karaokeLiftScale);
+                    karaoke.sweep, karaoke.uniformLift, karaokeWaveFor(karaokeLine), karaokePositionMs);
         }
     }
 
@@ -3740,38 +3746,9 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         return KARAOKE_SINGING_FOCUS_FLOOR * (1f - released);
     }
 
-    /**
-     * A pause must not leave a word hanging above its baseline, and a resume must not replay the
-     * rise. Both are the same one-property wall-clock fade on the lift amplitude: the word settles
-     * where the clock left it and comes back to where the clock has since moved on to.
-     */
-    private void updateKaraokeLiftScale() {
-        if (!lyricsWordTimed) return;
-        final MessageObject playing = MediaController.getInstance().getPlayingMessageObject();
-        final float target = playing != null && MediaController.getInstance().isMessagePaused() ? 0f : 1f;
-        if (karaokeLiftScale == target && karaokeLiftScaleAnimator == null) return;
-        if (karaokeLiftScaleAnimator != null) {
-            karaokeLiftScaleAnimator.cancel();
-            karaokeLiftScaleAnimator = null;
-        }
-        final ValueAnimator animator = ValueAnimator.ofFloat(karaokeLiftScale, target);
-        animator.addUpdateListener(a -> {
-            if (karaokeLiftScaleAnimator != a) return;
-            karaokeLiftScale = (float) a.getAnimatedValue();
-            repaintKaraokeRow();
-        });
-        animator.addListener(new AnimatorListenerAdapter() {
-            @Override public void onAnimationEnd(Animator animation) {
-                if (karaokeLiftScaleAnimator != animation) return;
-                karaokeLiftScaleAnimator = null;
-                karaokeLiftScale = target;
-                repaintKaraokeRow();
-            }
-        });
-        animator.setDuration(KARAOKE_LIFT_SETTLE_MS);
-        animator.setInterpolator(CubicBezierInterpolator.EASE_BOTH);
-        karaokeLiftScaleAnimator = animator;
-        animator.start();
+    /** The wave to paint one row with: the line being sung has one, and nothing else does. */
+    private KaraokeWave karaokeWaveFor(int line) {
+        return line == karaokeLine ? karaokeWave : null;
     }
 
     /** Stated start of the first timed line after {@code line}, or MAX_VALUE when there is none. */
@@ -3806,11 +3783,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         karaokeNextLineTimeMs = Long.MAX_VALUE;
         karaokeMutedSource = 0;
         karaokeSungSource = 0;
-        if (karaokeLiftScaleAnimator != null) {
-            karaokeLiftScaleAnimator.cancel();
-            karaokeLiftScaleAnimator = null;
-        }
-        karaokeLiftScale = 1f;
+        karaokeWave.reset();
     }
 
     private void applyLyricsDepth(View child) {
@@ -3894,7 +3867,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             textView.setLyricTextColor(mutedColor);
             textView.setKaraokeColors(mutedColor, sungColor);
             textView.setKaraokeFrame(rowKaraoke.wordStart, rowKaraoke.wordEnd, rowKaraoke.sweep,
-                    rowKaraoke.lift * karaokeLiftScale);
+                    rowKaraoke.uniformLift, karaokeWaveFor(visibleLyrics.get(row)), karaokePositionMs);
         } else {
             // Ordinary line-synced text, and any untimed line inside a karaoke document. Line-level
             // hierarchy only: no sweep, no word motion, nothing invented.
@@ -4189,6 +4162,160 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
      * come straight from the source's offsets and {@link #sweep} is decided after them, never the
      * other way round.
      */
+    public static final class KaraokeWave {
+        /**
+         * How long one grapheme takes to travel from the baseline to its raised position.
+         *
+         * <p>Fixed, and deliberately unrelated to how long the word was sung. Tying the motion to
+         * the word's own window - which is what the previous model did - meant a quick word jumped
+         * and a held word crawled, so a fast passage read as the page dancing. The fill already
+         * says how fast the singing is, exactly and from the source's own times. The decoration
+         * says only that the word has begun, and it says it at the same unhurried speed every time.
+         */
+        public static final long RISE_MS = 520;
+        /**
+         * How far behind its neighbour each grapheme sets off.
+         *
+         * <p>Tiny on purpose. It is a fraction of {@link #RISE_MS}, so a word's letters are all
+         * moving at once and merely out of step with one another: a soft wave travelling along the
+         * word rather than a typewriter working through it.
+         */
+        public static final long STAGGER_MS = 26;
+        /**
+         * Floor on the compression, for the degenerate case only.
+         *
+         * <p>A word whose line changes a handful of milliseconds after it starts cannot be given a
+         * meaningful rise at all, and dividing by that room would produce a sub-millisecond one.
+         * It is deliberately far below anything a real line reaches, so every genuine late word is
+         * compressed by exactly what it needs and no more.
+         */
+        public static final float MIN_COMPRESSION = 0.02f;
+
+        /** Number of DISPLAYED words on the line. */
+        public int count;
+        /** Inclusive UTF-16 start of each displayed word, in the line's own text. */
+        public int[] startOffset = new int[8];
+        /** Exclusive UTF-16 end of each displayed word. Contiguous: word w ends where w+1 starts. */
+        public int[] endOffset = new int[8];
+        /** Genuine stated start of each displayed word - the first of its segments. */
+        public long[] startMs = new long[8];
+        /**
+         * Visual room the word has before the line is carried away, or {@link Long#MAX_VALUE} when
+         * nothing bounds it. Only the last displayed word is ever bounded.
+         */
+        public long[] availableMs = new long[8];
+        /** Bumped on every rebuild, so a consumer can cache what it derived from this. */
+        public int generation;
+
+        public void reset() {
+            count = 0;
+            generation++;
+        }
+
+        /**
+         * Rebuilds the wave for one line. Called when the line changes and at no other time.
+         *
+         * <p>Displayed words, not timed segments: a source that splits {@code beautiful} into
+         * {@code be|au|ti|ful} at four stated times is one word here, beginning at the first of
+         * those times. The fill still follows all four; only the decoration is grouped, so the
+         * word gets one wave across its letters instead of four restarts.
+         */
+        public void build(SyncedLyricsController.Line line, long nextLineTimeMs) {
+            count = 0;
+            generation++;
+            if (line == null || line.segments == null || line.text == null || line.text.isEmpty()) return;
+            if (!line.timed) return;
+            final SyncedLyricsController.Segments segments = line.segments;
+            final int size = segments.size();
+            if (size == 0) return;
+            final CharSequence text = line.text;
+            ensureCapacity(size);
+            for (int i = 0; i < size; i++) {
+                if (count > 0 && KaraokeFrame.isWordContinuation(text, segments, i)) {
+                    // The same written word, stated again: it extends the word already open and
+                    // keeps that word's FIRST start, which is when the page saw it begin.
+                    endOffset[count - 1] = Math.max(endOffset[count - 1], segments.endOffset(i));
+                    continue;
+                }
+                startOffset[count] = segments.startOffset(i);
+                endOffset[count] = Math.max(segments.startOffset(i), segments.endOffset(i));
+                startMs[count] = segments.startTimeMs(i);
+                availableMs[count] = Long.MAX_VALUE;
+                count++;
+            }
+            if (count == 0) return;
+            // Any text before the first stated tag belongs to the line, so it rises with the first
+            // word rather than sitting at the baseline on its own; the spaces between words ride
+            // with the word before them, and the line's tail with the last.
+            startOffset[0] = 0;
+            for (int w = 0; w + 1 < count; w++) {
+                endOffset[w] = Math.max(endOffset[w], startOffset[w + 1]);
+            }
+            endOffset[count - 1] = Math.max(endOffset[count - 1], text.length());
+            if (nextLineTimeMs != Long.MAX_VALUE) {
+                // At least one, so a word stated at the very instant the line changes is read as
+                // having almost no room rather than as having none stated.
+                availableMs[count - 1] = Math.max(1L, nextLineTimeMs - startMs[count - 1]);
+            }
+        }
+
+        private void ensureCapacity(int size) {
+            if (size <= startOffset.length) return;
+            final int grown = Math.max(size, startOffset.length * 2);
+            startOffset = java.util.Arrays.copyOf(startOffset, grown);
+            endOffset = java.util.Arrays.copyOf(endOffset, grown);
+            startMs = java.util.Arrays.copyOf(startMs, grown);
+            availableMs = java.util.Arrays.copyOf(availableMs, grown);
+        }
+
+        /** How long the whole wave across {@code graphemes} letters takes at normal speed. */
+        public static long spanMs(int graphemes) {
+            return RISE_MS + (long) Math.max(0, graphemes - 1) * STAGGER_MS;
+        }
+
+        /**
+         * How much a word's decorative wave is compressed, 1 meaning not at all.
+         *
+         * <p>Only ever less than 1 for the last displayed word of a line, and only when that word
+         * genuinely starts so late that its normal wave would still be climbing when the line is
+         * carried away - which on device read as the last word never lifting at all. The
+         * adjustment is continuous in the room available, so there is no length at which the
+         * motion visibly changes character, and an earlier word is never touched however fast it
+         * is sung.
+         */
+        public static float compression(long availableMs, int graphemes) {
+            if (availableMs == Long.MAX_VALUE || availableMs <= 0) return 1f;
+            final long needed = spanMs(graphemes);
+            if (needed <= 0 || availableMs >= needed) return 1f;
+            final float scale = availableMs / (float) needed;
+            return scale < MIN_COMPRESSION ? MIN_COMPRESSION : scale;
+        }
+
+        /**
+         * Where one grapheme of one displayed word is, 0 at the baseline and 1 fully raised.
+         *
+         * <p>A pure function of the playback position, so a pause freezes it, a resume continues
+         * it, a seek lands on it and a recycled row rebinds to it - with no animator, no elapsed
+         * time and no previous frame anywhere.
+         *
+         * <p>It is non-decreasing in the position and it ends at 1. There is no downward half: a
+         * letter that has risen stays risen for as long as the line is on screen. And because each
+         * grapheme's clock starts at its own word's genuine start plus its own small offset,
+         * nothing waits for anything - the next letter sets off while this one is still climbing,
+         * and so does the next word.
+         */
+        public static float graphemeLift(long positionMs, long wordStartMs, int graphemeIndex, float compression) {
+            final float scale = compression > 0f ? compression : 1f;
+            final float rise = RISE_MS * scale;
+            if (rise <= 0f) return 1f;
+            final float elapsed = positionMs - wordStartMs - Math.max(0, graphemeIndex) * STAGGER_MS * scale;
+            if (elapsed <= 0f) return 0f;
+            if (elapsed >= rise) return 1f;
+            final float t = elapsed / rise;
+            return t * t * (3f - 2f * t);
+        }
+    }
+
     public static final class KaraokeFrame {
         /**
          * Safety bound on a fill derived for start-only word timing, for the genuinely huge gap -
@@ -4203,24 +4330,6 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         public static final long SWEEP_DERIVED_MAX_MS = 3000;
         /** Used only when start-only timing gives nothing at all to bound the fill with. */
         public static final long SWEEP_DERIVED_FALLBACK_MS = 600;
-        /** Safety bound on the lift, for the same reason and with the same generosity. */
-        public static final long LIFT_MAX_MS = 2600;
-        /**
-         * The window below which the lift fades out, and the one at and above which it is full.
-         *
-         * <p>A word that flashes past cannot be given a rise and settle: the result is not motion,
-         * it is a twitch, and a line of them reads as the text dancing. So the amplitude is a
-         * smooth function of how much room the word actually has - zero for anything quick, full
-         * only for a word that is genuinely held - and the transition between the two is a
-         * smoothstep, so there is no length at which the page visibly changes behaviour. The
-         * window is deliberately wide and the floor deliberately high: in a fast passage the right
-         * amount of vertical movement is none, and the fill still shows the timing exactly.
-         */
-        public static final long LIFT_FADE_MIN_MS = 150;
-        public static final long LIFT_FADE_FULL_MS = 620;
-        /** Fraction of the lift spent rising; the rest is the settle back to the normal position. */
-        private static final float LIFT_RISE = 0.38f;
-
         /** True when this line has genuine inline timing to show at the resolved position. */
         public boolean active;
         /**
@@ -4233,8 +4342,14 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         public int wordEnd;
         /** 0..1 across the word at {@link #wordStart}: how much of it the fill has travelled. */
         public float sweep;
-        /** 0..1 amplitude of the word's lift, starting and ending at 0. */
-        public float lift;
+        /**
+         * Lift shared by the whole line, for a line that has no wave of its own to paint: 1 for a
+         * line the position has already left, whose letters all finished rising while it was being
+         * sung and must not drop as it is carried away, and 0 for a line not yet reached.
+         *
+         * <p>The line being sung takes its lift from {@link KaraokeWave} instead, per grapheme.
+         */
+        public float uniformLift;
 
         public void clear() {
             active = false;
@@ -4242,7 +4357,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             wordStart = 0;
             wordEnd = 0;
             sweep = 0f;
-            lift = 0f;
+            uniformLift = 0f;
         }
 
         /**
@@ -4268,6 +4383,9 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 // is also what keeps a fast line's last word from being swallowed - it finishes
                 // lit rather than being caught mid-fill by the line change.
                 sungEnd = wordStart = wordEnd = line.text.length();
+                // Its letters all finished rising while it was current. Nothing brings them back
+                // down - the line simply fades and scrolls away at the height it reached.
+                uniformLift = 1f;
             }
             // Everything else is a line the position has not reached - including one a player is
             // already moving into view - and clear() has left every boundary at zero.
@@ -4309,17 +4427,10 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             final long elapsed = Math.max(0L, positionMs - start);
             final long sweepMs = sweepWindowMs(segments, index, nextLineTimeMs);
             sweep = sweepMs <= 0 ? 1f : clamp01(elapsed / (float) sweepMs);
-            // The lift belongs to the DISPLAYED word, not to the timed segment. A source that
-            // splits one word across several stated times - be|au|ti|ful - would otherwise lift
-            // and settle once per syllable, which is the single busiest thing on the page. So the
-            // lift is measured from the first segment of the displayed word this segment belongs
-            // to, and spans the whole of it. The fill is untouched and still follows every genuine
-            // segment; only the decoration is grouped.
-            final long liftStart = segments.startTimeMs(lexicalStartIndex(line.text, segments, index));
-            final long liftElapsed = Math.max(0L, positionMs - liftStart);
-            final long liftMs = liftWindowMs(line.text, segments, index, nextLineTimeMs);
-            lift = liftMs <= 0 ? 0f
-                    : liftCurve(liftElapsed / (float) liftMs) * liftAmplitudeScale(liftMs);
+            // Nothing vertical is decided here. The decoration belongs to the DISPLAYED word and
+            // to the letters inside it, it runs on its own fixed clock, and it is resolved by
+            // KaraokeWave from the playback position alone - so it can never bound a fill, hold a
+            // word back or move a boundary.
             active = true;
             return true;
         }
@@ -4396,60 +4507,6 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             int first = Math.max(0, index);
             while (first > 0 && isWordContinuation(text, segments, first)) first--;
             return first;
-        }
-
-        /**
-         * How long the lift takes: the interval the DISPLAYED word occupies, from the stated start
-         * of its first segment to the stated start of the next displayed word - or, for the last
-         * word of a line, the next line's.
-         *
-         * <p>Two consequences, both wanted. A word split into syllables gets one slow lift across
-         * all of them rather than one per syllable. And because the curve is zero at the end of
-         * this window, the decoration is already at rest when the next displayed word begins.
-         *
-         * <p>It bounds nothing else. {@link SyncedLyricsController.Segments#indexAt} still decides
-         * which segment is current the instant its stated time arrives, and the fill still follows
-         * that segment: the lift can never hold a word back, shorten a fill or move a boundary. It
-         * is decoration, and decoration yields.
-         */
-        public static long liftWindowMs(CharSequence text, SyncedLyricsController.Segments segments, int index, long nextLineTimeMs) {
-            final int first = lexicalStartIndex(text, segments, index);
-            final long start = segments.startTimeMs(first);
-            int next = first + 1;
-            while (next < segments.size() && isWordContinuation(text, segments, next)) next++;
-            long bound = -1;
-            if (next < segments.size()) {
-                bound = segments.startTimeMs(next) - start;
-            } else if (nextLineTimeMs != Long.MAX_VALUE) {
-                bound = nextLineTimeMs - start;
-            }
-            if (bound <= 0) bound = SWEEP_DERIVED_FALLBACK_MS;
-            return Math.min(bound, LIFT_MAX_MS);
-        }
-
-        /**
-         * How much of the intended travel a word with {@code windowMs} to make it in is given.
-         * Smoothstep between {@link #LIFT_FADE_MIN_MS} and {@link #LIFT_FADE_FULL_MS}, so there is
-         * no threshold at which the motion visibly switches on.
-         */
-        public static float liftAmplitudeScale(long windowMs) {
-            final float t = clamp01((windowMs - LIFT_FADE_MIN_MS) / (float) (LIFT_FADE_FULL_MS - LIFT_FADE_MIN_MS));
-            return t * t * (3f - 2f * t);
-        }
-
-        /**
-         * Normal position, a gentle rise, then a gentle settle back to the normal position.
-         *
-         * <p>Smoothstep on both halves, which means the value AND its rate of change are zero at
-         * the start, at the peak and at the end. The word eases away from rest, eases into its
-         * peak, and eases back down: there is no kick at the start, no corner at the top, and no
-         * arrival at the bottom - which is what made the old curve feel like a flick rather than a
-         * breath. It never goes below zero, so it lifts and settles and never bounces.
-         */
-        public static float liftCurve(float t) {
-            if (t <= 0f || t >= 1f) return 0f;
-            final float p = t < LIFT_RISE ? t / LIFT_RISE : 1f - (t - LIFT_RISE) / (1f - LIFT_RISE);
-            return p * p * (3f - 2f * p);
         }
 
         private static float clamp01(float value) {
@@ -4728,28 +4785,54 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         private int wordStart;
         private int wordEnd;
         private float sweep;
-        private float lift;
+        /** Lift for every grapheme at once, used only by a line with no wave of its own. */
+        private float uniformLift;
         private final float liftAmplitude = dp(KARAOKE_LIFT_DP);
+        /** The colour boundaries the spans currently carry, so an unchanged frame re-sets nothing. */
+        private int spanSungTo = -1;
+        private int spanWordTo = -1;
+
+        // --- the decorative wave ------------------------------------------------------------
+        // A copy of the line's displayed words, taken once per line, plus the compression each of
+        // them is due. Copied rather than read through because the frames that push here are
+        // scratch objects reused across rows, and because the compression needs this row's own
+        // grapheme counts.
+        private int waveGeneration = -1;
+        private int waveCount;
+        private int[] waveStartOffset = new int[8];
+        private int[] waveEndOffset = new int[8];
+        private long[] waveStartMs = new long[8];
+        private float[] waveCompression = new float[8];
+
+        // --- grapheme clusters of this row ---------------------------------------------------
+        // Boundaries depend on the text and rects on the layout, so each is rebuilt only when the
+        // thing it depends on changes. A tick walks them and allocates nothing.
+        private CharSequence clusterText;
+        private int clusterCount;
+        private int[] clusterStart = new int[32];
+        private byte[] clusterLevel = new byte[32];
+        private Layout clusterLayout;
+        private CharSequence clusterGeometryText;
+        private int clusterGeometryCount;
+        private float[] clusterLeft = new float[32];
+        private float[] clusterRight = new float[32];
+        private float[] clusterTop = new float[32];
+        private float[] clusterBottom = new float[32];
+        private boolean[] clusterRtl = new boolean[32];
+        private boolean[] clusterHasRect = new boolean[32];
+        /** The cluster {@link #addRun} is currently filling, or -1 outside a geometry rebuild. */
+        private int pendingCluster = -1;
+        /** The cluster the fill front is inside, and how far into it the fill has travelled. */
+        private int frontCluster = -1;
+        private float frontRevealed;
         /** Cached so a repaint with an unchanged colour never allocates a ColorStateList. */
         private int lyricTextColor;
         private boolean lyricTextColorSet;
         /** Quantised blur radius currently on the view, or -1 when nothing has been applied yet. */
         private int appliedBlur = -1;
 
-        /** Per-visual-run geometry of the word being sung, rebuilt only when it can have moved. */
-        private Layout geometryLayout;
-        private int geometryStart = -1;
-        private int geometryEnd = -1;
-        private int geometryCount;
-        private float geometryTotal;
-        private float[] geometryLeft = new float[4];
-        private float[] geometryRight = new float[4];
-        private float[] geometryTop = new float[4];
-        private float[] geometryBottom = new float[4];
-        private boolean[] geometryRtl = new boolean[4];
-        /** The filled part of the word and the part still to come. Disjoint, so nothing overlaps. */
-        private final Path sweptClip = new Path();
-        private final Path restClip = new Path();
+        /** Rebuilt per draw pass. One Path, rewound, so drawing allocates nothing. */
+        private final Path levelClip = new Path();
 
         LyricsTextView(Context context) {
             super(context);
@@ -4791,11 +4874,13 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         }
 
         /**
-         * Pushes one resolved frame. Everything about it is a boundary the source stated plus two
-         * scalars derived from the playback position, so pushing the same position twice is a
-         * no-op and a settled word costs nothing per tick.
+         * Pushes one resolved frame: the word the source says is current, how far its fill has
+         * travelled, and the wave the line's letters are riding. Everything here is a boundary the
+         * source stated plus a function of the playback position, so pushing the same position
+         * twice is a no-op and a settled line costs nothing per tick.
          */
-        void setKaraokeFrame(int start, int end, float sweepProgress, float liftProgress) {
+        void setKaraokeFrame(int start, int end, float sweepProgress, float lift,
+                             KaraokeWave wave, long positionMs) {
             if (karaokeText == null) return;
             // A row that was not painting karaoke a moment ago - a fresh bind, a recycled view, a
             // line that has just become relevant - carries no spans at all, so its first frame
@@ -4811,9 +4896,6 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 if (wasInactive || wordStart != snappedStart || wordEnd != snappedEnd) {
                     wordStart = snappedStart;
                     wordEnd = snappedEnd;
-                    setRange(sungSpan, 0, snappedStart);
-                    setRange(wordSpan, snappedStart, snappedEnd);
-                    setRange(tailSpan, snappedEnd, karaokeText.length());
                     changed = true;
                 }
             }
@@ -4821,14 +4903,183 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 sweep = sweepProgress;
                 changed = true;
             }
-            if (Math.abs(lift - liftProgress) > 0.0015f) {
-                lift = liftProgress;
+            if (Math.abs(uniformLift - lift) > 0.0015f) {
+                uniformLift = lift;
                 changed = true;
             }
+            if (adoptWave(wave)) changed = true;
+            if (updateLiftLevels(positionMs)) changed = true;
+            if (resolveColourBoundaries()) changed = true;
             // SpannableString does not report span changes to a SpanWatcher, and a colour changed
             // in place is not a change the text could report anyway, so every repaint here is this
             // one. It is also the reason nothing in this class can trigger a re-measure.
             if (changed) invalidate();
+        }
+
+        /**
+         * Takes this row's copy of the line's displayed words, and works out the compression each
+         * of them is due from the number of graphemes this row actually has to raise.
+         *
+         * <p>Only ever the last word of a line is compressed, and only when its normal wave would
+         * not finish before the line goes. Cached on the wave's generation, so this runs once per
+         * line rather than once per tick.
+         */
+        private boolean adoptWave(KaraokeWave wave) {
+            final int generation = wave == null ? -1 : wave.generation;
+            if (generation == waveGeneration) return false;
+            waveGeneration = generation;
+            waveCount = wave == null ? 0 : wave.count;
+            if (waveCount > 0) {
+                ensureWaveCapacity(waveCount);
+                ensureClusters();
+                for (int w = 0; w < waveCount; w++) {
+                    waveStartOffset[w] = wave.startOffset[w];
+                    waveEndOffset[w] = wave.endOffset[w];
+                    waveStartMs[w] = wave.startMs[w];
+                    waveCompression[w] = KaraokeWave.compression(wave.availableMs[w],
+                            graphemesBetween(wave.startOffset[w], wave.endOffset[w]));
+                }
+            }
+            return true;
+        }
+
+        /** Number of graphemes with something to draw between two offsets of this row's text. */
+        private int graphemesBetween(int from, int to) {
+            int count = 0;
+            for (int i = 0; i < clusterCount; i++) {
+                final int offset = clusterStart[i];
+                if (offset < from) continue;
+                if (offset >= to) break;
+                if (!isBlankCluster(i)) count++;
+            }
+            return count;
+        }
+
+        /**
+         * Re-derives where every grapheme of this row is standing, from the playback position and
+         * nothing else.
+         *
+         * <p>Each grapheme's clock starts at its own displayed word's genuine start plus its own
+         * small offset along the word, so a word begins the instant the source says so however far
+         * the previous word has got, and a letter begins however far its neighbour has got. The
+         * value is quantised to a small number of heights, which bounds the drawing and is what
+         * lets an unchanged frame skip the repaint entirely.
+         */
+        private boolean updateLiftLevels(long positionMs) {
+            ensureClusters();
+            if (clusterCount == 0) return false;
+            boolean changed = false;
+            int word = 0;
+            int grapheme = 0;
+            for (int i = 0; i < clusterCount; i++) {
+                final int offset = clusterStart[i];
+                float value;
+                if (waveCount == 0) {
+                    value = uniformLift;
+                } else {
+                    while (word < waveCount && offset >= waveEndOffset[word]) {
+                        word++;
+                        grapheme = 0;
+                    }
+                    if (word >= waveCount || offset < waveStartOffset[word]) {
+                        value = 0f;
+                    } else {
+                        value = KaraokeWave.graphemeLift(positionMs, waveStartMs[word], grapheme,
+                                waveCompression[word]);
+                        if (!isBlankCluster(i)) grapheme++;
+                    }
+                }
+                final byte level = (byte) Math.round(value * KARAOKE_LIFT_LEVELS);
+                if (clusterLevel[i] != level) {
+                    clusterLevel[i] = level;
+                    changed = true;
+                }
+            }
+            return changed;
+        }
+
+        /**
+         * Finds the grapheme the fill front is inside and colours the line around it: everything
+         * before it is sung, everything after it is still to come, and it alone is the one drawn
+         * in two pieces.
+         *
+         * <p>Done here rather than while drawing because setting a span asks the view to repaint,
+         * and a view may not ask itself to repaint from inside its own draw.
+         */
+        private boolean resolveColourBoundaries() {
+            if (karaokeText == null) return false;
+            ensureClusterGeometry();
+            int front = -1;
+            float revealed = 0f;
+            int sungTo;
+            int wordTo;
+            if (wordEnd <= wordStart) {
+                sungTo = wordTo = wordStart;
+            } else if (sweep >= 1f) {
+                sungTo = wordTo = wordEnd;
+            } else if (clusterGeometryCount != clusterCount || clusterCount == 0) {
+                // Not laid out yet. The word reads as still to come, and the next tick - by which
+                // time there is a layout - puts the fill where the clock says it is.
+                sungTo = wordTo = wordStart;
+            } else {
+                float total = 0f;
+                for (int i = 0; i < clusterCount; i++) {
+                    final int offset = clusterStart[i];
+                    if (offset < wordStart) continue;
+                    if (offset >= wordEnd) break;
+                    if (isBlankCluster(i) || !clusterHasRect[i]) continue;
+                    total += clusterRight[i] - clusterLeft[i];
+                }
+                if (total <= 0f) {
+                    sungTo = wordTo = wordStart;
+                } else {
+                    final float reveal = sweep * total;
+                    float consumed = 0f;
+                    for (int i = 0; i < clusterCount; i++) {
+                        final int offset = clusterStart[i];
+                        if (offset < wordStart) continue;
+                        if (offset >= wordEnd) break;
+                        if (isBlankCluster(i) || !clusterHasRect[i]) continue;
+                        final float width = clusterRight[i] - clusterLeft[i];
+                        if (reveal < consumed + width) {
+                            front = i;
+                            revealed = reveal - consumed;
+                            if (revealed < 0f) revealed = 0f;
+                            break;
+                        }
+                        consumed += width;
+                    }
+                    if (front < 0) {
+                        sungTo = wordTo = wordEnd;
+                    } else {
+                        sungTo = clusterStart[front];
+                        wordTo = clusterStart[front + 1];
+                    }
+                }
+            }
+            boolean changed = false;
+            if (front != frontCluster || Math.abs(revealed - frontRevealed) > 0.05f) {
+                frontCluster = front;
+                frontRevealed = revealed;
+                changed = true;
+            }
+            if (spanSungTo != sungTo || spanWordTo != wordTo) {
+                spanSungTo = sungTo;
+                spanWordTo = wordTo;
+                setRange(sungSpan, 0, sungTo);
+                setRange(wordSpan, sungTo, wordTo);
+                setRange(tailSpan, wordTo, karaokeText.length());
+                changed = true;
+            }
+            return changed;
+        }
+
+        @Override
+        protected void onLayout(boolean changed, int left, int top, int right, int bottom) {
+            super.onLayout(changed, left, top, right, bottom);
+            // A new layout moves every grapheme, so the fill front has to be found again. Doing it
+            // here rather than in onDraw keeps span changes out of the draw pass.
+            if (karaokeActive && resolveColourBoundaries()) invalidate();
         }
 
         /** Returns the row to plain, uniformly coloured text. */
@@ -4858,29 +5109,27 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
 
         /**
          * Draws the row. Without a word being sung this is exactly {@link TextView}'s own drawing.
-         * With one it is the same drawing two or three times over, each pass showing a different,
-         * <em>non-overlapping</em> part of the same laid-out text:
+         * With one it is the same drawing several times over, each pass showing a different,
+         * <em>non-overlapping</em> part of the same laid-out text at a different height:
          *
          * <ol>
-         *     <li>the whole line with the current word suppressed, so the sung text and the text
-         *     still to come are drawn once and no ghost of the word is left at its resting
-         *     position;</li>
-         *     <li>the part of the word the fill has reached, in the sung colour, at its lifted
-         *     position;</li>
-         *     <li>the part it has not, in the muted colour, at the same lifted position.</li>
+         *     <li>one pass per height the row's graphemes are currently standing at, clipped to
+         *     the graphemes at that height and translated to it, with the grapheme the fill front
+         *     is inside suppressed;</li>
+         *     <li>the part of that one grapheme the fill has reached, in the sung colour;</li>
+         *     <li>the part it has not, in the muted colour.</li>
          * </ol>
          *
-         * <p>Passes 2 and 3 are clipped to complementary regions of the same rectangles, so no
-         * pixel of the word is rasterised twice. That is the difference that matters: drawing the
-         * word muted and then drawing it again in the sung colour on top composites two
-         * antialiased glyph edges over each other, which fringes the sung text with the muted
-         * colour and thickens its outline. Nothing overlaps here, so the fill has a clean edge and
-         * the glyphs keep their real weight.
+         * <p>No pixel is rasterised twice. That is the difference that matters: drawing text muted
+         * and then drawing it again in the sung colour on top composites two antialiased glyph
+         * edges over each other, which fringes the sung text and thickens its outline. Nothing
+         * overlaps here, so the fill has a clean edge and the glyphs keep their real weight.
          *
          * <p>Each pass is the platform drawing the row's real {@link Layout}, so the glyphs are the
          * same shaped, kerned, wrapped and reordered glyphs throughout - there is no second
-         * measurement of the word anywhere, and nothing here can move a boundary. A settled row,
-         * and a row with no word in flight, is a single ordinary pass.
+         * measurement of anything, no per-letter view and no per-letter span, and nothing here can
+         * move a boundary or a metric. The number of passes is bounded by
+         * {@link AudioPlayerAlert#KARAOKE_LIFT_LEVELS}, and a line standing entirely still is two of them.
          */
         @Override
         protected void onDraw(Canvas canvas) {
@@ -4888,125 +5137,190 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 super.onDraw(canvas);
                 return;
             }
-            if (wordEnd <= wordStart) {
-                // A line with no word in flight: everything before the boundary is sung, the rest
-                // is muted, and there is nothing to lift or fill.
-                applyPassColors(sungColor, sungColor, mutedColor);
-                super.onDraw(canvas);
-                return;
-            }
-            ensureSweepGeometry();
-            if (geometryCount == 0 || geometryTotal <= 0f) {
-                // No geometry to fill: the row has not been laid out yet, or the stated range is
-                // nothing but whitespace. The word must still be DRAWN - suppressing it in the base
-                // pass and then having nothing to draw it with would make it vanish - so this falls
-                // back to one ordinary pass with the word muted.
+            ensureClusterGeometry();
+            if (clusterCount == 0 || clusterGeometryCount != clusterCount) {
+                // Nothing to clip against: the row has not been laid out yet. Everything the
+                // source has finished is sung, the rest is muted, and nothing is lifted or filled.
                 applyPassColors(sungColor, mutedColor, mutedColor);
                 super.onDraw(canvas);
                 return;
             }
-            applyPassColors(sungColor, Color.TRANSPARENT, mutedColor);
-            super.onDraw(canvas);
-            final float offset = lift * liftAmplitude;
-            final boolean lifted = offset > 0.05f;
-            if (lifted) {
-                canvas.save();
-                canvas.translate(0f, -offset);
-            }
-            drawWordRegion(canvas, true);
-            drawWordRegion(canvas, false);
-            if (lifted) canvas.restore();
-        }
-
-        /** Redraws one side of the fill boundary, clipped so the two sides never overlap. */
-        private void drawWordRegion(Canvas canvas, boolean swept) {
-            final Path clip = swept ? sweptClip : restClip;
-            if (!buildWordRegion(clip, swept)) return;
-            canvas.save();
-            canvas.clipPath(clip);
-            applyPassColors(Color.TRANSPARENT, swept ? sungColor : mutedColor, Color.TRANSPARENT);
-            super.onDraw(canvas);
-            canvas.restore();
-        }
-
-        /**
-         * Builds one side of the fill: a rectangle per visual run of the word, each grown from the
-         * side that run is actually read from, with the runs consumed in reading order so a word
-         * that wraps or reorders fills its first piece before its second.
-         */
-        private boolean buildWordRegion(Path path, boolean swept) {
-            final float reveal = sweep * geometryTotal;
             // The row never scrolls, so the layout sits at exactly the total padding.
             final float originX = getTotalPaddingLeft();
             final float originY = getTotalPaddingTop();
-            path.rewind();
-            float consumed = 0f;
+            final float step = liftAmplitude / KARAOKE_LIFT_LEVELS;
+            for (int level = 0; level <= KARAOKE_LIFT_LEVELS; level++) {
+                if (!buildLevelClip(level, originX, originY)) continue;
+                canvas.save();
+                if (level > 0) canvas.translate(0f, -level * step);
+                canvas.clipPath(levelClip);
+                applyPassColors(sungColor, Color.TRANSPARENT, mutedColor);
+                super.onDraw(canvas);
+                canvas.restore();
+            }
+            if (frontCluster >= 0) {
+                drawFrontRegion(canvas, originX, originY, step, true);
+                drawFrontRegion(canvas, originX, originY, step, false);
+            }
+        }
+
+        /**
+         * Collects the graphemes standing at one height into the clip for that height's pass. The
+         * grapheme the fill front is inside is left out: it is drawn afterwards, in two pieces.
+         */
+        private boolean buildLevelClip(int level, float originX, float originY) {
+            levelClip.rewind();
             boolean any = false;
-            for (int i = 0; i < geometryCount; i++) {
-                final float width = geometryRight[i] - geometryLeft[i];
-                final float shown = KaraokeGeometry.revealedWidth(reveal, consumed, width);
-                consumed += width;
-                final float part = swept ? shown : width - shown;
-                if (part <= 0.01f) continue;
-                final float left = swept
-                        ? KaraokeGeometry.revealedLeft(geometryLeft[i], geometryRight[i], shown, geometryRtl[i])
-                        : geometryRtl[i] ? geometryLeft[i] : geometryLeft[i] + shown;
-                path.addRect(originX + left, originY + geometryTop[i],
-                        originX + left + part, originY + geometryBottom[i], Path.Direction.CW);
+            for (int i = 0; i < clusterCount; i++) {
+                if (i == frontCluster || clusterLevel[i] != level || !clusterHasRect[i]) continue;
+                final float width = clusterRight[i] - clusterLeft[i];
+                if (width <= 0.01f) continue;
+                levelClip.addRect(originX + clusterLeft[i], originY + clusterTop[i],
+                        originX + clusterRight[i], originY + clusterBottom[i], Path.Direction.CW);
                 any = true;
             }
             return any;
         }
 
         /**
-         * Caches where the word actually is, asking the row's own {@link Layout} rather than
-         * measuring anything: which visual runs it falls on, how far across each one it runs, and
-         * which side of each one it is read from. It is rebuilt only when the layout object or the
-         * word's range changes, so a word being sung for two seconds is measured once.
+         * Draws one side of the fill boundary: the part of the front grapheme the fill has reached,
+         * or the part it has not. Grown from whichever side that grapheme is actually read from, so
+         * a right-to-left word fills from its right edge.
          */
-        private void ensureSweepGeometry() {
+        private void drawFrontRegion(Canvas canvas, float originX, float originY, float step, boolean swept) {
+            final int i = frontCluster;
+            if (i < 0 || i >= clusterCount || !clusterHasRect[i]) return;
+            final float width = clusterRight[i] - clusterLeft[i];
+            if (width <= 0.01f) return;
+            float shown = frontRevealed;
+            if (shown < 0f) shown = 0f;
+            if (shown > width) shown = width;
+            final float part = swept ? shown : width - shown;
+            if (part <= 0.01f) return;
+            final float left = swept
+                    ? KaraokeGeometry.revealedLeft(clusterLeft[i], clusterRight[i], shown, clusterRtl[i])
+                    : clusterRtl[i] ? clusterLeft[i] : clusterLeft[i] + shown;
+            canvas.save();
+            final float offset = clusterLevel[i] * step;
+            if (offset > 0f) canvas.translate(0f, -offset);
+            canvas.clipRect(originX + left, originY + clusterTop[i],
+                    originX + left + part, originY + clusterBottom[i]);
+            applyPassColors(Color.TRANSPARENT, swept ? sungColor : mutedColor, Color.TRANSPARENT);
+            super.onDraw(canvas);
+            canvas.restore();
+        }
+
+        /**
+         * Splits this row's text into user-visible graphemes, once per text.
+         *
+         * <p>The segmentation is {@link KaraokeGeometry#clusterEnd}'s, which is the platform's
+         * UAX #29 answer with an emoji backstop: a surrogate pair, a combining sequence, a ZWJ
+         * emoji, an Amharic syllable and a flag are each one grapheme, and none of them can be cut
+         * in half to make a wave out of.
+         */
+        private void ensureClusters() {
+            if (clusterText == karaokeText && clusterCount > 0) return;
+            clusterText = karaokeText;
+            clusterCount = 0;
+            if (karaokeText == null) return;
+            final int length = karaokeText.length();
+            if (length == 0) return;
+            ensureClusterCapacity(length + 1);
+            int offset = 0;
+            int count = 0;
+            clusterStart[0] = 0;
+            while (offset < length) {
+                final int next = KaraokeGeometry.clusterEnd(karaokeText, offset + 1);
+                offset = next <= offset ? offset + 1 : Math.min(next, length);
+                clusterStart[++count] = offset;
+            }
+            clusterCount = count;
+            java.util.Arrays.fill(clusterLevel, 0, clusterCount, (byte) -1);
+        }
+
+        /**
+         * Caches where each grapheme actually is, asking the row's own {@link Layout} rather than
+         * measuring anything. Rebuilt only when the layout object or the text changes, so a line
+         * being sung for several seconds is measured once.
+         */
+        private void ensureClusterGeometry() {
+            ensureClusters();
             final Layout layout = getLayout();
-            if (layout == geometryLayout && geometryStart == wordStart && geometryEnd == wordEnd) return;
-            geometryLayout = layout;
-            geometryStart = wordStart;
-            geometryEnd = wordEnd;
-            geometryCount = 0;
-            geometryTotal = 0f;
-            if (layout == null || wordEnd <= wordStart || wordEnd > layout.getText().length()) return;
-            // A stated range runs to the start of the next one, so it usually carries the space
-            // after the word. The colour is welcome to cover it - a space has no glyph to colour -
-            // but the fill must not spend a quarter of its travel crossing one, so the geometry is
-            // the word's own glyphs and the fill therefore completes exactly when the word does.
-            final CharSequence text = layout.getText();
-            int glyphStart = wordStart;
-            int glyphEnd = wordEnd;
-            while (glyphEnd > glyphStart && Character.isWhitespace(text.charAt(glyphEnd - 1))) glyphEnd--;
-            while (glyphStart < glyphEnd && Character.isWhitespace(text.charAt(glyphStart))) glyphStart++;
-            if (glyphEnd <= glyphStart) return;
-            KaraokeGeometry.forEachVisualRun(layout, glyphStart, glyphEnd, this);
+            if (layout == clusterLayout && clusterGeometryText == clusterText) return;
+            clusterLayout = layout;
+            clusterGeometryText = clusterText;
+            clusterGeometryCount = 0;
+            if (layout == null || clusterCount == 0 || karaokeText == null) return;
+            final CharSequence laid = layout.getText();
+            if (laid == null || laid.length() != karaokeText.length()) return;
+            ensureClusterGeometryCapacity(clusterCount);
+            for (int i = 0; i < clusterCount; i++) {
+                pendingCluster = i;
+                clusterHasRect[i] = false;
+                KaraokeGeometry.forEachVisualRun(layout, clusterStart[i], clusterStart[i + 1], this);
+            }
+            pendingCluster = -1;
+            clusterGeometryCount = clusterCount;
+        }
+
+        /** True when a grapheme has no glyph to raise or fill - a space, a tab, a line separator. */
+        private boolean isBlankCluster(int index) {
+            final CharSequence text = clusterText;
+            if (text == null) return true;
+            final int from = clusterStart[index];
+            final int to = clusterStart[index + 1];
+            for (int i = from; i < to; i++) {
+                if (!Character.isWhitespace(text.charAt(i))) return false;
+            }
+            return true;
         }
 
         /** {@link KaraokeGeometry.RunSink}. Called only while the geometry is being rebuilt. */
         @Override
         public void addRun(float left, float right, float top, float bottom, boolean rightToLeft) {
-            ensureGeometryCapacity(geometryCount + 1);
-            geometryLeft[geometryCount] = left;
-            geometryRight[geometryCount] = right;
-            geometryTop[geometryCount] = top;
-            geometryBottom[geometryCount] = bottom;
-            geometryRtl[geometryCount] = rightToLeft;
-            geometryTotal += right - left;
-            geometryCount++;
+            final int i = pendingCluster;
+            if (i < 0 || i >= clusterHasRect.length) return;
+            if (!clusterHasRect[i]) {
+                clusterHasRect[i] = true;
+                clusterLeft[i] = left;
+                clusterRight[i] = right;
+                clusterTop[i] = top;
+                clusterBottom[i] = bottom;
+                clusterRtl[i] = rightToLeft;
+                return;
+            }
+            // A grapheme cannot wrap or reorder, so this is only ever a defensive union.
+            if (left < clusterLeft[i]) clusterLeft[i] = left;
+            if (right > clusterRight[i]) clusterRight[i] = right;
+            if (top < clusterTop[i]) clusterTop[i] = top;
+            if (bottom > clusterBottom[i]) clusterBottom[i] = bottom;
         }
 
-        private void ensureGeometryCapacity(int size) {
-            if (size <= geometryLeft.length) return;
-            final int grown = Math.max(size, geometryLeft.length * 2);
-            geometryLeft = java.util.Arrays.copyOf(geometryLeft, grown);
-            geometryRight = java.util.Arrays.copyOf(geometryRight, grown);
-            geometryTop = java.util.Arrays.copyOf(geometryTop, grown);
-            geometryBottom = java.util.Arrays.copyOf(geometryBottom, grown);
-            geometryRtl = java.util.Arrays.copyOf(geometryRtl, grown);
+        private void ensureWaveCapacity(int size) {
+            if (size <= waveStartOffset.length) return;
+            final int grown = Math.max(size, waveStartOffset.length * 2);
+            waveStartOffset = java.util.Arrays.copyOf(waveStartOffset, grown);
+            waveEndOffset = java.util.Arrays.copyOf(waveEndOffset, grown);
+            waveStartMs = java.util.Arrays.copyOf(waveStartMs, grown);
+            waveCompression = java.util.Arrays.copyOf(waveCompression, grown);
+        }
+
+        private void ensureClusterCapacity(int size) {
+            if (size <= clusterStart.length) return;
+            final int grown = Math.max(size, clusterStart.length * 2);
+            clusterStart = java.util.Arrays.copyOf(clusterStart, grown);
+            clusterLevel = java.util.Arrays.copyOf(clusterLevel, grown);
+        }
+
+        private void ensureClusterGeometryCapacity(int size) {
+            if (size <= clusterLeft.length) return;
+            final int grown = Math.max(size, clusterLeft.length * 2);
+            clusterLeft = java.util.Arrays.copyOf(clusterLeft, grown);
+            clusterRight = java.util.Arrays.copyOf(clusterRight, grown);
+            clusterTop = java.util.Arrays.copyOf(clusterTop, grown);
+            clusterBottom = java.util.Arrays.copyOf(clusterBottom, grown);
+            clusterRtl = java.util.Arrays.copyOf(clusterRtl, grown);
+            clusterHasRect = java.util.Arrays.copyOf(clusterHasRect, grown);
         }
 
         /** Colours for one draw pass. Read live by the spans, so it never invalidates anything. */
@@ -5034,14 +5348,19 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             wordStart = 0;
             wordEnd = 0;
             sweep = 0f;
-            lift = 0f;
+            uniformLift = 0f;
             requestedStart = -1;
             requestedEnd = -1;
-            geometryLayout = null;
-            geometryStart = -1;
-            geometryEnd = -1;
-            geometryCount = 0;
-            geometryTotal = 0f;
+            spanSungTo = -1;
+            spanWordTo = -1;
+            frontCluster = -1;
+            frontRevealed = 0f;
+            waveGeneration = -1;
+            waveCount = 0;
+            clusterLayout = null;
+            clusterGeometryText = null;
+            clusterGeometryCount = 0;
+            if (clusterCount > 0) java.util.Arrays.fill(clusterLevel, 0, clusterCount, (byte) -1);
         }
     }
 
