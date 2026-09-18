@@ -4421,16 +4421,16 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             // but the fill must not spend a quarter of its travel crossing one, so the geometry is
             // the word's own glyphs and the fill therefore completes exactly when the word does.
             final CharSequence text = layout.getText();
-            int from = wordStart;
-            int to = wordEnd;
-            while (to > from && Character.isWhitespace(text.charAt(to - 1))) to--;
-            while (from < to && Character.isWhitespace(text.charAt(from))) from++;
-            if (to <= from) return;
-            final int firstLine = layout.getLineForOffset(from);
-            final int lastLine = layout.getLineForOffset(to - 1);
+            int glyphStart = wordStart;
+            int glyphEnd = wordEnd;
+            while (glyphEnd > glyphStart && Character.isWhitespace(text.charAt(glyphEnd - 1))) glyphEnd--;
+            while (glyphStart < glyphEnd && Character.isWhitespace(text.charAt(glyphStart))) glyphStart++;
+            if (glyphEnd <= glyphStart) return;
+            final int firstLine = layout.getLineForOffset(glyphStart);
+            final int lastLine = layout.getLineForOffset(glyphEnd - 1);
             for (int line = firstLine; line <= lastLine; line++) {
-                final int start = Math.max(from, layout.getLineStart(line));
-                final int end = Math.min(to, layout.getLineEnd(line));
+                final int start = Math.max(glyphStart, layout.getLineStart(line));
+                final int end = Math.min(glyphEnd, layout.getLineEnd(line));
                 if (end <= start) continue;
                 final float from = KaraokeGeometry.horizontalAt(layout, line, start);
                 final float to = KaraokeGeometry.horizontalAt(layout, line, end);
