@@ -3173,9 +3173,24 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         return getNormalPlayerHeight();
     }
 
-    /** Vertical position inside the viewport that the active synced line settles on. */
-    private int getLyricsFocusCenter() {
-        return lyricsListView.getHeight() / 2;
+    /**
+     * MEASURED: where the active line settles, as a fraction of the lyrics viewport height.
+     *
+     * <p>The reference TOP-anchors the active block. Its first baseline sits at y = 405.0 px of a
+     * 1560 px frame in every settled frame measured - 405.00, 404.95, 405.01, 405.02, 405.04,
+     * 405.50 - and that holds whether the block is one, two or three rows tall. The glyph top is
+     * at 361 px, i.e. 0.2314 of the frame.
+     *
+     * <p>This player used to centre the row instead, which is a real and visible mismatch: with a
+     * centred anchor a three-row line sits higher than a one-row line, so the page shifts
+     * vertically with the length of whatever line happens to be current. The reference never does
+     * that, because it anchors the top.
+     */
+    static final float LYRICS_FOCUS_TOP_FRACTION = 0.2314f;
+
+    /** The viewport y the TOP of the active row settles on. */
+    private int getLyricsFocusTop() {
+        return Math.round(lyricsListView.getHeight() * LYRICS_FOCUS_TOP_FRACTION);
     }
 
     // ---------------------------------------------------------------------------------------
@@ -3186,7 +3201,36 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
     // line (emphasis, colour, tap-to-seek) still changes exactly at the real timestamp.
     // ---------------------------------------------------------------------------------------
 
+    /**
+     * MEASURED: the scroll starts this long before the incoming line's own karaoke fill begins
+     * (median 450 ms over nine transitions, mean 498, sd 93). The value this player already used
+     * is 440, which is inside the measurement's own error, so it is kept rather than nudged.
+     */
     private static final long LYRIC_FOLLOW_LEAD_MAX = 440;
+
+    /**
+     * MEASURED line-follow easing, fitted to the mean normalised displacement curve of ten
+     * transitions in the reference (rmse 0.0037; per-sample sd <= 0.025 across the ten):
+     *
+     * <pre>
+     *   t/T   0.00  0.10  0.20  0.25  0.30  0.50  0.75  0.90  1.00
+     *   p     0.000 0.040 0.157 0.282 0.442 0.792 0.939 0.977 0.992
+     * </pre>
+     *
+     * <p>Velocity peaks at 0.29 T. The shape is ease-in-out with a SHORT in and a very long out -
+     * the first 20 % of the time covers only 16 % of the distance, then half the travel is spent
+     * between 0.25 T and 0.40 T, then it settles for the rest. A symmetric {@code EASE_BOTH}, which
+     * is what this used, spends far too long on the second half and reads slack by comparison.
+     */
+    static final CubicBezierInterpolator LYRIC_FOLLOW_EASING =
+            new CubicBezierInterpolator(0.45, 0.10, 0.05, 0.85);
+
+    /**
+     * MEASURED: how long the travel itself takes - median 483 ms, mean 507, sd 90, over the ten
+     * transitions. It does NOT scale with distance in the reference: a 312 px advance took 433 ms
+     * and a 216 px advance took 617 ms.
+     */
+    static final long LYRIC_FOLLOW_MEASURED_MS = 480;
 
     /**
      * How long BEFORE a line's stated time the list starts carrying the previous line away.
@@ -3435,7 +3479,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             // Far away (first open, long seek): reach the destination immediately rather than
             // crawling through the whole document, then let the next update ease from there.
             cancelLyricsFollowAnimator();
-            lyricsLayoutManager.scrollToPositionWithOffset(row, Math.max(0, getLyricsFocusCenter() - dp(32)));
+            lyricsLayoutManager.scrollToPositionWithOffset(row, Math.max(0, getLyricsFocusTop()));
             lyricsFollowRow = row;
             // Resolve emphasis onto the destination too, so a long seek cannot leave the previous
             // line emphasised or bold a row that is no longer current.
@@ -3443,7 +3487,9 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             return;
         }
         // scrollBy() takes the opposite sign convention: positive dy moves content up.
-        final int distance = (child.getTop() + child.getBottom()) / 2 - getLyricsFocusCenter();
+        // Top-anchored, per the reference: the row's TOP goes to the focus, so a long line and a
+        // short one start their first row at the same y instead of being centred against each other.
+        final int distance = child.getTop() - getLyricsFocusTop();
         if (!animated) {
             cancelLyricsFollowAnimator();
             lyricsListView.scrollBy(0, distance);
@@ -3463,8 +3509,12 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         }
         long duration = preferredDuration;
         if (duration <= 0) {
-            // Distance-proportional, so a one-line step stays soft and a long seek stays responsive.
-            duration = Math.round(220 + Math.abs(distance) / AndroidUtilities.density * 0.9f);
+            // MEASURED: an ordinary line advance takes ~480 ms in the reference whatever the
+            // distance, so a one-line step is not scaled by how far it happens to travel. A long
+            // seek still is: the reference has no such move, and crawling one would be worse.
+            duration = Math.abs(distance) <= dp(LYRICS_TEXT_SIZE_MAX_DP * 4)
+                    ? LYRIC_FOLLOW_MEASURED_MS
+                    : Math.round(220 + Math.abs(distance) / AndroidUtilities.density * 0.9f);
         }
         duration = Math.max(LYRIC_FOLLOW_MIN_MS, Math.min(LYRIC_FOLLOW_MAX_MS, duration));
         lyricsFollowRow = row;
@@ -3503,8 +3553,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             }
         });
         animator.setDuration(duration);
-        // Same easing family as the compact lyric transition: soft in, soft out, no snap.
-        animator.setInterpolator(CubicBezierInterpolator.EASE_BOTH);
+        animator.setInterpolator(LYRIC_FOLLOW_EASING);
         lyricsFollowAnimator = animator;
         animator.start();
     }
@@ -3548,25 +3597,131 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
      * metric-affecting and switching one on a state change would re-measure and possibly re-wrap
      * the row, moving every row below it.
      */
-    static final int LYRICS_TEXT_SIZE_DP = 22;
-    static final int LYRICS_LINE_SPACING_DP = 3;
-    static final int LYRICS_ROW_MIN_HEIGHT_DP = 64;
+    // -- Measured from the Apple Music reference (720x1560 capture, docs/apple-music-lyrics-reference.md)
+    //
+    // The reference gives RATIOS, not the recording device's density, so the type is expressed
+    // against the viewport width rather than in fixed dp. A dp figure here would be a guess about
+    // the hardware that was recorded; a ratio reproduces the measured proportion on every screen.
+    //
+    //   left text inset     61-63 px / 720 = 0.0854 W      (92 px of a 1080-wide frame)
+    //   text em             62.0 px  / 720 = 0.0861 W      (cap height 44 px, x-height 34 px)
+    //   wrapped-row pitch   78.0 px        = 1.258 em
+    //   block-to-block      141.5 px       = 2.282 em, i.e. an extra 1.024 em between lines
+    //
+    /** MEASURED: lyric em size as a fraction of the lyrics viewport width. */
+    static final float LYRICS_TEXT_SIZE_W = 0.0861f;
+    /** MEASURED: left (and right) text inset as a fraction of the lyrics viewport width. */
+    static final float LYRICS_INSET_W = 0.0854f;
+    /** MEASURED: baseline-to-baseline distance of two wrapped rows of one line, in em. */
+    static final float LYRICS_ROW_PITCH_EM = 1.258f;
+    /** MEASURED: the extra distance between two separate lyric lines, in em. */
+    static final float LYRICS_BLOCK_GAP_EM = 1.024f;
+    /**
+     * Bounds on the derived em size. DERIVED FROM CURRENT DEVICE DENSITY: the ratio alone would
+     * set absurd type on a tablet-width or a watch-width viewport, and neither is in the reference.
+     */
+    static final float LYRICS_TEXT_SIZE_MIN_DP = 18f;
+    static final float LYRICS_TEXT_SIZE_MAX_DP = 36f;
+
+    /** The lyric em size, in dp, for a viewport this many dp wide. Pure, so the ratio is testable. */
+    static float lyricsTextSizeDp(float viewportWidthDp) {
+        return Math.max(LYRICS_TEXT_SIZE_MIN_DP,
+                Math.min(LYRICS_TEXT_SIZE_MAX_DP, viewportWidthDp * LYRICS_TEXT_SIZE_W));
+    }
+
+    /** The left/right text inset, in dp, for a viewport this many dp wide. */
+    static float lyricsInsetDp(float viewportWidthDp) {
+        return Math.max(LYRICS_TEXT_SIZE_MIN_DP * LYRICS_INSET_W / LYRICS_TEXT_SIZE_W,
+                Math.min(LYRICS_TEXT_SIZE_MAX_DP * LYRICS_INSET_W / LYRICS_TEXT_SIZE_W,
+                        viewportWidthDp * LYRICS_INSET_W));
+    }
+
+    /**
+     * Vertical padding of one lyric row. Two adjacent rows each contribute one of these between
+     * their text, so the pair has to add up to the measured 1.024 em block gap.
+     */
+    static float lyricsRowPaddingVDp(float textSizeDp) {
+        return textSizeDp * LYRICS_BLOCK_GAP_EM / 2f;
+    }
+
+    /**
+     * Extra line spacing, in px, that makes a wrapped row pitch land on the measured 1.258 em.
+     *
+     * <p>Derived from the paint's own metrics rather than from a dp constant, so the measured
+     * pitch is reproduced whatever the font resolves to. A negative result means the font is
+     * already looser than the reference and is clamped away rather than tightened.
+     */
+    static float lyricsExtraLineSpacingPx(float textSizePx, float fontAscentPx, float fontDescentPx) {
+        return Math.max(0f, textSizePx * LYRICS_ROW_PITCH_EM - (fontDescentPx - fontAscentPx));
+    }
+
+    /**
+     * Sets the one lyric typography, derived from the measured reference proportions.
+     *
+     * <p>Called when a row is created and again when it is bound, and never after that: a size, a
+     * weight or a spacing is metric-affecting, and changing one when a line or a word becomes
+     * active would re-measure the row, possibly re-wrap it, and move every row underneath. The
+     * reference agrees - active and inactive lines there are set identically; the only thing that
+     * changes when a line becomes current is colour.
+     */
+    private void applyLyricsTypography(LyricsTextView textView, boolean stanzaSpace) {
+        final float widthDp = lyricsViewportWidthDp();
+        final float textSizeDp = lyricsTextSizeDp(widthDp);
+        final float insetDp = lyricsInsetDp(widthDp);
+        final float paddingVDp = lyricsRowPaddingVDp(textSizeDp);
+        textView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, textSizeDp);
+        // MEASURED: stroke width / cap height = 0.20 in the reference, which is a bold weight.
+        // This is what the row already used, so it is unchanged.
+        textView.setTypeface(AndroidUtilities.bold());
+        final Paint.FontMetrics fm = textView.getPaint().getFontMetrics();
+        textView.setLineSpacing(lyricsExtraLineSpacingPx(dp(textSizeDp), fm.ascent, fm.descent), 1f);
+        textView.setMinHeight(stanzaSpace ? dp(LYRICS_ROW_STANZA_HEIGHT_DP) : 0);
+        textView.setPadding(dp(insetDp), stanzaSpace ? 0 : dp(paddingVDp),
+                dp(insetDp), stanzaSpace ? 0 : dp(paddingVDp));
+    }
+
+    /** The viewport width, in dp, the lyric type is currently derived from. */
+    private float lyricsViewportWidthDp() {
+        int widthPx = lyricsListView != null && lyricsListView.getWidth() > 0
+                ? lyricsListView.getWidth()
+                : AndroidUtilities.displaySize.x;
+        return widthPx / AndroidUtilities.density;
+    }
+
+    // Retained for the stanza spacer only: a blank line between two verses is structural, not type.
     static final int LYRICS_ROW_STANZA_HEIGHT_DP = 26;
-    static final int LYRICS_ROW_PADDING_H_DP = 22;
-    static final int LYRICS_ROW_PADDING_V_DP = 13;
-    /** Opacity of a karaoke line at the focus centre but not current. */
-    private static final float KARAOKE_REST_ALPHA = 0.74f;
+
+    /**
+     * MEASURED: opacity of text the sweep has not reached yet, relative to sung text (0.259 on
+     * the active line, 0.293 on the line after it - the same tier within measurement error).
+     */
+    private static final float KARAOKE_UNSUNG_ALPHA = 0.29f;
+    /**
+     * MEASURED: the opacity the furthest visible line keeps, relative to the nearest one
+     * (0.081 / 0.293 = 0.28). This is a fade with screen position, not with "activeness".
+     */
+    private static final float KARAOKE_DEPTH_FAR = 0.28f;
+    /**
+     * MEASURED: the reference has NO depth blur. 20-80% edge-rise width by depth came back
+     * 1.00 / 3.27 / 0.80 / 1.67 px - noise, with no monotonic trend. What reads as blur on the
+     * distant lines is low alpha and nothing else, so depth is carried by opacity alone.
+     */
+    private static final float KARAOKE_BLUR_MAX_DP = 0f;
+
+    // Read-only views of the measured constants, so the hierarchy can be asserted without the
+    // player being on screen.
+    static float karaokeUnsungAlpha() { return KARAOKE_UNSUNG_ALPHA; }
+    static float karaokeDepthFar() { return KARAOKE_DEPTH_FAR; }
+    static float karaokeBlurMaxDp() { return KARAOKE_BLUR_MAX_DP; }
+
+    // EXISTING TELEGRAM BEHAVIOUR RETAINED: a line-synced document states no word timing, so it
+    // has no sweep to carry the hierarchy and keeps the line-level crossfade it always had.
+    /** Opacity of a line-synced line that is not current. */
+    private static final float SYNCED_REST_ALPHA = 0.74f;
     /** How much of that opacity the distance falloff is allowed to take. */
-    private static final float KARAOKE_REST_ALPHA_FALLOFF = 0.20f;
-    /** Opacity of the current line. Deliberately only a little above its neighbours. */
-    private static final float KARAOKE_ACTIVE_ALPHA = 0.96f;
-    /** Blur, in dp, a karaoke line furthest from the focus centre carries. Small on purpose. */
-    private static final float KARAOKE_BLUR_MAX_DP = 2.4f;
-    /** How much of the active colour sung text takes on a line that is not the current one. */
-    private static final float KARAOKE_SUNG_REST = 0.50f;
-    /** How much of it text that has not been sung takes, at rest and on the current line. */
-    private static final float KARAOKE_MUTED_REST = 0.10f;
-    private static final float KARAOKE_MUTED_ACTIVE = 0.30f;
+    private static final float SYNCED_REST_ALPHA_FALLOFF = 0.20f;
+    /** Opacity of the current line-synced line. */
+    private static final float SYNCED_ACTIVE_ALPHA = 0.96f;
 
     /** Resolved once per document: true only when some line genuinely states inline word timing. */
     private boolean lyricsWordTimed;
@@ -3820,41 +3975,55 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 && row != lyricsEmphasisToRow && rowKaraoke.wordEnd > rowKaraoke.wordStart;
         final float focus = Math.max(lyricsFocusOf(row),
                 karaokeReadableFloor(singing, rowKaraoke.sweep));
-        final float center = getLyricsFocusCenter();
-        final float distance = Math.abs((child.getTop() + child.getBottom()) / 2f - center) / Math.max(1f, center);
-        // Smoothstep rather than the raw distance: the falloff starts gently, so the lines either
-        // side of the active one stay comfortably readable, and deepens further out, where being
-        // subordinate is the point. Linear distance did the opposite of both.
-        final float linear = Math.min(1f, distance);
-        final float depth = linear * linear * (3f - 2f * linear);
-        // Depth is carried by opacity and a small real blur, and by nothing else. There is no
-        // scale: the page is meant to read as one layered surface, and a zoom on the current line
-        // would fight the word motion. Both line-synced and karaoke documents get this, so the two
-        // differ in capability and never in quality.
-        child.setAlpha(lerp(KARAOKE_REST_ALPHA - depth * KARAOKE_REST_ALPHA_FALLOFF, KARAOKE_ACTIVE_ALPHA, focus));
+        // Depth is distance from the focus ANCHOR, which is near the top of the viewport rather
+        // than at its centre, so the two sides are normalised over their own spans.
+        final float anchor = getLyricsFocusTop();
+        final float rowTop = child.getTop();
+        final float span = rowTop >= anchor
+                ? Math.max(1f, lyricsListView.getHeight() - anchor)
+                : Math.max(1f, anchor);
+        final float depth = lyricsDepthOf(rowTop, anchor, span);
+        // MEASURED: depth is carried by OPACITY and by nothing else. The reference has no depth
+        // blur (edge-rise width does not vary with distance) and no per-depth scale (inactive row
+        // pitch is 78.00 px at every depth), so neither is applied here.
         child.setScaleX(1f);
         child.setScaleY(1f);
         if (textView == null) return;
         textView.setDepthBlur(lerp(depth * dp(KARAOKE_BLUR_MAX_DP), 0f, focus));
         if (wordFrame) {
-            // Word timing splits what used to be one colour into two: text the source has reached
-            // takes the sung colour, text it has not stays muted, and the word being sung right now
-            // is filled from the muted colour into the sung one by a clip travelling across its
-            // glyphs. A line already passed is wholly sung; a line the pre-roll is bringing in
-            // early shows nothing lit until its own time.
-            final int sungColor = ColorUtils.blendARGB(inactiveColor, sweepColor,
-                    lerp(KARAOKE_SUNG_REST, 1f, focus));
-            final int mutedColor = ColorUtils.blendARGB(inactiveColor, activeColor,
-                    lerp(KARAOKE_MUTED_REST, KARAOKE_MUTED_ACTIVE, focus));
+            // MEASURED: in the reference the emphasis transfer IS the sweep. Through a whole
+            // transition the incoming line's contrast stays flat at 39 while the scroll runs 0 ->
+            // 99 % of its travel, and only jumps to ~148 when its OWN karaoke fill starts. The
+            // unsung text of the current line (0.259) and the text of the next line (0.293) are
+            // the same tier. So nothing here reads the follow's focus: the row's opacity is its
+            // depth, the sweep colour is the hierarchy, and the two have separate clocks because
+            // the reference gives them separate clocks.
+            child.setAlpha(lerp(1f, KARAOKE_DEPTH_FAR, depth));
+            final int sungColor = sweepColor;
+            final int mutedColor = ColorUtils.setAlphaComponent(sweepColor,
+                    Math.round(Color.alpha(sweepColor) * KARAOKE_UNSUNG_ALPHA));
             textView.setLyricTextColor(mutedColor);
             textView.setKaraokeColors(mutedColor, sungColor);
             textView.setKaraokeFrame(rowKaraoke.wordStart, rowKaraoke.wordEnd, rowKaraoke.sweep);
         } else {
-            // Ordinary line-synced text, and any untimed line inside a karaoke document. Line-level
-            // hierarchy only: no sweep, no word motion, nothing invented.
+            // EXISTING TELEGRAM BEHAVIOUR RETAINED. A line-synced document states no word timing,
+            // so it has no sweep to carry the hierarchy with and keeps the line-level crossfade it
+            // always had. The reference is a word-timed document and says nothing about this case.
+            child.setAlpha(lerp(SYNCED_REST_ALPHA - depth * SYNCED_REST_ALPHA_FALLOFF,
+                    SYNCED_ACTIVE_ALPHA, focus));
             textView.clearKaraoke();
             textView.setLyricTextColor(ColorUtils.blendARGB(inactiveColor, activeColor, focus));
         }
+    }
+
+    /**
+     * The depth falloff, free of the view state so it can be asserted directly. Smoothstep rather
+     * than raw distance: the falloff starts gently, so the lines either side of the active one
+     * stay readable, and deepens further out, where being subordinate is the point.
+     */
+    static float lyricsDepthOf(float rowTop, float anchor, float span) {
+        final float linear = Math.min(1f, Math.abs(rowTop - anchor) / Math.max(1f, span));
+        return linear * linear * (3f - 2f * linear);
     }
 
     /**
@@ -3902,7 +4071,10 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             top = dp(fullscreenLyrics ? 12 : LYRICS_EXPAND_INSET);
             bottom = dp(24);
         } else {
-            top = bottom = Math.max(0, getLyricsFocusCenter() - dp(32));
+            // Top-anchored: the first line has to be able to come DOWN to the anchor and the last
+            // line has to be able to come UP to it, so each inset is the travel on its own side.
+            top = Math.max(0, getLyricsFocusTop());
+            bottom = Math.max(0, lyricsListView.getHeight() - getLyricsFocusTop());
         }
         if (lyricsListView.getPaddingTop() != top || lyricsListView.getPaddingBottom() != bottom) {
             lyricsListView.setPadding(0, top, 0, bottom);
@@ -5224,9 +5396,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             textView.setLayoutParams(new RecyclerView.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
             textView.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
             textView.setTextDirection(View.TEXT_DIRECTION_FIRST_STRONG);
-            textView.setPadding(dp(LYRICS_ROW_PADDING_H_DP), dp(LYRICS_ROW_PADDING_V_DP),
-                    dp(LYRICS_ROW_PADDING_H_DP), dp(LYRICS_ROW_PADDING_V_DP));
-            textView.setMinHeight(dp(LYRICS_ROW_MIN_HEIGHT_DP));
+            applyLyricsTypography(textView, false);
             textView.setBackground(Theme.createSelectorDrawable(getThemedColor(Theme.key_listSelector), 2));
             return new RecyclerListView.Holder(textView);
         }
@@ -5248,12 +5418,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             // again, because a size or a weight is metric-affecting: switching one when a line or a
             // word becomes active would re-measure the row, possibly re-wrap it, and move every row
             // underneath it.
-            textView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, LYRICS_TEXT_SIZE_DP);
-            textView.setTypeface(AndroidUtilities.bold());
-            textView.setLineSpacing(dp(LYRICS_LINE_SPACING_DP), 1f);
-            textView.setMinHeight(dp(stanzaSpace ? LYRICS_ROW_STANZA_HEIGHT_DP : LYRICS_ROW_MIN_HEIGHT_DP));
-            textView.setPadding(dp(LYRICS_ROW_PADDING_H_DP), dp(stanzaSpace ? 0 : LYRICS_ROW_PADDING_V_DP),
-                    dp(LYRICS_ROW_PADDING_H_DP), dp(stanzaSpace ? 0 : LYRICS_ROW_PADDING_V_DP));
+            applyLyricsTypography(textView, stanzaSpace);
             // A recycled row must never arrive carrying the previous line's depth; the attach
             // callback re-derives it from the row's real position immediately afterwards.
             textView.setDepthBlur(0f);
