@@ -3607,6 +3607,54 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
      * same font; tinting happens afterwards, on coverage that is already fixed.
      */
     static final int GLYPH_MASK_INK = Color.WHITE;
+    /**
+     * The format the cached row raster is kept in.
+     *
+     * <p>ARGB_8888, and emphatically not ALPHA_8. An alpha-only bitmap drawn through a HARDWARE
+     * canvas does not reliably honour the paint's colour - the "paint colour tints an ALPHA_8
+     * bitmap" rule is a software-Canvas rule - and on the device it drew nothing at all. That is
+     * what made the whole lyrics page blank in Build #41: the allocation succeeded, the draw threw
+     * nothing, and every row rendered transparent. A white ARGB raster tinted through a
+     * {@link PorterDuffColorFilter} is the ordinary, universally supported path.
+     */
+    static final Bitmap.Config GLYPH_CACHE_CONFIG = Bitmap.Config.ARGB_8888;
+    /** Rows between samples when checking a freshly built raster actually contains glyphs. */
+    private static final int GLYPH_CACHE_SCAN_STEP = 2;
+    /** Beyond this a row is not a row, and the memory is not worth it. About 4MB at ARGB_8888. */
+    private static final long GLYPH_CACHE_MAX_PIXELS = 1_100_000L;
+
+    /**
+     * Tint for the cached raster: replaces the colour and keeps the coverage.
+     *
+     * <p>{@code SRC_IN} against a white, antialiased glyph raster gives {@code colour.rgb} with the
+     * raster's own alpha, so the sung and the muted state are the same coverage values with a
+     * different colour - which is the whole reason the raster exists.
+     */
+    static PorterDuffColorFilter glyphTint(int color) {
+        return new PorterDuffColorFilter(color, PorterDuff.Mode.SRC_IN);
+    }
+
+    /**
+     * True when a raster contains at least one pixel that would actually paint.
+     *
+     * <p>Checked once, when a raster is built, and never per frame. A row whose text is not empty
+     * but whose raster is blank is a renderer that has failed silently - exactly the Build #41
+     * failure - and the answer is to throw the raster away and draw the text live instead.
+     */
+    static boolean hasVisibleInk(Bitmap bitmap) {
+        if (bitmap == null || bitmap.isRecycled()) return false;
+        final int width = bitmap.getWidth();
+        final int height = bitmap.getHeight();
+        if (width <= 0 || height <= 0) return false;
+        final int[] row = new int[width];
+        for (int y = 0; y < height; y += GLYPH_CACHE_SCAN_STEP) {
+            bitmap.getPixels(row, 0, width, 0, y, width, 1);
+            for (int x = 0; x < width; x++) {
+                if ((row[x] >>> 24) != 0) return true;
+            }
+        }
+        return false;
+    }
 
     /** Resolved once per document: true only when some line genuinely states inline word timing. */
     private boolean lyricsWordTimed;
@@ -4961,13 +5009,16 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         // The row's text, rasterised ONCE into an alpha mask, and from then on only tinted and
         // translated. See the note on onDraw: this is what makes the sung and the muted text the
         // same font, and what lets the lift move by a fraction of a pixel.
-        private Bitmap glyphMask;
-        private Layout glyphMaskLayout;
-        private CharSequence glyphMaskText;
-        private int glyphMaskWidth;
-        private int glyphMaskHeight;
-        private boolean glyphMaskUnavailable;
-        private final Paint glyphMaskPaint = new Paint(Paint.FILTER_BITMAP_FLAG | Paint.ANTI_ALIAS_FLAG);
+        private Bitmap glyphCache;
+        private Layout glyphCacheLayout;
+        private CharSequence glyphCacheText;
+        private int glyphCacheWidth;
+        private int glyphCacheHeight;
+        private boolean glyphCacheUnavailable;
+        private final Paint glyphCachePaint = new Paint(Paint.FILTER_BITMAP_FLAG);
+        /** Built when the colours change, so drawing a frame allocates nothing. */
+        private PorterDuffColorFilter sungTint;
+        private PorterDuffColorFilter mutedTint;
         /** The cluster the fill front is inside, and how far into it the fill has travelled. */
         private int frontCluster = -1;
         private float frontRevealed;
@@ -4989,7 +5040,10 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
          */
         void setLyricText(CharSequence text, boolean wordTimed) {
             detachSpans();
-            releaseGlyphMask();
+            releaseGlyphCache();
+            // A new binding gets a fresh attempt: the previous verdict was about the previous
+            // text, and a row that failed once should not be condemned to live text for ever.
+            glyphCacheUnavailable = false;
             karaokeActive = false;
             if (wordTimed) {
                 // TextView always makes its own spannable copy here, so the one to colour is the
@@ -5012,9 +5066,12 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         }
 
         void setKaraokeColors(int muted, int sung) {
-            if (mutedColor == muted && sungColor == sung) return;
+            if (mutedColor == muted && sungColor == sung && mutedTint != null) return;
             mutedColor = muted;
             sungColor = sung;
+            // Rebuilt here rather than while drawing, so a frame allocates nothing.
+            mutedTint = glyphTint(muted);
+            sungTint = glyphTint(sung);
             if (karaokeActive) invalidate();
         }
 
@@ -5344,11 +5401,12 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 return;
             }
             ensureClusterGeometry();
-            ensureGlyphMask();
-            if (glyphMask == null || clusterOrderCount == 0 || clusterGeometryCount != clusterCount) {
-                // No mask yet, or nothing to clip against: the row has not been laid out, or this
-                // device would not give us an alpha bitmap. Everything the source has finished is
-                // sung, the rest is muted, and nothing is lifted or filled.
+            ensureGlyphCache();
+            if (clusterOrderCount == 0 || clusterGeometryCount != clusterCount) {
+                // Nothing to clip against yet: the row has not been laid out. Everything the source
+                // has finished is sung, the rest is muted, and nothing is lifted or filled. Note
+                // that a MISSING RASTER is not handled here - the strips below fall back to live
+                // text one by one, so the row is drawn either way.
                 applyPassColors(sungColor, mutedColor, mutedColor);
                 super.onDraw(canvas);
                 return;
@@ -5484,8 +5542,19 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             // The band follows the text upward, so a lifted ascender is never clipped off.
             canvas.translate(0f, lift);
             canvas.clipRect(originX + left, originY + top, originX + right, originY + bottom);
-            glyphMaskPaint.setColor(swept ? sungColor : mutedColor);
-            canvas.drawBitmap(glyphMask, 0f, 0f, glyphMaskPaint);
+            final Bitmap cache = glyphCache;
+            final PorterDuffColorFilter tint = swept ? sungTint : mutedTint;
+            if (cache != null && !cache.isRecycled() && tint != null) {
+                glyphCachePaint.setColorFilter(tint);
+                canvas.drawBitmap(cache, 0f, 0f, glyphCachePaint);
+            } else {
+                // THE FAIL-SAFE. Without a usable raster this strip draws the row's text live,
+                // exactly as it did before the raster existed. It carries the old imperfection -
+                // sung and muted are separate rasterisations, so their weights differ slightly -
+                // and that is a great deal better than a blank page.
+                applyPassColors(sungColor, swept ? sungColor : mutedColor, mutedColor);
+                super.onDraw(canvas);
+            }
             canvas.restore();
         }
 
@@ -5501,60 +5570,63 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
          * what a sung word is, and it is better for the muted text to carry the sung text's weight
          * than for the weight to change as the fill crosses each letter.
          */
-        private void ensureGlyphMask() {
-            if (glyphMaskUnavailable || karaokeText == null) return;
+        private void ensureGlyphCache() {
+            if (glyphCacheUnavailable || karaokeText == null) return;
             final Layout layout = getLayout();
             if (layout == null) return;
             final int width = getWidth();
             final int height = getHeight();
             if (width <= 0 || height <= 0) return;
-            if (glyphMask != null && glyphMaskLayout == layout && glyphMaskText == karaokeText
-                    && glyphMaskWidth == width && glyphMaskHeight == height) {
+            // A full-colour raster of a lyric row is around half a megabyte. Anything wildly
+            // bigger than a row is not a row, and is not worth the memory - draw it live.
+            if ((long) width * height > GLYPH_CACHE_MAX_PIXELS) {
+                glyphCacheUnavailable = true;
                 return;
             }
-            releaseGlyphMask();
-            final Bitmap mask;
-            try {
-                mask = Bitmap.createBitmap(width, height, Bitmap.Config.ALPHA_8);
-            } catch (Throwable unsupported) {
-                // A device that will not give us an alpha bitmap falls back to drawing the text
-                // live, for ever. It looks like the previous build; it does not fail.
-                glyphMaskUnavailable = true;
+            if (glyphCache != null && glyphCacheLayout == layout && glyphCacheText == karaokeText
+                    && glyphCacheWidth == width && glyphCacheHeight == height) {
                 return;
             }
-            // No density on the mask, so it is blitted one pixel to one pixel rather than being
-            // rescaled by whatever the canvas and the bitmap each think the density is.
-            mask.setDensity(Bitmap.DENSITY_NONE);
+            releaseGlyphCache();
+            final Bitmap raster;
             try {
+                raster = Bitmap.createBitmap(width, height, GLYPH_CACHE_CONFIG);
                 applyPassColors(GLYPH_MASK_INK, GLYPH_MASK_INK, GLYPH_MASK_INK);
-                super.onDraw(new Canvas(mask));
+                super.onDraw(new Canvas(raster));
             } catch (Throwable failed) {
-                glyphMaskUnavailable = true;
+                glyphCacheUnavailable = true;
                 return;
             }
-            glyphMask = mask;
-            glyphMaskLayout = layout;
-            glyphMaskText = karaokeText;
-            glyphMaskWidth = width;
-            glyphMaskHeight = height;
+            // The check Build #41 did not have. A raster that came out blank for text that is not
+            // blank means the path has failed silently, and the row must go back to live text
+            // rather than paint nothing. Once, on build - never per frame.
+            if (karaokeText.length() > 0 && !hasVisibleInk(raster)) {
+                glyphCacheUnavailable = true;
+                return;
+            }
+            glyphCache = raster;
+            glyphCacheLayout = layout;
+            glyphCacheText = karaokeText;
+            glyphCacheWidth = width;
+            glyphCacheHeight = height;
         }
 
         /**
          * Drops the mask. Deliberately not recycled: a bitmap can still be referenced by a display
          * list the render thread has not finished with, and recycling one of those crashes.
          */
-        private void releaseGlyphMask() {
-            glyphMask = null;
-            glyphMaskLayout = null;
-            glyphMaskText = null;
-            glyphMaskWidth = 0;
-            glyphMaskHeight = 0;
+        private void releaseGlyphCache() {
+            glyphCache = null;
+            glyphCacheLayout = null;
+            glyphCacheText = null;
+            glyphCacheWidth = 0;
+            glyphCacheHeight = 0;
         }
 
         @Override
         protected void onDetachedFromWindow() {
             super.onDetachedFromWindow();
-            releaseGlyphMask();
+            releaseGlyphCache();
         }
 
         /**

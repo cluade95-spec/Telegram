@@ -1,6 +1,9 @@
 package org.telegram.ui.Components
 
+import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
 import android.graphics.Typeface
 import android.text.Layout
 import android.text.StaticLayout
@@ -701,6 +704,99 @@ class LyricsKaraokeRenderingTest {
             "$biggest px", biggest < 0.05f)
         // Which is the point: a threshold of any size above zero would silently drop the entire
         // rise. The renderer now repaints whenever the value changes at all.
+    }
+
+    // ===================================================== the cached raster actually renders
+    // Build #41 replaced live text with a cached raster and the whole lyrics page went blank on
+    // device: an ALPHA_8 bitmap drawn through a hardware canvas does not honour the paint's
+    // colour, so every row painted nothing, and nothing threw. These tests exercise the real
+    // Bitmap/Canvas/ColorFilter path rather than asserting that an allocation succeeded.
+
+    /** A row's worth of text, rasterised the way the renderer rasterises it. */
+    private fun rasteriseRow(text: String, width: Int = 400, height: Int = 80): Bitmap {
+        val paint = TextPaint().apply {
+            isAntiAlias = true
+            textSize = 44f
+            typeface = Typeface.DEFAULT_BOLD
+            color = AudioPlayerAlert.GLYPH_MASK_INK
+        }
+        val raster = Bitmap.createBitmap(width, height, AudioPlayerAlert.GLYPH_CACHE_CONFIG)
+        val layout = StaticLayout.Builder.obtain(text, 0, text.length, paint, width).build()
+        layout.draw(Canvas(raster))
+        return raster
+    }
+
+    private fun tintOnto(raster: Bitmap, color: Int): Bitmap {
+        val target = Bitmap.createBitmap(raster.width, raster.height, Bitmap.Config.ARGB_8888)
+        val paint = Paint(Paint.FILTER_BITMAP_FLAG)
+        paint.colorFilter = AudioPlayerAlert.glyphTint(color)
+        Canvas(target).drawBitmap(raster, 0f, 0f, paint)
+        return target
+    }
+
+    @Test
+    fun theCachedRasterIsFullColourAndNeverAlphaOnly() {
+        // C. The Build #41 regression, pinned. ALPHA_8 is the format that drew nothing.
+        assertEquals("the cache must be a full-colour bitmap",
+            Bitmap.Config.ARGB_8888, AudioPlayerAlert.GLYPH_CACHE_CONFIG)
+        assertNotEquals("an alpha-only cache is what blanked the page",
+            Bitmap.Config.ALPHA_8, AudioPlayerAlert.GLYPH_CACHE_CONFIG)
+    }
+
+    @Test
+    fun aRowOfTextRasterisesToSomethingThatWouldActuallyPaint() {
+        // A/G. Non-empty text must produce non-empty pixels, and the check that decides it must
+        // say so. This is the assertion Build #41 did not make.
+        for (text in listOf("minimum", "AVATAR", "ሰላም ለዓለም", "مرحبا بالعالم", "jazz")) {
+            val raster = rasteriseRow(text)
+            assertTrue("$text: the rasterised row must contain ink",
+                AudioPlayerAlert.hasVisibleInk(raster))
+            raster.recycle()
+        }
+        // And a raster that really is empty must be reported as empty, so the renderer can throw
+        // it away and draw live text instead of painting nothing.
+        val blank = Bitmap.createBitmap(64, 32, AudioPlayerAlert.GLYPH_CACHE_CONFIG)
+        assertFalse("an untouched raster has no ink", AudioPlayerAlert.hasVisibleInk(blank))
+        blank.recycle()
+        assertFalse("and neither does a missing one", AudioPlayerAlert.hasVisibleInk(null))
+    }
+
+    @Test
+    fun tintingTheRasterChangesColourAndNothingElse() {
+        // B/C. The whole reason the raster exists: muted and sung must be the same coverage with a
+        // different colour, not two rasterisations that differ in weight.
+        val muted = 0xFF6E6E6E.toInt()
+        val sung = Color.WHITE
+        val raster = rasteriseRow("minimum office")
+        val asMuted = tintOnto(raster, muted)
+        val asSung = tintOnto(raster, sung)
+
+        var inked = 0
+        var opaque = 0
+        for (y in 0 until raster.height) {
+            for (x in 0 until raster.width) {
+                val a = Color.alpha(asMuted.getPixel(x, y))
+                assertEquals("coverage differs at ($x,$y): the tint changed the glyph",
+                    a, Color.alpha(asSung.getPixel(x, y)))
+                if (a > 0) inked++
+                if (a > 200) {
+                    opaque++
+                    // Where the glyph is solid the colour really is the one asked for, so the
+                    // tint is doing the recolouring rather than the rasteriser.
+                    val mutedRed = Color.red(asMuted.getPixel(x, y))
+                    val sungRed = Color.red(asSung.getPixel(x, y))
+                    assertTrue("muted red at ($x,$y) was $mutedRed",
+                        Math.abs(mutedRed - Color.red(muted)) <= 2)
+                    assertTrue("sung red at ($x,$y) was $sungRed",
+                        Math.abs(sungRed - Color.red(sung)) <= 2)
+                    assertTrue("and the two states differ in colour at ($x,$y)",
+                        Math.abs(mutedRed - sungRed) > 20)
+                }
+            }
+        }
+        assertTrue("the fixture must actually have drawn something: $inked", inked > 100)
+        assertTrue("and some of it solid: $opaque", opaque > 20)
+        raster.recycle(); asMuted.recycle(); asSung.recycle()
     }
 
     @Test
