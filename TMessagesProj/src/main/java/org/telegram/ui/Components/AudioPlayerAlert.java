@@ -3598,63 +3598,6 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
      * between words.
      */
     static final boolean KARAOKE_WAVE_DRAWN_PER_WORD = true;
-    /**
-     * The single colour every karaoke row's glyph mask is rasterised at.
-     *
-     * <p>Android gamma-corrects a text mask against the paint's luminance, so the SAME glyph at
-     * the SAME size has different coverage in white than in a muted grey - the white visibly
-     * heavier. Rasterising every row once, at one colour, is what makes sung and muted text the
-     * same font; tinting happens afterwards, on coverage that is already fixed.
-     */
-    static final int GLYPH_MASK_INK = Color.WHITE;
-    /**
-     * The format the cached row raster is kept in.
-     *
-     * <p>ARGB_8888, and emphatically not ALPHA_8. An alpha-only bitmap drawn through a HARDWARE
-     * canvas does not reliably honour the paint's colour - the "paint colour tints an ALPHA_8
-     * bitmap" rule is a software-Canvas rule - and on the device it drew nothing at all. That is
-     * what made the whole lyrics page blank in Build #41: the allocation succeeded, the draw threw
-     * nothing, and every row rendered transparent. A white ARGB raster tinted through a
-     * {@link PorterDuffColorFilter} is the ordinary, universally supported path.
-     */
-    static final Bitmap.Config GLYPH_CACHE_CONFIG = Bitmap.Config.ARGB_8888;
-    /** Rows between samples when checking a freshly built raster actually contains glyphs. */
-    private static final int GLYPH_CACHE_SCAN_STEP = 2;
-    /** Beyond this a row is not a row, and the memory is not worth it. About 4MB at ARGB_8888. */
-    private static final long GLYPH_CACHE_MAX_PIXELS = 1_100_000L;
-
-    /**
-     * Tint for the cached raster: replaces the colour and keeps the coverage.
-     *
-     * <p>{@code SRC_IN} against a white, antialiased glyph raster gives {@code colour.rgb} with the
-     * raster's own alpha, so the sung and the muted state are the same coverage values with a
-     * different colour - which is the whole reason the raster exists.
-     */
-    static PorterDuffColorFilter glyphTint(int color) {
-        return new PorterDuffColorFilter(color, PorterDuff.Mode.SRC_IN);
-    }
-
-    /**
-     * True when a raster contains at least one pixel that would actually paint.
-     *
-     * <p>Checked once, when a raster is built, and never per frame. A row whose text is not empty
-     * but whose raster is blank is a renderer that has failed silently - exactly the Build #41
-     * failure - and the answer is to throw the raster away and draw the text live instead.
-     */
-    static boolean hasVisibleInk(Bitmap bitmap) {
-        if (bitmap == null || bitmap.isRecycled()) return false;
-        final int width = bitmap.getWidth();
-        final int height = bitmap.getHeight();
-        if (width <= 0 || height <= 0) return false;
-        final int[] row = new int[width];
-        for (int y = 0; y < height; y += GLYPH_CACHE_SCAN_STEP) {
-            bitmap.getPixels(row, 0, width, 0, y, width, 1);
-            for (int x = 0; x < width; x++) {
-                if ((row[x] >>> 24) != 0) return true;
-            }
-        }
-        return false;
-    }
 
     /** Resolved once per document: true only when some line genuinely states inline word timing. */
     private boolean lyricsWordTimed;
@@ -4254,12 +4197,12 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
          * says how fast the singing is, exactly and from the source's own times. The decoration
          * says only that the word has begun, and it says it at the same unhurried speed every time.
          *
-         * <p>Two and a half seconds, near enough. The point of the length is not slowness for its
-         * own sake: it is OVERLAP. At this duration several words of a line are always in motion
-         * at once, so no single word's arrival is an event the eye can pick out - which is the
-         * thing device QA kept noticing about the previous builds.
+         * <p>A second and a half. A full second still arrived too soon, and the curve below spends
+         * most of that length on the last stretch: at half the duration the letter is only two
+         * thirds of the way up, and the final twentieth of the travel takes a quarter of a second
+         * on its own. The motion is meant to stop being noticeable before it stops.
          */
-        public static final long RISE_MS = 2400;
+        public static final long RISE_MS = 1500;
         /**
          * How far behind its neighbour each grapheme sets off.
          *
@@ -4457,17 +4400,21 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         }
 
         /**
-         * {@code 1 - (1-t)^4 * (1 + 4t)}, whose velocity is {@code 20t(1-t)^3}: zero at the start,
-         * quickest a quarter of the way in, then falling for the whole of the remaining three
-         * quarters, and zero again at the end.
+         * Sets off gently, reaches its quickest a third of the way in, and slows for the whole of
+         * the rest: {@code 1 - (1-t)^3 * (1 + 3t)}, whose velocity is {@code 12t(1-t)^2}.
          *
-         * <p>The peak moves earlier than the curve it replaces (a third), which is the direction
-         * device QA asked for. It cannot move very much earlier, and this is worth stating plainly
-         * rather than pretending otherwise: for any single-peaked velocity the position of the
-         * peak and the fatness of the tail are the same number. Pushing the peak into the first
-         * tenth necessarily makes the curve finish most of its travel in the first half, which is
-         * the "arrives early and sits still" this is supposed to avoid. The long, unremarkable
-         * finish is bought with {@link #RISE_MS} and with words overlapping, not with the curve.
+         * <p>This replaces smootherstep, which device QA read as wrong in a specific way.
+         * Smootherstep is symmetric - it accelerates for the first half and decelerates for the
+         * second - so the middle of the travel is its fastest part and the motion reads as setting
+         * off, getting there, and stopping. The reference motion is not symmetric: it begins
+         * without a jump, and from very early on it is continuously slowing, spending a long time
+         * creeping the last little way.
+         *
+         * <p>This curve is exactly that. Velocity is zero at the start, so there is no flick; it
+         * peaks at a third of the duration and then falls for the remaining two thirds; and it
+         * reaches zero at the end, so the letter settles rather than arriving. It is two thirds of
+         * the way up at half time, 95% at three quarters, and spends the last quarter of the
+         * duration on the final twentieth of the travel.
          *
          * <p>Monotonic on [0,1] and bounded by it: no overshoot, no spring, nothing to come back
          * down from.
@@ -4476,7 +4423,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             if (t <= 0f) return 0f;
             if (t >= 1f) return 1f;
             final float r = 1f - t;
-            return 1f - r * r * r * r * (1f + 4f * t);
+            return 1f - r * r * r * (1f + 3f * t);
         }
     }
 
@@ -5004,21 +4951,6 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         private boolean[] clusterHasRect = new boolean[32];
         /** The cluster {@link #addRun} is currently filling, or -1 outside a geometry rebuild. */
         private int pendingCluster = -1;
-
-        // --- the glyph mask -------------------------------------------------------------------
-        // The row's text, rasterised ONCE into an alpha mask, and from then on only tinted and
-        // translated. See the note on onDraw: this is what makes the sung and the muted text the
-        // same font, and what lets the lift move by a fraction of a pixel.
-        private Bitmap glyphCache;
-        private Layout glyphCacheLayout;
-        private CharSequence glyphCacheText;
-        private int glyphCacheWidth;
-        private int glyphCacheHeight;
-        private boolean glyphCacheUnavailable;
-        private final Paint glyphCachePaint = new Paint(Paint.FILTER_BITMAP_FLAG);
-        /** Built when the colours change, so drawing a frame allocates nothing. */
-        private PorterDuffColorFilter sungTint;
-        private PorterDuffColorFilter mutedTint;
         /** The cluster the fill front is inside, and how far into it the fill has travelled. */
         private int frontCluster = -1;
         private float frontRevealed;
@@ -5040,10 +4972,6 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
          */
         void setLyricText(CharSequence text, boolean wordTimed) {
             detachSpans();
-            releaseGlyphCache();
-            // A new binding gets a fresh attempt: the previous verdict was about the previous
-            // text, and a row that failed once should not be condemned to live text for ever.
-            glyphCacheUnavailable = false;
             karaokeActive = false;
             if (wordTimed) {
                 // TextView always makes its own spannable copy here, so the one to colour is the
@@ -5066,12 +4994,9 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         }
 
         void setKaraokeColors(int muted, int sung) {
-            if (mutedColor == muted && sungColor == sung && mutedTint != null) return;
+            if (mutedColor == muted && sungColor == sung) return;
             mutedColor = muted;
             sungColor = sung;
-            // Rebuilt here rather than while drawing, so a frame allocates nothing.
-            mutedTint = glyphTint(muted);
-            sungTint = glyphTint(sung);
             if (karaokeActive) invalidate();
         }
 
@@ -5168,15 +5093,9 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
          * small offset along the word, so a word begins the instant the source says so however far
          * the previous word has got, and a letter begins however far its neighbour has got.
          *
-         * <p>Reports whether anything moved AT ALL, exactly, with no tolerance.
-         *
-         * <p>There used to be a twentieth-of-a-pixel threshold here, and it was one of the things
-         * device QA was seeing. The player ticks every 17ms; near the ends of the curve one tick
-         * moves a grapheme by about a hundredth of a pixel, so for most of the rise every single
-         * tick was discarded and the row was only repainted once the change had accumulated past
-         * the threshold. The result is a slow drift redrawn in irregular jumps - which is what
-         * "it starts fast and then waits" and "shaking" look like. A settled word sits at exactly
-         * 1 and still costs nothing; a moving one now repaints on every tick it moves on.
+         * <p>Reports whether anything moved by enough to be worth a repaint - a twentieth of a
+         * pixel - so a settled line still costs nothing per tick while a moving one is redrawn on
+         * every tick it actually moves on.
          */
         private boolean updateGraphemeLift(long positionMs) {
             ensureClusters();
@@ -5202,10 +5121,10 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                         if (!isBlankCluster(i)) grapheme++;
                     }
                 }
-                if (clusterLift[i] != value) {
+                if (Math.abs(clusterLift[i] - value) * liftAmplitude > 0.05f) {
                     changed = true;
-                    clusterLift[i] = value;
                 }
+                clusterLift[i] = value;
             }
             return changed;
         }
@@ -5358,42 +5277,45 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         /**
          * Draws the row. Without a word being sung this is exactly {@link TextView}'s own drawing.
          *
-         * <p>With one, the row's text is rasterised ONCE into an alpha mask and from then on only
-         * tinted and translated. Nothing about the karaoke presentation asks Android to lay out,
-         * shape or rasterise a glyph again.
+         * <p>With one, the row is cut into vertical strips and each strip is one pass: the same
+         * laid-out text, clipped to that strip, translated to that strip's height, coloured for
+         * that strip's side of the fill. The strips tile the row exactly - every cut is shared by
+         * the two strips either side of it, and the outermost cuts run off the ends of the visual
+         * line - so every pixel of every glyph is rasterised exactly once, by exactly one pass.
          *
-         * <p>That is the correction three rounds of device QA converged on, and the reason is
-         * specific. Android does not rasterise a glyph the same way for every colour: the text
-         * mask is gamma-corrected against the paint's luminance, so white-on-dark and muted-on-dark
-         * are genuinely DIFFERENT coverage for the same glyph at the same size - the white one
-         * heavier. The old renderer drew the sung part and the muted part as two separate text
-         * draws, so the two halves of a word really were two different rasterisations, and where
-         * the fill crossed a letter the letter changed weight mid-glyph. "It looks like two
-         * different fonts" is exactly right, and no clipping rule could have fixed it, because the
-         * pixels differed before any clip was applied.
-         *
-         * <p>One mask removes the whole class of problem by construction:
+         * <p>Where the cuts fall is the whole of the correctness, and it is what two rounds of
+         * device QA were spent on:
          *
          * <ul>
-         *     <li><b>Colour cannot change shape.</b> Sung and muted are the same coverage values
-         *     with a different tint, because they are literally the same pixels of the same
-         *     bitmap. There is no second rasterisation to differ.</li>
-         *     <li><b>The lift moves pixels, not glyphs.</b> Text drawn at a fractional vertical
-         *     offset is snapped to whole pixels by the rasteriser, so a 0.9dp travel used to
-         *     arrive in two or three visible jumps however smooth the arithmetic was. A bitmap
-         *     drawn at a fractional offset is sampled, not re-rendered, so the same pixels really
-         *     do move by a fraction of a pixel.</li>
-         *     <li><b>Nothing can move horizontally.</b> The only transform is a vertical
-         *     translation of a fixed image; there is no x term anywhere, and advances, kerning and
-         *     shaping are baked into the mask at build time.</li>
+         *     <li><b>A cut for the LIFT only ever falls between displayed words</b>, where there
+         *     is whitespace. Cutting anywhere else divides glyph ink - a kerning pair, an accent,
+         *     a ligature, an Arabic joining stroke - and if the two sides then get different
+         *     heights, one letter is drawn in two pieces at two heights. That is exactly the
+         *     "letters change shape, gain and lose spacing, jump sideways" of the last report, and
+         *     it came from cutting every four graphemes inside a word.</li>
+         *     <li><b>A cut for the COLOUR may fall inside a glyph</b>, because it has to - the fill
+         *     travels across letters. It is safe precisely because both sides keep the SAME
+         *     translation: the identical float, from the same variable. Same geometry, same
+         *     rasterisation, complementary pixels, so the glyph is reconstructed exactly and only
+         *     its colour changes.</li>
+         *     <li><b>The cuts are rectangles, not paths.</b> {@code clipPath} is ANTIALIASED, so
+         *     two passes tiling the same boundary each covered the boundary column partially and
+         *     composited it separately - a lighter one-pixel seam at every cut. A rectangular clip
+         *     has no partial coverage.</li>
+         *     <li><b>Every cut is snapped to a whole pixel</b> and both sides are given the same
+         *     snapped value, so two strips can neither overlap nor leave a gap however the device
+         *     rounds.</li>
          * </ul>
          *
-         * <p>The row is still cut into vertical strips, because different words stand at different
-         * heights and the fill boundary has to fall somewhere. The cuts are unchanged: between
-         * words they pass through the middle of the whitespace, and the colour cut may fall inside
-         * a glyph because it is now only a choice of tint for pixels that already exist. Every cut
-         * is snapped to a whole pixel and shared by both sides, so strips cannot overlap or gap.
+         * <p>Neighbouring strips standing at exactly the same height are merged, so the settled
+         * part of a line and the part not yet reached are one pass each and carry no cut at all.
          *
+         * <p>Each pass is the platform drawing the row's real {@link Layout}, so the glyphs are the
+         * same shaped, kerned, wrapped and bidirectionally reordered glyphs throughout. There is no
+         * second measurement of anything, no per-letter view, no per-letter span and no per-letter
+         * shaping, and nothing here can move a boundary or a metric: for one playback position the
+         * geometry is identical whatever the colours are doing.
+         */
         @Override
         protected void onDraw(Canvas canvas) {
             if (!karaokeActive || karaokeText == null) {
@@ -5401,12 +5323,9 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 return;
             }
             ensureClusterGeometry();
-            ensureGlyphCache();
             if (clusterOrderCount == 0 || clusterGeometryCount != clusterCount) {
-                // Nothing to clip against yet: the row has not been laid out. Everything the source
-                // has finished is sung, the rest is muted, and nothing is lifted or filled. Note
-                // that a MISSING RASTER is not handled here - the strips below fall back to live
-                // text one by one, so the row is drawn either way.
+                // Nothing to clip against: the row has not been laid out yet. Everything the
+                // source has finished is sung, the rest is muted, and nothing is lifted or filled.
                 applyPassColors(sungColor, mutedColor, mutedColor);
                 super.onDraw(canvas);
                 return;
@@ -5414,7 +5333,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             // The row never scrolls, so the layout sits at exactly the total padding.
             final float originX = getTotalPaddingLeft();
             final float originY = getTotalPaddingTop();
-            final float sungCut = sungCutX();
+            final float frontCut = frontCutX();
             int at = 0;
             while (at < clusterOrderCount) {
                 final int first = clusterOrder[at];
@@ -5423,6 +5342,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 int last = first;
                 int end = at;
                 int latest = first;
+                boolean carriesFront = first == frontCluster;
                 final float height = clusterLift[first];
                 while (end + 1 < clusterOrderCount) {
                     final int next = clusterOrder[end + 1];
@@ -5432,6 +5352,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                     // This is what collapses the settled part of the line, and the part not yet
                     // reached, into one pass each.
                     if (clusterRun[next] != run && clusterLift[next] != height) break;
+                    if (next == frontCluster) carriesFront = true;
                     if (next > latest) latest = next;
                     last = next;
                     end++;
@@ -5450,52 +5371,34 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 final float lift = height > 0f ? -height * liftAmplitude : 0f;
                 final float top = clusterTop[first];
                 final float bottom = clusterBottom[first];
-                if (sungCut > left && sungCut < right) {
-                    // The fill boundary falls inside this strip: the same pixels, two tints. The
-                    // side it is read from decides which half is the sung one.
-                    final boolean rtl = clusterRtl[frontCluster >= 0 ? frontCluster : first];
-                    drawStrip(canvas, originX, originY, left, sungCut, top, bottom, lift, !rtl);
-                    drawStrip(canvas, originX, originY, sungCut, right, top, bottom, lift, rtl);
+                if (carriesFront && frontCut > left && frontCut < right) {
+                    final boolean rtl = clusterRtl[frontCluster];
+                    drawStrip(canvas, originX, originY, left, frontCut, top, bottom, lift, !rtl);
+                    drawStrip(canvas, originX, originY, frontCut, right, top, bottom, lift, rtl);
                 } else {
-                    // Wholly one side of the boundary. Decided on the source's own offsets, so it
-                    // is right for a line already sung, a line not yet reached, and a word whose
-                    // fill has run past the end of the segment it belongs to.
+                    // A strip wholly before the fill front is on the sung side, which only matters
+                    // for the sliver of the front glyph that overhangs into it.
                     drawStrip(canvas, originX, originY, left, right, top, bottom, lift,
-                            spanSungTo > 0 && clusterStart[latest] < spanSungTo);
+                            frontCluster >= 0 && latest < frontCluster);
                 }
                 at = end + 1;
             }
         }
 
         /**
-         * Where, in layout coordinates, the sung text stops and the muted text begins, or
-         * {@link Float#NaN} when the whole row is one or the other.
-         *
-         * <p>Usually that is a point inside the grapheme the fill is crossing. It is a cluster
-         * edge instead whenever no grapheme is being crossed but part of the row is still sung -
-         * a segment whose fill has completed, most obviously inside a word the source split into
-         * syllables. Snapped to a whole pixel, so the two strips either side are given the same
-         * number and the edge cannot shimmer.
+         * Where, in layout coordinates, the fill has reached inside the grapheme it is crossing, or
+         * {@link Float#NaN} when no grapheme is being crossed. Snapped to a whole pixel, so the two
+         * strips either side of it are given the same number and the edge cannot shimmer.
          */
-        private float sungCutX() {
-            if (karaokeText == null || spanSungTo <= 0 || spanSungTo >= karaokeText.length()) {
-                return Float.NaN;
-            }
+        private float frontCutX() {
             final int i = frontCluster;
-            if (i >= 0 && i < clusterCount && clusterHasRect[i]) {
-                final float width = clusterRight[i] - clusterLeft[i];
-                if (width > 0.01f) {
-                    float shown = frontRevealed;
-                    if (shown < 0f) shown = 0f;
-                    if (shown > width) shown = width;
-                    return snap(clusterRtl[i] ? clusterRight[i] - shown : clusterLeft[i] + shown);
-                }
-            }
-            for (int c = 0; c < clusterCount; c++) {
-                if (clusterStart[c] < spanSungTo || !clusterHasRect[c]) continue;
-                return snap(clusterRtl[c] ? clusterRight[c] : clusterLeft[c]);
-            }
-            return Float.NaN;
+            if (i < 0 || i >= clusterCount || !clusterHasRect[i]) return Float.NaN;
+            final float width = clusterRight[i] - clusterLeft[i];
+            if (width <= 0.01f) return Float.NaN;
+            float shown = frontRevealed;
+            if (shown < 0f) shown = 0f;
+            if (shown > width) shown = width;
+            return snap(clusterRtl[i] ? clusterRight[i] - shown : clusterLeft[i] + shown);
         }
 
         /**
@@ -5527,106 +5430,23 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         }
 
         /**
-         * One strip: a rectangle of the row's glyph mask, tinted for this strip's side of the fill
-         * and translated to this strip's height.
+         * One strip: the row's own text, clipped to a rectangle, translated to the strip's height,
+         * and coloured for the strip's side of the fill.
          *
-         * <p>The mask is the whole row at its own position, so it is drawn at the origin and the
-         * clip decides which columns of it appear. {@code swept} chooses the tint and nothing
-         * else - it cannot reach the coverage values, which are fixed in the bitmap.
+         * <p>{@code swept} only decides the colour of the one grapheme the fill front is inside -
+         * everything before it is already the sung colour and everything after it the muted one,
+         * from the spans - so it changes which pixels get which colour and nothing else.
          */
         private void drawStrip(Canvas canvas, float originX, float originY,
                                float left, float right, float top, float bottom,
                                float lift, boolean swept) {
             if (right - left < 0.5f) return;
             canvas.save();
-            // The band follows the text upward, so a lifted ascender is never clipped off.
             canvas.translate(0f, lift);
             canvas.clipRect(originX + left, originY + top, originX + right, originY + bottom);
-            final Bitmap cache = glyphCache;
-            final PorterDuffColorFilter tint = swept ? sungTint : mutedTint;
-            if (cache != null && !cache.isRecycled() && tint != null) {
-                glyphCachePaint.setColorFilter(tint);
-                canvas.drawBitmap(cache, 0f, 0f, glyphCachePaint);
-            } else {
-                // THE FAIL-SAFE. Without a usable raster this strip draws the row's text live,
-                // exactly as it did before the raster existed. It carries the old imperfection -
-                // sung and muted are separate rasterisations, so their weights differ slightly -
-                // and that is a great deal better than a blank page.
-                applyPassColors(sungColor, swept ? sungColor : mutedColor, mutedColor);
-                super.onDraw(canvas);
-            }
+            applyPassColors(sungColor, swept ? sungColor : mutedColor, mutedColor);
+            super.onDraw(canvas);
             canvas.restore();
-        }
-
-        /**
-         * Rasterises the row's text into an alpha mask, once.
-         *
-         * <p>Rebuilt only when something that genuinely changes glyph geometry changes - the text,
-         * the {@link Layout} (which covers typeface, size, width and wrapping, since any of those
-         * produces a new one) or the view's size. The playback position never touches it.
-         *
-         * <p>The whole row is drawn at ONE colour, so there is one gamma-corrected rasterisation
-         * for the line rather than one per colour. White is the colour chosen, because white is
-         * what a sung word is, and it is better for the muted text to carry the sung text's weight
-         * than for the weight to change as the fill crosses each letter.
-         */
-        private void ensureGlyphCache() {
-            if (glyphCacheUnavailable || karaokeText == null) return;
-            final Layout layout = getLayout();
-            if (layout == null) return;
-            final int width = getWidth();
-            final int height = getHeight();
-            if (width <= 0 || height <= 0) return;
-            // A full-colour raster of a lyric row is around half a megabyte. Anything wildly
-            // bigger than a row is not a row, and is not worth the memory - draw it live.
-            if ((long) width * height > GLYPH_CACHE_MAX_PIXELS) {
-                glyphCacheUnavailable = true;
-                return;
-            }
-            if (glyphCache != null && glyphCacheLayout == layout && glyphCacheText == karaokeText
-                    && glyphCacheWidth == width && glyphCacheHeight == height) {
-                return;
-            }
-            releaseGlyphCache();
-            final Bitmap raster;
-            try {
-                raster = Bitmap.createBitmap(width, height, GLYPH_CACHE_CONFIG);
-                applyPassColors(GLYPH_MASK_INK, GLYPH_MASK_INK, GLYPH_MASK_INK);
-                super.onDraw(new Canvas(raster));
-            } catch (Throwable failed) {
-                glyphCacheUnavailable = true;
-                return;
-            }
-            // The check Build #41 did not have. A raster that came out blank for text that is not
-            // blank means the path has failed silently, and the row must go back to live text
-            // rather than paint nothing. Once, on build - never per frame.
-            if (karaokeText.length() > 0 && !hasVisibleInk(raster)) {
-                glyphCacheUnavailable = true;
-                return;
-            }
-            glyphCache = raster;
-            glyphCacheLayout = layout;
-            glyphCacheText = karaokeText;
-            glyphCacheWidth = width;
-            glyphCacheHeight = height;
-        }
-
-        /**
-         * Drops the mask. Deliberately not recycled: a bitmap can still be referenced by a display
-         * list the render thread has not finished with, and recycling one of those crashes.
-         */
-        private void releaseGlyphCache() {
-            glyphCache = null;
-            glyphCacheLayout = null;
-            glyphCacheText = null;
-            glyphCacheWidth = 0;
-            glyphCacheHeight = 0;
-        }
-
-        @Override
-        protected void onDetachedFromWindow() {
-            super.onDetachedFromWindow();
-            releaseGlyphCache();
         }
 
         /**
