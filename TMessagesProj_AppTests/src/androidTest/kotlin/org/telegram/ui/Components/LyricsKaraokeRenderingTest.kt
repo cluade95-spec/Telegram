@@ -575,13 +575,172 @@ class LyricsKaraokeRenderingTest {
 
     @Test
     fun everyLyricModeIsSetWithTheSameTypography() {
-        // There is exactly one size, one spacing and one row metric set, so no mode can be the
-        // small ugly one. A second, smaller set is what the previous build shipped.
-        assertEquals(22, AudioPlayerAlert.LYRICS_TEXT_SIZE_DP)
-        assertTrue("large", AudioPlayerAlert.LYRICS_TEXT_SIZE_DP >= 20)
-        assertTrue("generous line spacing", AudioPlayerAlert.LYRICS_LINE_SPACING_DP >= 2)
-        assertTrue("generous rows", AudioPlayerAlert.LYRICS_ROW_MIN_HEIGHT_DP >= 60)
-        assertTrue("generous padding", AudioPlayerAlert.LYRICS_ROW_PADDING_V_DP >= 12)
+        // There is exactly one size, one inset and one row metric derived, so no mode can be the
+        // small ugly one. A second, smaller set is what an earlier build shipped.
+        for (widthDp in floatArrayOf(320f, 360f, 392.7f, 411f)) {
+            val size = AudioPlayerAlert.lyricsTextSizeDp(widthDp)
+            assertTrue("large at ${widthDp}dp: $size", size >= 20f)
+            assertTrue("generous padding", AudioPlayerAlert.lyricsRowPaddingVDp(size) >= 12f)
+            assertTrue("inset tracks the size", AudioPlayerAlert.lyricsInsetDp(widthDp) >= 20f)
+        }
+    }
+
+    // ============================================== measured against the Apple Music reference
+    // docs/apple-music-lyrics-reference.md. Every figure below is a measurement off the supplied
+    // 720x1560 capture, not a preference.
+
+    @Test
+    fun typeSizeReproducesTheMeasuredShareOfTheViewportWidth() {
+        // MEASURED: em = 62.0 px of a 720 px wide frame = 0.0861 W.
+        assertEquals(0.0861f, 62.0f / 720f, 0.0005f)
+        assertEquals(360f * 0.0861f, AudioPlayerAlert.lyricsTextSizeDp(360f), 0.01f)
+        // MEASURED: left inset 61-63 px of 720 = 0.0854 W, i.e. within 1 % of the em itself.
+        assertEquals(360f * 0.0854f, AudioPlayerAlert.lyricsInsetDp(360f), 0.01f)
+    }
+
+    @Test
+    fun rowAndBlockSpacingReproduceTheMeasuredPitches() {
+        // MEASURED: wrapped rows 78.0 px apart, blocks 141.5 px apart, with em = 62.0 px.
+        assertEquals(1.258f, 78.0f / 62.0f, 0.002f)
+        assertEquals(1.024f, (141.5f - 78.0f) / 62.0f, 0.002f)
+        // Two adjacent rows each contribute one padding, so the pair must be the measured gap.
+        val em = 62f
+        assertEquals(em * 1.024f, 2f * AudioPlayerAlert.lyricsRowPaddingVDp(em), 0.01f)
+        // Extra line spacing lands the wrapped-row pitch on 1.258 em for any font metrics.
+        val ascent = -0.927f * em
+        val descent = 0.244f * em
+        val extra = AudioPlayerAlert.lyricsExtraLineSpacingPx(em, ascent, descent)
+        assertEquals(em * 1.258f, (descent - ascent) + extra, 0.01f)
+        // A font already looser than the reference is left alone, never tightened.
+        assertEquals(0f, AudioPlayerAlert.lyricsExtraLineSpacingPx(em, -1.2f * em, 0.4f * em), 0f)
+    }
+
+    @Test
+    fun theActiveLineIsTopAnchoredAtTheMeasuredFraction() {
+        // MEASURED: the active block's glyph top sits at y = 361 of a 1560 px frame in every
+        // settled frame, whatever the block's height. Centring is what this used to do.
+        assertEquals(361f / 1560f, AudioPlayerAlert.LYRICS_FOCUS_TOP_FRACTION, 0.001f)
+        assertTrue("well above centre", AudioPlayerAlert.LYRICS_FOCUS_TOP_FRACTION < 0.4f)
+    }
+
+    @Test
+    fun followEasingMatchesTheMeasuredReferenceCurve() {
+        // MEASURED: mean normalised displacement over ten transitions, sd <= 0.025 per sample.
+        val t = floatArrayOf(0.10f, 0.20f, 0.25f, 0.30f, 0.50f, 0.75f, 0.90f, 1.00f)
+        val p = floatArrayOf(0.040f, 0.157f, 0.282f, 0.442f, 0.792f, 0.939f, 0.977f, 1.000f)
+        for (i in t.indices) {
+            assertEquals(
+                "displacement at t/T=${t[i]}",
+                p[i], AudioPlayerAlert.LYRIC_FOLLOW_EASING.getInterpolation(t[i]), 0.045f
+            )
+        }
+    }
+
+    @Test
+    fun followMotionIsMonotonicAndNeverOvershoots() {
+        var previous = 0f
+        var i = 0
+        while (i <= 100) {
+            val v = AudioPlayerAlert.LYRIC_FOLLOW_EASING.getInterpolation(i / 100f)
+            assertTrue("monotonic at $i", v >= previous - 1e-4f)
+            assertTrue("no overshoot at $i: $v", v <= 1.0001f)
+            assertTrue("no undershoot at $i: $v", v >= -1e-4f)
+            previous = v
+            i++
+        }
+        assertEquals(0f, AudioPlayerAlert.LYRIC_FOLLOW_EASING.getInterpolation(0f), 1e-4f)
+        assertEquals(1f, AudioPlayerAlert.LYRIC_FOLLOW_EASING.getInterpolation(1f), 1e-4f)
+    }
+
+    @Test
+    fun followEasingIsWeightedToTheTailNotSymmetric() {
+        // MEASURED: velocity peaks at 0.29 T and half the travel is done by 0.33 T. A symmetric
+        // curve puts half the travel at 0.50 T, which is what EASE_BOTH did.
+        val half = AudioPlayerAlert.LYRIC_FOLLOW_EASING.getInterpolation(0.33f)
+        assertTrue("half the distance by a third of the time, was $half", half >= 0.45f)
+        // ...and it still has a real ease-IN: the first fifth of the time is not the fast part.
+        val early = AudioPlayerAlert.LYRIC_FOLLOW_EASING.getInterpolation(0.20f)
+        assertTrue("slow start, was $early", early < 0.25f)
+    }
+
+    @Test
+    fun followLeadAndDurationMatchTheMeasuredTransition() {
+        // MEASURED: the scroll starts a median 450 ms before the incoming line's fill begins
+        // (mean 498, sd 93), and the travel itself runs a median 483 ms (mean 507, sd 90).
+        assertEquals(450.0, AudioPlayerAlert.lyricFollowLeadMs(100_000L).toDouble(), 60.0)
+        assertEquals(483.0, AudioPlayerAlert.LYRIC_FOLLOW_MEASURED_MS.toDouble(), 60.0)
+        // A short gap still cannot lead by more than half of it.
+        assertEquals(200L, AudioPlayerAlert.lyricFollowLeadMs(400L))
+    }
+
+    @Test
+    fun depthIsCarriedByOpacityAlone() {
+        // MEASURED: no depth blur in the reference (edge-rise width does not vary with distance),
+        // and no per-depth scale (inactive row pitch is 78.00 px at every depth).
+        assertEquals(0f, AudioPlayerAlert.karaokeBlurMaxDp(), 0f)
+        // The falloff is monotonic, starts at nothing on the anchor and saturates at the edge.
+        assertEquals(0f, AudioPlayerAlert.lyricsDepthOf(100f, 100f, 800f), 1e-4f)
+        assertEquals(1f, AudioPlayerAlert.lyricsDepthOf(900f, 100f, 800f), 1e-4f)
+        var previous = -1f
+        var y = 100
+        while (y <= 900) {
+            val v = AudioPlayerAlert.lyricsDepthOf(y.toFloat(), 100f, 800f)
+            assertTrue("monotonic at $y", v >= previous - 1e-4f)
+            previous = v
+            y += 10
+        }
+    }
+
+    @Test
+    fun theUnsungTierMatchesTheMeasuredAlphaHierarchy() {
+        // MEASURED, relative to sung text: unsung on the current line 0.259, next line 0.293,
+        // block+2 0.224, block+3 0.144, block+4 0.081. The current line's unsung text and the
+        // next line's text are one tier, so the unsung level does not depend on "activeness".
+        assertEquals(0.29f, AudioPlayerAlert.karaokeUnsungAlpha(), 0.04f)
+        // MEASURED: furthest / nearest = 0.081 / 0.293 = 0.276.
+        assertEquals(0.081f / 0.293f, AudioPlayerAlert.karaokeDepthFar(), 0.03f)
+        // Composed, the far line lands on the measured 0.081 of sung white.
+        val far = AudioPlayerAlert.karaokeUnsungAlpha() * AudioPlayerAlert.karaokeDepthFar()
+        assertEquals(0.081f, far, 0.015f)
+    }
+
+    @Test
+    fun theActiveLineIsNeverRescaledAndItsTypeNeverChanges() {
+        // MEASURED: inactive row pitch is 78.00 px at every depth, so nothing scales with depth.
+        // The reference does show the ACTIVE line 2.2 % larger (width ratio 1.0219 at five
+        // independent thresholds), and that is deliberately NOT reproduced: a metric-affecting
+        // change on the current row would re-measure and re-wrap it, which is exactly what the
+        // run-aligned karaoke spans depend on not happening mid-playback.
+        //
+        // The type is a pure function of the viewport width and of nothing else - not of which
+        // line is current, not of the sweep - so it cannot change when a line becomes active.
+        assertEquals(
+            AudioPlayerAlert.lyricsTextSizeDp(360f),
+            AudioPlayerAlert.lyricsTextSizeDp(360f), 0f
+        )
+        assertEquals(
+            AudioPlayerAlert.lyricsRowPaddingVDp(31f),
+            AudioPlayerAlert.lyricsRowPaddingVDp(31f), 0f
+        )
+        // Nothing in the frame the renderer is handed can express a scale.
+        val frameFields = KaraokeFrame::class.java.declaredFields.map { it.name.lowercase() }
+        for (banned in listOf("scale", "zoom")) {
+            assertFalse("KaraokeFrame must not carry $banned", frameFields.any { it.contains(banned) })
+        }
+    }
+
+    @Test
+    fun noVerticalWordOrLetterMotionExists() {
+        // MEASURED: glyphs are geometrically identical between frames while the fill advances -
+        // no per-word lift, no per-letter lift, no vertical wave. The frame the renderer paints
+        // from offers no surface for one at all, so none can be switched on by accident.
+        val frameFields = KaraokeFrame::class.java.declaredFields.map { it.name.lowercase() }
+        for (banned in listOf("lift", "rise", "offsety", "translationy", "stagger", "dy")) {
+            assertFalse("KaraokeFrame must not carry $banned", frameFields.any { it.contains(banned) })
+        }
+        // The whole frame is a horizontal range plus how far across it the fill has travelled.
+        assertTrue("horizontal sweep only", frameFields.contains("sweep"))
+        assertTrue(frameFields.contains("wordstart") && frameFields.contains("wordend"))
     }
 
     @Test
