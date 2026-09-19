@@ -343,8 +343,10 @@ public class CachedMediaLayout extends FrameLayout implements NestedSizeNotifier
                     MediaController.getInstance().playMessage(fileInfo.messageObject);
                 }
             } else {
-                // MediaController.getInstance().setPlaylist(documentsAdapter.createPlaylist(), fileInfo.messageObject, 0);
-                MediaController.getInstance().playMessage(fileInfo.messageObject);
+                // A downloaded file is its own playback context: playMessage alone would leave it
+                // attached to whatever playlist was loaded before, and the player would go on
+                // showing that chat or profile.
+                MediaController.getInstance().playStandaloneMessage(fileInfo.messageObject);
             }
         }
         return;

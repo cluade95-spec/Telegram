@@ -50,6 +50,8 @@ import org.telegram.ui.ActionBar.AlertDialog;
 import org.telegram.ui.ActionBar.BaseFragment;
 import org.telegram.ui.ActionBar.Theme;
 import org.telegram.ui.ActionBar.ThemeDescription;
+import org.telegram.ui.Cells.RadioColorCell;
+import org.telegram.ui.Components.BulletinFactory;
 import org.telegram.ui.Components.EditTextBoldCursor;
 import org.telegram.ui.Components.AudioPlayerAlert;
 import org.telegram.ui.Components.LayoutHelper;
@@ -78,6 +80,18 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
     private static final int ONLINE_SEARCH = 7;
     private static final int PICK_LRC = 41;
     private static final int MAX_SIZE = 1024 * 1024;
+    /**
+     * The file names Import accepts. {@code .lrc} is what this feature writes and what every LRC
+     * tool produces, {@code .elrc} is the extension some taggers give an Enhanced (word-timed) LRC,
+     * and {@code .txt} was always accepted for plain lyrics. All three are read by the same parser,
+     * which decides what the contents actually are.
+     */
+    // .ttml joins the three that were already here because the editor can now genuinely hold a
+    // TTML document: the parser reads the dialect, the online search can return one, and Save
+    // persists it verbatim. Nothing else about import changes - same picker, same name check,
+    // same size limit, same strict UTF-8 decode, and the same parser deciding afterwards
+    // whether what arrived is usable.
+    private static final String[] IMPORT_EXTENSIONS = {".lrc", ".elrc", ".txt", ".ttml"};
 
     private final MessageObject messageObject;
     private LyricsEditText editText;
@@ -104,6 +118,8 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
     private boolean pendingControllerRefresh;
     private String searchArtist;
     private String searchTitle;
+    /** The flavour the row list opens marked. Remembered like the fields, and never applied on its own. */
+    private LyricsOnlineSearch.Type searchType = LyricsOnlineSearch.Type.SYNCED;
 
     public SyncedLyricsEditorFragment(MessageObject messageObject) {
         super(new Bundle());
@@ -240,6 +256,9 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
     /** Leading LRC timestamps only, matching what the parser accepts. Metadata tags cannot match. */
     private static final Pattern TIMESTAMP_TOKEN = Pattern.compile("\\[(\\d{1,3}):(\\d{1,2})(?:[\\.:]\\d{1,3})?]");
 
+    /** Inline Enhanced-LRC word timestamps, matching what the parser captures inside a timed line. */
+    private static final Pattern WORD_TIMESTAMP_TOKEN = Pattern.compile("<(\\d{1,3}):(\\d{1,2})(?:[\\.:]\\d{1,3})?>");
+
     /**
      * Re-colours only the lines the last edit touched. Typing re-spans one paragraph; a paste or an
      * import re-spans just the inserted range. Nothing ever walks the whole document per keystroke
@@ -261,16 +280,17 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
             text.removeSpan(span);
         }
         final int color = getThemedColor(Theme.key_windowBackgroundWhiteBlueText);
+        final int wordColor = getThemedColor(Theme.key_windowBackgroundWhiteGrayText);
         int lineStart = start;
         while (lineStart <= end && lineStart < length) {
             int lineEnd = lineStart;
             while (lineEnd < length && text.charAt(lineEnd) != '\n') lineEnd++;
-            styleTimestampsInLine(text, lineStart, lineEnd, color);
+            styleTimestampsInLine(text, lineStart, lineEnd, color, wordColor);
             lineStart = lineEnd + 1;
         }
     }
 
-    private void styleTimestampsInLine(Editable text, int lineStart, int lineEnd, int color) {
+    private void styleTimestampsInLine(Editable text, int lineStart, int lineEnd, int color, int wordColor) {
         if (lineEnd <= lineStart) return;
         final Matcher matcher = TIMESTAMP_TOKEN.matcher(text);
         matcher.region(lineStart, lineEnd);
@@ -284,6 +304,31 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
             }
             text.setSpan(new TimestampSpan(color), matcher.start(), matcher.end(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
             cursor = matcher.end();
+        }
+        // Inline word timestamps are only timing inside a line that already has a leading one; on
+        // any other line the same characters are just text, and colouring them would say otherwise.
+        if (cursor > lineStart) styleWordTimestampsInLine(text, cursor, lineEnd, wordColor);
+    }
+
+    /**
+     * Marks the inline word timestamps of one timed line, all of them or none. The parser discards
+     * a line's inline timing outright when any one tag states an impossible time, so colouring the
+     * well-formed ones next to a broken one would show timing that will not be read back.
+     */
+    private void styleWordTimestampsInLine(Editable text, int start, int lineEnd, int color) {
+        if (lineEnd <= start) return;
+        final Matcher matcher = WORD_TIMESTAMP_TOKEN.matcher(text);
+        matcher.region(start, lineEnd);
+        while (matcher.find()) {
+            try {
+                if (Long.parseLong(matcher.group(2)) >= 60) return;
+            } catch (RuntimeException ignore) {
+                return;
+            }
+        }
+        matcher.region(start, lineEnd); // resets the matcher; every tag on this line is known good
+        while (matcher.find()) {
+            text.setSpan(new TimestampSpan(color), matcher.start(), matcher.end(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
         }
     }
 
@@ -583,13 +628,29 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
         try {
             Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
             intent.addCategory(Intent.CATEGORY_OPENABLE);
+            // Deliberately no EXTRA_MIME_TYPES. That extra REPLACES setType() as the picker's
+            // filter, and .lrc has no registered MIME type on Android: MimeTypeMap does not know
+            // the extension, so every document provider is free to report whatever it likes -
+            // text/plain, application/octet-stream, a vendor-specific type, or nothing at all. A
+            // provider whose answer is outside the list leaves the file listed but greyed out and
+            // unselectable, which is exactly what happened to a real .lrc file. The platform
+            // cannot express this format as a MIME allowlist, so the filter is the file name and
+            // the contents, checked below after selection, where they can be checked properly.
             intent.setType("*/*");
-            intent.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{"text/plain", "application/x-subrip", "application/octet-stream"});
             startActivityForResult(intent, PICK_LRC);
         } catch (Exception e) {
             FileLog.e(e);
             showError(R.string.LyricsImportFailed);
         }
+    }
+
+    /** True when the picked document's name is one of {@link #IMPORT_EXTENSIONS}. */
+    private static boolean isSupportedLyricsFileName(String name) {
+        final String lower = name.toLowerCase(Locale.US);
+        for (int a = 0; a < IMPORT_EXTENSIONS.length; a++) {
+            if (lower.endsWith(IMPORT_EXTENSIONS[a])) return true;
+        }
+        return false;
     }
 
     @Override
@@ -606,15 +667,20 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
             try (Cursor cursor = ApplicationLoader.applicationContext.getContentResolver().query(uri, new String[]{OpenableColumns.DISPLAY_NAME}, null, null, null)) {
                 if (cursor != null && cursor.moveToFirst()) {
                     String name = cursor.getString(0);
-                    if (name != null) {
-                        name = name.toLowerCase(Locale.US);
-                        if (!name.endsWith(".lrc") && !name.endsWith(".txt")) throw new IllegalArgumentException("Unsupported lyrics file");
+                    // A provider that reports no name at all still has to get past the size limit
+                    // and the strict UTF-8 decode below, which is what keeps this from being a
+                    // door for arbitrary files now that the picker cannot filter by type.
+                    if (name != null && !isSupportedLyricsFileName(name)) {
+                        throw new IllegalArgumentException("Unsupported lyrics file");
                     }
                 }
             }
+            // Not the same as an empty file: the provider could not open what the user picked, and
+            // reporting that as empty content would silently wipe the editor.
+            if (stream == null) throw new IllegalArgumentException("Lyrics file could not be opened");
             byte[] buffer = new byte[8192];
             int total = 0, count;
-            while (stream != null && (count = stream.read(buffer)) != -1) {
+            while ((count = stream.read(buffer)) != -1) {
                 total += count;
                 if (total > MAX_SIZE) throw new IllegalArgumentException("Lyrics file is too large");
                 output.write(buffer, 0, count);
@@ -673,18 +739,49 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
         container.addView(createSearchLabel(activity, R.string.LyricsOnlineSearchTitle), LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
         container.addView(titleField, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 36, Gravity.TOP | Gravity.START, 24, 2, 24, 0));
 
+        // The three flavours are rows rather than dialog buttons: a dialog has three button slots
+        // and one of them has to stay Cancel, and this is the same pick-one-and-act row Telegram
+        // uses for its own single-choice dialogs. Tapping a row is still one explicit action, and
+        // the row that is marked is the one last used - there is no automatic flavour.
+        final AlertDialog[] dialogRef = new AlertDialog[1];
+        container.addView(createSearchLabel(activity, R.string.LyricsOnlineSearchType), LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
+        final LyricsOnlineSearch.Type[] types = {
+                LyricsOnlineSearch.Type.KARAOKE,
+                LyricsOnlineSearch.Type.SYNCED,
+                LyricsOnlineSearch.Type.PLAIN
+        };
+        final int[] labels = {
+                R.string.LyricsOnlineSearchKaraoke,
+                R.string.LyricsOnlineSearchSynced,
+                R.string.LyricsOnlineSearchPlain
+        };
+        for (int a = 0; a < types.length; a++) {
+            final LyricsOnlineSearch.Type type = types[a];
+            final RadioColorCell cell = new RadioColorCell(activity, getResourceProvider());
+            cell.setPadding(AndroidUtilities.dp(4), 0, AndroidUtilities.dp(4), 0);
+            cell.setCheckColor(getThemedColor(Theme.key_radioBackground), getThemedColor(Theme.key_dialogRadioBackgroundChecked));
+            cell.setTextAndValue(LocaleController.getString(labels[a]), type == searchType);
+            cell.setBackground(Theme.createSelectorDrawable(getThemedColor(Theme.key_listSelector), Theme.RIPPLE_MASK_ALL));
+            cell.setOnClickListener(ignored -> {
+                searchType = type;
+                // Started before the dialog goes away, as the buttons this replaced did: the
+                // fields are still attached, so hiding the keyboard still has a window to act on.
+                startOnlineSearch(type, artistField, titleField);
+                if (dialogRef[0] != null) dialogRef[0].dismiss();
+            });
+            container.addView(cell, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 50));
+        }
+
         AlertDialog dialog = new AlertDialog.Builder(activity, getResourceProvider())
                 .setTitle(LocaleController.getString(R.string.LyricsOnlineSearch))
                 .setView(container)
-                .setPositiveButton(LocaleController.getString(R.string.LyricsOnlineSearchSynced),
-                        (ignored, which) -> startOnlineSearch(LyricsOnlineSearch.Type.SYNCED, artistField, titleField))
-                .setNegativeButton(LocaleController.getString(R.string.LyricsOnlineSearchPlain),
-                        (ignored, which) -> startOnlineSearch(LyricsOnlineSearch.Type.PLAIN, artistField, titleField))
-                .setNeutralButton(LocaleController.getString(R.string.Cancel), null)
-                // Remembering what was typed is what keeps the fields alive across a failed search.
-                .setOnDismissListener(ignored -> rememberSearchFields(artistField, titleField))
+                .setNegativeButton(LocaleController.getString(R.string.Cancel), null)
                 .create();
-        showDialog(dialog);
+        dialogRef[0] = dialog;
+        // Remembering what was typed is what keeps the fields alive across a cancelled or failed
+        // search. It has to be handed to showDialog(): BaseFragment installs its own dismiss
+        // listener on whatever it shows, which would replace one set through the builder.
+        showDialog(dialog, ignored -> rememberSearchFields(artistField, titleField));
         artistField.requestFocus();
     }
 
@@ -745,7 +842,7 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
         onlineProgressDialog = progress;
 
         final LyricsOnlineSearch.Request[] started = new LyricsOnlineSearch.Request[1];
-        started[0] = LyricsOnlineSearch.search(searchArtist, searchTitle, messageObject.getDuration(), type, (lyrics, error) -> {
+        started[0] = LyricsOnlineSearch.search(searchArtist, searchTitle, messageObject.getDuration(), type, (lyrics, resolved, error) -> {
             // Only the search that still owns the editor may act. A cancelled request never calls
             // back at all; this also rejects a result whose search has been superseded.
             if (started[0] == null || onlineRequest != started[0]) return;
@@ -760,8 +857,20 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
             consumePendingControllerRefresh();
             if (lyrics != null) {
                 applyOnlineLyrics(lyrics);
+                // A karaoke search that no word-timing source could answer still returns something
+                // useful, but it is line timing and the user is told so rather than left to
+                // discover it when nothing lights up word by word.
+                if (resolved != type) {
+                    BulletinFactory.of(this).createSimpleBulletin(R.raw.info,
+                            LocaleController.getString(R.string.LyricsOnlineSearchLineSyncOnly), 3).show();
+                }
             } else {
-                showError(onlineSearchErrorMessage(error));
+                // The same compact bottom message the line-sync notice above uses, and for the
+                // same reason: a search that found nothing is information, not a decision to
+                // confirm, and a centred dialog with an OK button interrupts the editor to say so.
+                // All three flavours fail through here, so all three fail the same way.
+                BulletinFactory.of(this).createSimpleBulletin(R.raw.error,
+                        LocaleController.getString(onlineSearchErrorMessage(error)), 3).show();
             }
         });
         onlineRequest = started[0];
