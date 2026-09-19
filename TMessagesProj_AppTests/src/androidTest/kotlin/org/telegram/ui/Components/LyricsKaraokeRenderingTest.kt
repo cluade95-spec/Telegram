@@ -125,7 +125,7 @@ class LyricsKaraokeRenderingTest {
     fun theRiseIsSlowAndNeverComesBackDown() {
         // A. Monotonic for the whole of forward playback, and it ends raised.
         var previous = -1f
-        for (position in 0L..4000L step 3L) {
+        for (position in 0L..6000L step 3L) {
             val value = KaraokeWave.graphemeLift(position, 1000, 2, 6, 1f)
             assertTrue("never travels downward at $position: $previous -> $value",
                 value >= previous - 0.0001f)
@@ -134,22 +134,26 @@ class LyricsKaraokeRenderingTest {
         }
         assertEquals("and it stays raised", 1f, previous, 0f)
         // F. Once there, it is there for good.
-        for (position in longArrayOf(2000, 5000, 60000, 600000)) {
+        for (position in longArrayOf(4000, 8000, 60000, 600000)) {
             assertEquals("still raised at $position", 1f,
                 KaraokeWave.graphemeLift(position, 1000, 0, 6, 1f), 0f)
         }
         // Eases away from rest rather than kicking off it, and eases into the raised position
         // rather than arriving at it.
         assertTrue("eases out of rest", KaraokeWave.graphemeLift(1010, 1000, 0, 6, 1f) < 0.005f)
-        assertTrue("eases into the top", KaraokeWave.graphemeLift(2450, 1000, 0, 6, 1f) > 0.99f)
-        // B. Device QA: 520ms "does not feel slow". A word must still be plainly on its way up
-        // well after that, and the whole travel takes about a second.
-        assertTrue("still climbing at 520ms: ${KaraokeWave.graphemeLift(1520, 1000, 0, 6, 1f)}",
-            KaraokeWave.graphemeLift(1520, 1000, 0, 6, 1f) < 0.5f)
+        assertTrue("eases into the top", KaraokeWave.graphemeLift(3300, 1000, 0, 6, 1f) > 0.99f)
+        // B/M. Device QA rejected 1500ms as still too quick. A word must be barely half way up
+        // after a second, and the whole travel takes well over two.
+        assertTrue("still climbing at 1500ms: ${KaraokeWave.graphemeLift(2500, 1000, 0, 6, 1f)}",
+            KaraokeWave.graphemeLift(2500, 1000, 0, 6, 1f) < 0.95f)
+        assertTrue("barely started after a second: ${KaraokeWave.graphemeLift(2000, 1000, 0, 6, 1f)}",
+            KaraokeWave.graphemeLift(2000, 1000, 0, 6, 1f) < 0.72f)
         assertTrue("and nowhere near done at a fifth of a second",
-            KaraokeWave.graphemeLift(1200, 1000, 0, 6, 1f) < 0.15f)
-        assertTrue("the normal rise is well over a second: ${KaraokeWave.RISE_MS}",
-            KaraokeWave.RISE_MS in 1300L..1800L)
+            KaraokeWave.graphemeLift(1200, 1000, 0, 6, 1f) < 0.08f)
+        assertTrue("the normal rise is well over two seconds: ${KaraokeWave.RISE_MS}",
+            KaraokeWave.RISE_MS in 2000L..3000L)
+        assertTrue("substantially longer than the 1500ms device QA rejected",
+            KaraokeWave.RISE_MS >= 1500L * 3 / 2)
     }
 
     @Test
@@ -174,7 +178,7 @@ class LyricsKaraokeRenderingTest {
             "${heights.size}", heights.size > 500)
         // No single millisecond may move it by anything like one of the old levels (1/5 of the
         // travel). The steepest point of the curve is its middle, and even there it crawls.
-        assertTrue("no visible step anywhere in the rise: $biggestStep", biggestStep < 0.005f)
+        assertTrue("no visible step anywhere in the rise: $biggestStep", biggestStep < 0.002f)
         assertEquals("and it arrives exactly", 1f, previous, 0f)
     }
 
@@ -198,7 +202,7 @@ class LyricsKaraokeRenderingTest {
         assertEquals(1f, KaraokeWave.ease(2f), 0f)
 
         // No jump off the baseline: the first hundredth of the duration moves almost nothing.
-        assertTrue("sets off gently: ${KaraokeWave.ease(0.01f)}", KaraokeWave.ease(0.01f) < 0.001f)
+        assertTrue("sets off gently: ${KaraokeWave.ease(0.01f)}", KaraokeWave.ease(0.01f) < 0.002f)
 
         // The velocity peaks early and then falls for the whole of the rest. Sampled as
         // differences, the fastest stretch is in the first half and every later stretch is slower
@@ -219,13 +223,15 @@ class LyricsKaraokeRenderingTest {
 
         // A long, very slow finish: most of the second half of the duration is spent on a sliver
         // of the travel - but it must NOT arrive so early that it visually stops.
-        assertTrue("two thirds of the way up at half time: ${KaraokeWave.ease(0.5f)}",
-            KaraokeWave.ease(0.5f) in 0.6f..0.75f)
-        assertTrue("still visibly short of the top at three quarters: ${KaraokeWave.ease(0.75f)}",
-            KaraokeWave.ease(0.75f) < 0.96f)
-        assertTrue("the last quarter of the time is the last sliver of the travel",
-            1f - KaraokeWave.ease(0.75f) > 0.03f)
+        assertTrue("well short of the top at half time: ${KaraokeWave.ease(0.5f)}",
+            KaraokeWave.ease(0.5f) in 0.75f..0.86f)
         assertTrue("and it does arrive", KaraokeWave.ease(0.99f) > 0.999f)
+        // The peak moved earlier than Build #40's third, which is the direction device QA asked
+        // for. It cannot move very much earlier: for a single-peaked velocity, where the peak sits
+        // and how fat the tail is are the same number, so pushing it into the first tenth would
+        // finish the travel in the first half. The unremarkable finish comes from the duration and
+        // from words overlapping, not from the curve.
+        assertTrue("earlier than a third: $peakAt", peakAt < 0.30f)
     }
 
     @Test
@@ -493,7 +499,7 @@ class LyricsKaraokeRenderingTest {
         val deadline = visualDeadline(0, nextLine)
         val graphemes = 6 // "lovely"
         val needed = KaraokeWave.spanMs(graphemes)
-        for (startMs in longArrayOf(1800, 2600, 3100, 3400, 3520)) {
+        for (startMs in longArrayOf(1200, 2000, 2600, 3100, 3400)) {
             val line = lrc("[00:00.000]<00:00.000>first <${clock(startMs)}>lovely")
             val wave = KaraokeWave().apply { build(line, nextLine) }
             assertEquals("the stated start is never moved", startMs, wave.startMs[1])
@@ -532,7 +538,7 @@ class LyricsKaraokeRenderingTest {
         // I. The same six letters with far less room. The lift is shortened only as much as it
         // must be, and it really does complete before the line goes.
         // Everything from the floor's own span upwards completes inside its window.
-        for (room in longArrayOf(1400, 900, 650, 400, 300, 260)) {
+        for (room in longArrayOf(2000, 1500, 1000, 600, 400)) {
             val scale = KaraokeWave.compression(room, 6)
             assertTrue("${room}ms: compressed", scale < 1f)
             assertTrue("${room}ms: but never faster than the floor",
@@ -544,9 +550,9 @@ class LyricsKaraokeRenderingTest {
         // deliberate: the alternative is a thirty-millisecond flick, which is the popping the whole
         // wave exists to avoid. The rise is never allowed to be quicker than the floor.
         val shortest = KaraokeWave.RISE_MS * KaraokeWave.MIN_COMPRESSION
-        assertTrue("the quickest the decoration may ever travel is a fifth of a second: $shortest",
-            shortest in 150f..350f)
-        for (room in longArrayOf(150, 80, 20, 1)) {
+        assertTrue("the quickest the decoration may ever travel stays a real movement: $shortest",
+            shortest in 250f..500f)
+        for (room in longArrayOf(300, 150, 20, 1)) {
             assertEquals("${room}ms: pinned to the floor, never quicker",
                 KaraokeWave.MIN_COMPRESSION, KaraokeWave.compression(room, 6), 0f)
         }
@@ -665,6 +671,72 @@ class LyricsKaraokeRenderingTest {
                 assertEquals("$text: run $i right", first[i].right, second[i].right, 0f)
             }
         }
+    }
+
+    @Test
+    fun everyTickOfTheRiseIsTooSmallToSurviveAnInvalidationThreshold() {
+        // H. The dominant defect in Build #40, and the reason the motion read as "starts fast then
+        // waits". The renderer only repainted when a grapheme had moved more than a twentieth of a
+        // pixel; the player ticks every 17ms; and at 0.9dp of total travel NO tick of the rise -
+        // not even the quickest one - moves that far. So the wave was never repainted on its own
+        // clock at all, and only moved when something else forced a redraw, in accumulated jumps.
+        //
+        // This test states the arithmetic that makes any such threshold wrong.
+        val tick = 17L
+        val amplitudePx = AudioPlayerAlert.KARAOKE_LIFT_DP * 3f // a typical xxhdpi screen
+        var biggest = 0f
+        var smallestMoving = Float.MAX_VALUE
+        var position = 0L
+        while (position < KaraokeWave.RISE_MS) {
+            val from = KaraokeWave.graphemeLift(position, 0, 0, 6, 1f)
+            val to = KaraokeWave.graphemeLift(position + tick, 0, 0, 6, 1f)
+            val movedPx = (to - from) * amplitudePx
+            assertTrue("never moves backward at $position", movedPx >= 0f)
+            if (movedPx > biggest) biggest = movedPx
+            if (movedPx > 0f && movedPx < smallestMoving) smallestMoving = movedPx
+            position += tick
+        }
+        assertTrue("the whole rise really is in motion tick by tick", smallestMoving > 0f)
+        assertTrue("and even its quickest tick is under the old twentieth-of-a-pixel gate: " +
+            "$biggest px", biggest < 0.05f)
+        // Which is the point: a threshold of any size above zero would silently drop the entire
+        // rise. The renderer now repaints whenever the value changes at all.
+    }
+
+    @Test
+    fun theGlyphMaskIsRasterisedAtOneColourForBothStates() {
+        // The Build #40 root cause, stated as an invariant. Android gamma-corrects a text mask
+        // against the paint's luminance, so white-on-dark and muted-on-dark are different coverage
+        // for the same glyph - which is why sung and muted text looked like two different fonts.
+        // The row is now rasterised once, at one colour, and tinted afterwards.
+        assertEquals("one ink for the whole row, whatever it is later tinted",
+            Color.WHITE, AudioPlayerAlert.GLYPH_MASK_INK)
+        assertEquals("and it is fully opaque, so the mask is pure coverage",
+            255, Color.alpha(AudioPlayerAlert.GLYPH_MASK_INK))
+        // The mask's ink is deliberately NOT either of the two states' colours in general - it is
+        // one fixed value, so neither state can influence the coverage it is drawn from.
+        val muted = 0xFF7F7F7F.toInt()
+        assertNotEquals("the muted colour cannot be what the mask is rasterised at",
+            muted, AudioPlayerAlert.GLYPH_MASK_INK)
+    }
+
+    @Test
+    fun theLiftLandsOnFractionsOfAPixelSoItMustBeCompositedNotRedrawn() {
+        // Text drawn at a fractional vertical offset is snapped to whole pixels by the rasteriser,
+        // so a 0.9dp travel would arrive in two or three jumps. Almost every position of the rise
+        // is a fraction of a pixel, which is why the row is now composited from a bitmap rather
+        // than re-drawn as text.
+        val amplitudePx = AudioPlayerAlert.KARAOKE_LIFT_DP * 3f
+        assertTrue("the whole travel is only a couple of pixels: $amplitudePx", amplitudePx < 4f)
+        var fractional = 0
+        var total = 0
+        for (position in 0L..KaraokeWave.RISE_MS step 17L) {
+            val px = KaraokeWave.graphemeLift(position, 0, 0, 6, 1f) * amplitudePx
+            if (Math.abs(px - Math.round(px)) > 0.02f) fractional++
+            total++
+        }
+        assertTrue("nearly every frame of the rise sits between two pixels: $fractional of $total",
+            fractional > total * 3 / 4)
     }
 
     @Test
@@ -899,7 +971,7 @@ class LyricsKaraokeRenderingTest {
                 assertEquals("${tail}ms tail: pinned to the floor", KaraokeWave.MIN_COMPRESSION,
                     scale, 0f)
                 assertTrue("${tail}ms tail: and visibly under way by the line change",
-                    KaraokeWave.graphemeLift(nextLine, wave.startMs[1], 0, 4, scale) > 0.15f)
+                    KaraokeWave.graphemeLift(nextLine, wave.startMs[1], 0, 4, scale) > 0.10f)
             }
         }
     }
