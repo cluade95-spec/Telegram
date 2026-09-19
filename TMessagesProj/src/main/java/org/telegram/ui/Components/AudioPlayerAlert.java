@@ -4593,10 +4593,25 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
      * text, is laid out and drawn by exactly the code that would have drawn it unhighlighted.
      */
     private static class LyricsTextView extends TextView implements KaraokeGeometry.RunSink {
-        /** Text the source has finished, the word being sung, and text it has not reached. */
-        private final KaraokeSpan sungSpan = new KaraokeSpan();
-        private final KaraokeSpan wordSpan = new KaraokeSpan();
-        private final KaraokeSpan tailSpan = new KaraokeSpan();
+        /**
+         * One span per VISUAL RUN - one bidi run of one visual line - covering the whole row.
+         *
+         * <p>The ranges are a property of the {@link Layout} alone and do NOT move with the sweep.
+         * That is the whole point, and it is measured: Android's {@link android.text.TextLine}
+         * cannot merge two runs whose paints differ, so every span boundary becomes a separate
+         * {@code drawTextRun}. A boundary that falls inside a shaping run changes the glyphs the
+         * shaper produces - a ligature that straddles it is no longer formed, kerning across it is
+         * lost - which is a real change of shape and of width, not of colour. Splitting only where
+         * the platform already splits (at a wrap, and at a direction change) costs nothing, so the
+         * glyphs are bit-for-bit those of an unstyled render at every sweep value.
+         */
+        private KaraokeSpan[] runSpans = new KaraokeSpan[4];
+        /** Logical range of each visual run, and its visual extent, taken from the layout. */
+        private int[] runStart = new int[4];
+        private int[] runEnd = new int[4];
+        private float[] runLeft = new float[4];
+        private float[] runRight = new float[4];
+        private int runCount;
         /** The view's own mutable copy of the text, or null for a line with no inline timing. */
         private Spannable karaokeText;
 
@@ -4804,81 +4819,122 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             if (spanSungTo != sungTo || spanWordTo != wordTo) {
                 spanSungTo = sungTo;
                 spanWordTo = wordTo;
-                setRange(sungSpan, 0, sungTo);
-                setRange(wordSpan, sungTo, wordTo);
-                setRange(tailSpan, wordTo, karaokeText.length());
                 changed = true;
             }
+            // Note what is NOT here any more: nothing calls setSpan. The spans are attached once
+            // per layout, at run boundaries, and a frame only changes their APPEARANCE.
             if (changed || relaidOut) updateAppearance();
             return changed;
         }
 
         /**
-         * Sets the three spans' appearance, and nothing else. This is the only place karaoke
-         * colour is decided, and it is pure appearance: a colour, and for one grapheme a shader.
+         * Gives every visual run its appearance for this frame, and nothing else. This is the only
+         * place karaoke colour is decided, and it is pure appearance: a colour, and for the one run
+         * the sung boundary falls inside, a shader.
          *
-         * <p>Text before the fill is solid sung, text after it solid muted, and the grapheme the
-         * fill is crossing carries a {@link LinearGradient} with a hard stop exactly where the
-         * boundary has reached. That grapheme is therefore rasterised ONCE, in its final geometry,
-         * with both colours in one pass - never drawn muted and then again white.
+         * <p>A run the boundary has passed is solid sung; a run it has not reached is solid muted;
+         * the run containing it is drawn ONCE with a {@link LinearGradient} whose hard stop sits
+         * exactly where the fill has reached. No run is ever subdivided, so no glyph is re-shaped
+         * or re-rasterised as the boundary travels through it.
          */
         private void updateAppearance() {
-            sungSpan.setSolid(sungColor);
-            tailSpan.setSolid(mutedColor);
-            final LinearGradient gradient = frontGradient();
-            if (gradient != null) {
-                // Partly filled: the hard stop inside this one grapheme IS the sung boundary. The
-                // colour is the fallback the paint would use without a shader, so a device that
-                // somehow refuses the shader shows a whole muted grapheme rather than nothing.
-                wordSpan.set(mutedColor, gradient);
-            } else {
-                // Wholly on one side of the boundary, so one flat colour states it exactly - and a
-                // flat colour is cheaper and cannot band.
-                wordSpan.set(frontFilled() ? sungColor : mutedColor, null);
+            final int boundary = boundaryCluster();
+            final float cut = boundaryX(boundary);
+            final boolean rtl = boundary >= 0 && clusterRtl[boundary];
+            for (int r = 0; r < runCount; r++) {
+                final KaraokeSpan span = runSpans[r];
+                if (runEnd[r] <= spanSungTo) {
+                    span.setSolid(sungColor);                 // wholly sung
+                } else if (runStart[r] >= spanWordTo) {
+                    span.setSolid(mutedColor);                // not reached yet
+                } else {
+                    final LinearGradient gradient = runGradient(r, cut, rtl);
+                    if (gradient != null) {
+                        // The colour is the fallback the paint would use without a shader, so a
+                        // device that somehow refused it shows a muted run rather than nothing.
+                        span.set(mutedColor, gradient);
+                    } else {
+                        // No geometry at all to place a boundary with - the row has not been laid
+                        // out yet. The next tick, by which time it has, puts the fill where the
+                        // clock says. Until then the run reads as not yet reached.
+                        span.setSolid(mutedColor);
+                    }
+                }
             }
         }
 
-        /** True when the fill has covered the whole of the grapheme it is inside. */
-        private boolean frontFilled() {
-            final int i = frontCluster;
-            if (i < 0 || i >= clusterGeometryCount || !clusterHasRect[i]) return false;
-            return frontRevealed >= clusterRight[i] - clusterLeft[i];
+        /**
+         * The grapheme the sung boundary is measured against.
+         *
+         * <p>Normally the one the fill is part-way through. When there is no such grapheme - nothing
+         * of the word sung yet, the word complete, or no layout - the boundary sits at the leading
+         * edge of the first grapheme that is NOT yet sung, so a run straddling that offset is still
+         * divided by colour at the right place instead of being flooded with one of the two.
+         *
+         * <p>A grapheme with no ink of its own (a space) cannot carry an edge, so the search steps
+         * to the next one that has, and failing that to the last one before it.
+         */
+        private int boundaryCluster() {
+            if (frontCluster >= 0 && frontCluster < clusterGeometryCount
+                    && clusterHasRect[frontCluster]) {
+                return frontCluster;
+            }
+            final int limit = Math.min(clusterCount, clusterGeometryCount);
+            for (int i = 0; i < limit; i++) {
+                if (clusterStart[i] < spanSungTo) continue;
+                if (clusterHasRect[i]) return i;
+            }
+            for (int i = limit - 1; i >= 0; i--) {
+                if (clusterHasRect[i]) return i;
+            }
+            return -1;
         }
 
         /**
-         * The gradient for the grapheme the fill front is inside, or null when a solid colour says
-         * it exactly.
-         *
-         * <p>Its coordinates are the row's own {@link Layout} coordinates, which is the space the
-         * paint's shader is resolved in: {@link TextView#onDraw} translates the canvas by the
-         * padding before {@link Layout#draw}, so the shader's matrix is the layout's. They are not
-         * invented - they are the grapheme's own left and right edges as the layout reported them.
-         *
-         * <p>Two stops share the boundary position, so the transition is a hard edge rather than a
-         * fade, matching the fill the clipped renderer used to produce. {@link Shader.TileMode#CLAMP}
-         * extends the end colours outwards, so ink that overhangs the advance box - a kerning pair,
-         * a leaning accent, an Arabic joining stroke - is coloured by the side it belongs to
-         * instead of being cut off.
-         *
-         * <p>For an LTR run the sung side is the left; for an RTL run it is the right. That is the
-         * only difference between the two, and it comes from the direction the layout gave the run.
+         * Layout x the sung boundary has reached, for the grapheme it is measured against: the
+         * fill's own position inside a part-filled grapheme, and otherwise that grapheme's leading
+         * edge - its left for an LTR run, its right for an RTL one.
          */
-        private LinearGradient frontGradient() {
-            final int i = frontCluster;
-            if (i < 0 || i >= clusterGeometryCount || !clusterHasRect[i]) return null;
-            final float left = clusterLeft[i];
-            final float right = clusterRight[i];
+        private float boundaryX(int cluster) {
+            if (cluster < 0) return Float.NaN;
+            final float left = clusterLeft[cluster];
+            final float right = clusterRight[cluster];
+            if (cluster != frontCluster) {
+                return clusterRtl[cluster] ? right : left;
+            }
             final float width = right - left;
-            if (width <= 0.01f) return null;
+            if (width <= 0.01f) return clusterRtl[cluster] ? right : left;
             float shown = frontRevealed;
             if (shown < 0f) shown = 0f;
             if (shown > width) shown = width;
-            final boolean rtl = clusterRtl[i];
-            // Distance from the LEFT edge, whichever side the run is filled from.
-            final float cut = rtl ? width - shown : shown;
-            final float stop = cut / width;
-            if (stop <= 0f) return null;  // nothing of it filled: the solid colour is exact
-            if (stop >= 1f) return null;  // all of it filled: likewise
+            // RTL runs are read from their right edge, so the fill travels leftwards through them.
+            return clusterRtl[cluster] ? right - shown : left + shown;
+        }
+
+        /**
+         * The gradient for the one run the sung boundary falls inside, or null when there is no
+         * usable cut.
+         *
+         * <p>It spans the RUN's own visual extent, with two stops sharing the boundary's position,
+         * so the transition is a hard edge and the run is still a single draw. The coordinates are
+         * the row's own {@link Layout} coordinates, which is the space the paint's shader is
+         * resolved in - {@link TextView#onDraw} translates the canvas by the padding before
+         * {@link Layout#draw}, so the shader's matrix is the layout's. That has been measured, not
+         * assumed. {@link Shader.TileMode#CLAMP} extends the end colours outwards, so ink that
+         * overhangs the run's advance box is coloured by the side it belongs to.
+         *
+         * <p>For an LTR run the sung side is the left; for an RTL run it is the right, taken from
+         * the direction the layout gave the grapheme the boundary is inside.
+         */
+        private LinearGradient runGradient(int run, float cut, boolean rtl) {
+            if (Float.isNaN(cut)) return null;
+            final float left = runLeft[run];
+            final float right = runRight[run];
+            final float width = right - left;
+            if (width <= 0.01f) return null;
+            float stop = (cut - left) / width;
+            if (stop < 0f) stop = 0f;
+            if (stop > 1f) stop = 1f;
             final int leading = rtl ? mutedColor : sungColor;
             final int trailing = rtl ? sungColor : mutedColor;
             return new LinearGradient(left, 0f, right, 0f,
@@ -4969,7 +5025,71 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             }
             pendingCluster = -1;
             clusterGeometryCount = clusterCount;
+            rebuildRunSpans(layout);
             return true;
+        }
+
+        /**
+         * Attaches exactly one span per visual run, covering the whole row.
+         *
+         * <p>A visual run is one bidi run of one visual line - the same division
+         * {@link KaraokeGeometry#forEachVisualRun} makes, and the same one the platform itself
+         * draws in: {@link Layout} draws each visual line separately and
+         * {@link android.text.TextLine} each direction run separately. Putting the span boundaries
+         * exactly there means karaoke never asks for a split the platform was not making anyway, so
+         * it cannot change a glyph. Ranges are rebuilt only with the layout, never with the sweep.
+         */
+        private void rebuildRunSpans(Layout layout) {
+            detachRunSpans();
+            runCount = 0;
+            if (karaokeText == null || layout == null) return;
+            final int length = karaokeText.length();
+            if (length == 0) return;
+            for (int line = 0; line < layout.getLineCount(); line++) {
+                final int from = layout.getLineStart(line);
+                final int to = Math.min(length, layout.getLineEnd(line));
+                if (to <= from) continue;
+                int start = from;
+                boolean rtl = layout.isRtlCharAt(start);
+                for (int i = from + 1; i <= to; i++) {
+                    final boolean next = i < to && layout.isRtlCharAt(i);
+                    if (i < to && next == rtl) continue;
+                    addRunSpan(layout, line, start, i);
+                    start = i;
+                    rtl = next;
+                }
+            }
+        }
+
+        private void addRunSpan(Layout layout, int line, int start, int end) {
+            if (end <= start) return;
+            ensureRunCapacity(runCount + 1);
+            if (runSpans[runCount] == null) runSpans[runCount] = new KaraokeSpan();
+            final float leading = KaraokeGeometry.edgeAt(layout, line, start, false);
+            final float trailing = KaraokeGeometry.edgeAt(layout, line, end, true);
+            runStart[runCount] = start;
+            runEnd[runCount] = end;
+            runLeft[runCount] = Math.min(leading, trailing);
+            runRight[runCount] = Math.max(leading, trailing);
+            karaokeText.setSpan(runSpans[runCount], start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+            runCount++;
+        }
+
+        private void ensureRunCapacity(int size) {
+            if (size <= runSpans.length) return;
+            final int grown = Math.max(size, runSpans.length * 2);
+            runSpans = java.util.Arrays.copyOf(runSpans, grown);
+            runStart = java.util.Arrays.copyOf(runStart, grown);
+            runEnd = java.util.Arrays.copyOf(runEnd, grown);
+            runLeft = java.util.Arrays.copyOf(runLeft, grown);
+            runRight = java.util.Arrays.copyOf(runRight, grown);
+        }
+
+        private void detachRunSpans() {
+            if (karaokeText == null) return;
+            for (int r = 0; r < runCount; r++) {
+                if (runSpans[r] != null) karaokeText.removeSpan(runSpans[r]);
+            }
         }
 
         /** True when a grapheme has no glyph to fill - a space, a tab, a line separator. */
@@ -5017,21 +5137,9 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             clusterHasRect = java.util.Arrays.copyOf(clusterHasRect, grown);
         }
 
-        private void setRange(KaraokeSpan span, int start, int end) {
-            if (karaokeText == null) return;
-            if (end > start) {
-                karaokeText.setSpan(span, start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
-            } else {
-                karaokeText.removeSpan(span);
-            }
-        }
-
         private void detachSpans() {
-            if (karaokeText != null) {
-                karaokeText.removeSpan(sungSpan);
-                karaokeText.removeSpan(wordSpan);
-                karaokeText.removeSpan(tailSpan);
-            }
+            detachRunSpans();
+            runCount = 0;
             wordStart = 0;
             wordEnd = 0;
             sweep = 0f;
@@ -5046,9 +5154,9 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             clusterGeometryCount = 0;
             // The spans are detached, but a recycled row reuses these objects, so no shader from
             // the line just released can reach the next line's paint.
-            sungSpan.set(0, null);
-            wordSpan.set(0, null);
-            tailSpan.set(0, null);
+            for (int r = 0; r < runSpans.length; r++) {
+                if (runSpans[r] != null) runSpans[r].set(0, null);
+            }
         }
     }
 

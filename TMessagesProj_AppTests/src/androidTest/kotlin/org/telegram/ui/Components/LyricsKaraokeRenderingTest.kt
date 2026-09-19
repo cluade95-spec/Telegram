@@ -1,5 +1,7 @@
 package org.telegram.ui.Components
 
+import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.LinearGradient
 import android.graphics.Shader
@@ -1262,19 +1264,42 @@ class LyricsKaraokeRenderingTest {
         assertEquals("$label: paint flags", a.flags, b.flags)
     }
 
+    /** One visual run: a bidi run of one visual line, the unit LyricsTextView spans. */
+    private class VisualRun(val start: Int, val end: Int, val left: Float, val right: Float, val rtl: Boolean)
+
     /**
-     * Applies the karaoke spans to [text] for one sweep exactly as LyricsTextView does: the sung
-     * prefix, then the single grapheme the fill front is inside, then the muted tail. The front is
-     * found from the graphemes' own advance widths, which is the renderer's own rule.
+     * The visual runs of a layout: per visual line, split at every direction change. This is the
+     * same division [KaraokeGeometry.forEachVisualRun] makes and the same one the platform draws
+     * in, and it is the ONLY place LyricsTextView is allowed to put a span boundary.
      */
-    private fun spanned(text: String, layout: Layout, sweep: Float): SpannableString {
-        val out = SpannableString(text)
+    private fun visualRuns(layout: Layout, length: Int): List<VisualRun> {
+        val out = ArrayList<VisualRun>()
+        for (line in 0 until layout.lineCount) {
+            val from = layout.getLineStart(line)
+            val to = minOf(length, layout.getLineEnd(line))
+            if (to <= from) continue
+            var start = from
+            var rtl = layout.isRtlCharAt(start)
+            for (i in from + 1..to) {
+                val next = i < to && layout.isRtlCharAt(i)
+                if (i < to && next == rtl) continue
+                val a = KaraokeGeometry.edgeAt(layout, line, start, false)
+                val b = KaraokeGeometry.edgeAt(layout, line, i, true)
+                out.add(VisualRun(start, i, minOf(a, b), maxOf(a, b), rtl))
+                start = i
+                rtl = next
+            }
+        }
+        return out
+    }
+
+    /** Where the fill front is: the grapheme it is inside, and how far into it, from the layout. */
+    private fun frontOf(text: String, layout: Layout, sweep: Float): Pair<Int, Float> {
         val pieces = graphemesOf(text)
         val bounds = ArrayList<Int>()
         var at = 0
         for (piece in pieces) { bounds.add(at); at += piece.length }
         bounds.add(text.length)
-        // Advance width of each non-blank grapheme, from the layout and nothing else.
         val widths = FloatArray(pieces.size)
         for (i in pieces.indices) {
             if (pieces[i].isBlank()) continue
@@ -1286,23 +1311,40 @@ class LyricsKaraokeRenderingTest {
         val total = widths.sum()
         val reveal = sweep * total
         var consumed = 0f
-        var front = -1
         for (i in pieces.indices) {
             if (widths[i] <= 0f) continue
-            if (reveal < consumed + widths[i]) { front = i; break }
+            if (reveal < consumed + widths[i]) return Pair(bounds[i], reveal - consumed)
             consumed += widths[i]
         }
-        val sungTo = if (front < 0) text.length else bounds[front]
-        val wordTo = if (front < 0) text.length else bounds[front + 1]
-        if (sungTo > 0) out.setSpan(newKaraokeSpan(Color.WHITE, null), 0, sungTo, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-        if (wordTo > sungTo) {
-            // The one grapheme the boundary is inside: ONE span, carrying a hard-stop gradient.
-            val shader = LinearGradient(0f, 0f, 10f, 0f,
-                intArrayOf(Color.WHITE, Color.WHITE, Color.GRAY, Color.GRAY),
-                floatArrayOf(0f, 0.5f, 0.5f, 1f), Shader.TileMode.CLAMP)
-            out.setSpan(newKaraokeSpan(Color.GRAY, shader), sungTo, wordTo, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        return Pair(text.length, 0f)
+    }
+
+    /**
+     * Applies the karaoke spans for one sweep exactly as LyricsTextView does: ONE span per visual
+     * run, solid on either side of the boundary and a hard-stop gradient on the run containing it.
+     *
+     * The ranges are a function of the LAYOUT ONLY - they do not depend on [sweep] at all. That is
+     * the property the fix rests on, and [theSpanRangesDoNotDependOnTheSweep] pins it.
+     */
+    private fun spanned(text: String, layout: Layout, sweep: Float): SpannableString {
+        val out = SpannableString(text)
+        val (sungTo, _) = frontOf(text, layout, sweep)
+        for (run in visualRuns(layout, text.length)) {
+            val span = when {
+                run.end <= sungTo -> newKaraokeSpan(Color.WHITE, null)
+                run.start >= sungTo -> newKaraokeSpan(Color.GRAY, null)
+                else -> {
+                    val stop = ((layout.getPrimaryHorizontal(sungTo) - run.left)
+                            / (run.right - run.left)).coerceIn(0f, 1f)
+                    val colours = if (run.rtl)
+                        intArrayOf(Color.GRAY, Color.GRAY, Color.WHITE, Color.WHITE)
+                    else intArrayOf(Color.WHITE, Color.WHITE, Color.GRAY, Color.GRAY)
+                    newKaraokeSpan(Color.GRAY, LinearGradient(run.left, 0f, run.right, 0f,
+                        colours, floatArrayOf(0f, stop, stop, 1f), Shader.TileMode.CLAMP))
+                }
+            }
+            out.setSpan(span, run.start, run.end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
         }
-        if (text.length > wordTo) out.setSpan(newKaraokeSpan(Color.GRAY, null), wordTo, text.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
         return out
     }
 
@@ -1450,6 +1492,148 @@ class LyricsKaraokeRenderingTest {
             val name = field.name.lowercase()
             for (word in banned) {
                 assertFalse("KaraokeFrame.${field.name} still exists for '$word'", name.contains(word))
+            }
+        }
+    }
+
+    // ===================================== the span boundaries may not divide a shaping run
+    // The Build #43 device report: "the text still visibly glitches during the colour transition -
+    // shape, weight, size and spacing appear to change." That was NOT a colour or gamma effect.
+    //
+    // Android cannot merge two adjacent spans whose paints differ, so every karaoke span boundary
+    // becomes its own drawTextRun. Splitting a draw at a position that is not a shaping boundary
+    // changes the glyphs the shaper produces: a ligature straddling it is no longer formed, and
+    // kerning across it is lost. The previous renderer put its boundaries on GRAPHEME clusters,
+    // which are finer than shaping clusters, so the boundary regularly landed inside a ligature.
+    // Measured with colour removed, that changed pixels by the full 0..255 range and changed a
+    // word's inked width by up to 18px, appearing and disappearing as the sweep advanced.
+    //
+    // The cure is that karaoke never asks for a split the platform was not already making: span
+    // boundaries sit only at visual-line and direction-run boundaries.
+
+    /** The words that carry a ligature or a conjunct, which is where the damage was measurable. */
+    private val shapingStressStrings = listOf(
+        "office", "fly", "difficult", "waffle", "AVATAR",
+        "take off, take off all your clothes",
+        "ሰላም ለዓለም",
+        "مرحبا بالعالم",
+        "नमस्ते दुनिया"
+    )
+
+    @Test
+    fun everySpanBoundaryLandsOnAVisualRunBoundary() {
+        for (text in typographyStrings + shapingStressStrings) {
+            for (width in intArrayOf(2000, 300)) {
+                val layout = StaticLayout.Builder
+                    .obtain(text, 0, text.length, karaokePaint(), width).build()
+                val allowed = HashSet<Int>()
+                for (run in visualRuns(layout, text.length)) { allowed.add(run.start); allowed.add(run.end) }
+                for (sweep in sweeps) {
+                    val styled = spanned(text, layout, sweep)
+                    val spans = styled.getSpans(0, styled.length, CharacterStyle::class.java)
+                    assertTrue("'$text' must be spanned at all", spans.isNotEmpty())
+                    for (span in spans) {
+                        val from = styled.getSpanStart(span)
+                        val to = styled.getSpanEnd(span)
+                        assertTrue("'$text' w=$width sweep=$sweep: span start $from divides a shaping run",
+                            allowed.contains(from))
+                        assertTrue("'$text' w=$width sweep=$sweep: span end $to divides a shaping run",
+                            allowed.contains(to))
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    fun theSpanRangesDoNotDependOnTheSweep() {
+        // The crux. If the ranges move with the sweep, the draw is re-split as the fill advances and
+        // the glyphs can change with it. They must be a function of the layout alone.
+        for (text in typographyStrings + shapingStressStrings) {
+            for (width in intArrayOf(2000, 300)) {
+                val layout = StaticLayout.Builder
+                    .obtain(text, 0, text.length, karaokePaint(), width).build()
+                var expected: List<Pair<Int, Int>>? = null
+                for (sweep in sweeps) {
+                    val styled = spanned(text, layout, sweep)
+                    val ranges = styled.getSpans(0, styled.length, CharacterStyle::class.java)
+                        .map { Pair(styled.getSpanStart(it), styled.getSpanEnd(it)) }
+                        .sortedBy { it.first }
+                    if (expected == null) expected = ranges
+                    else assertEquals("'$text' w=$width: span ranges moved at sweep $sweep",
+                        expected, ranges)
+                }
+                // And together they cover the whole row, so no character is left unpainted.
+                assertEquals("'$text' w=$width: spans must start at 0", 0, expected!!.first().first)
+                assertEquals("'$text' w=$width: spans must reach the end", text.length, expected.last().second)
+            }
+        }
+    }
+
+    // ============================================== the raster proof, in actual pixels
+    // Colour is removed from the measurement rather than compensated for: both karaoke colours are
+    // set to the SAME white, so the render differs from an unstyled one ONLY through the span
+    // structure. Any difference is therefore geometry.
+
+    private fun renderToPixels(text: CharSequence, width: Int, w: Int, h: Int): IntArray {
+        val bitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bitmap)
+        canvas.drawColor(Color.BLACK)
+        canvas.translate(8f, 4f)
+        StaticLayout.Builder.obtain(text, 0, text.length, karaokePaint(), width).build().draw(canvas)
+        val px = IntArray(w * h)
+        bitmap.getPixels(px, 0, w, 0, 0, w, h)
+        bitmap.recycle()
+        return px
+    }
+
+    private fun luminance(c: Int): Int =
+        Math.round(0.2126f * Color.red(c) + 0.7152f * Color.green(c) + 0.0722f * Color.blue(c))
+
+    /** Rightmost inked column, which is what a change of word width shows up in. */
+    private fun inkedWidth(px: IntArray, w: Int, h: Int): Int {
+        for (x in w - 1 downTo 0) for (y in 0 until h) if (luminance(px[y * w + x]) > 30) return x
+        return -1
+    }
+
+    @Test
+    fun theSweepDoesNotChangeOnePixelOfTheGlyphs() {
+        val bw = 1400
+        val bh = 220
+        for (text in typographyStrings + shapingStressStrings) {
+            for (width in intArrayOf(1300, 300)) {
+                // Reference: the same layout with no karaoke span at all.
+                val plain = renderToPixels(text, width, bw, bh)
+                val referenceWidth = inkedWidth(plain, bw, bh)
+                val layout = StaticLayout.Builder
+                    .obtain(text, 0, text.length, karaokePaint(), width).build()
+                for (sweep in floatArrayOf(0f, 0.1f, 0.25f, 0.5f, 0.75f, 0.9f, 1f)) {
+                    // Both colours white: the span structure is production's, the colour is not.
+                    val styled = SpannableString(text)
+                    val (sungTo, _) = frontOf(text, layout, sweep)
+                    for (run in visualRuns(layout, text.length)) {
+                        val span = if (run.end <= sungTo || run.start >= sungTo) {
+                            newKaraokeSpan(Color.WHITE, null)
+                        } else {
+                            val stop = ((layout.getPrimaryHorizontal(sungTo) - run.left)
+                                    / (run.right - run.left)).coerceIn(0f, 1f)
+                            newKaraokeSpan(Color.WHITE, LinearGradient(run.left, 0f, run.right, 0f,
+                                intArrayOf(Color.WHITE, Color.WHITE, Color.WHITE, Color.WHITE),
+                                floatArrayOf(0f, stop, stop, 1f), Shader.TileMode.CLAMP))
+                        }
+                        styled.setSpan(span, run.start, run.end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                    }
+                    val painted = renderToPixels(styled, width, bw, bh)
+                    var worst = 0
+                    for (i in plain.indices) {
+                        val d = Math.abs(luminance(plain[i]) - luminance(painted[i]))
+                        if (d > worst) worst = d
+                    }
+                    assertTrue("'$text' w=$width sweep=$sweep: the glyphs changed by $worst levels",
+                        worst <= 2)
+                    assertEquals("'$text' w=$width sweep=$sweep: the inked width changed",
+                        referenceWidth, inkedWidth(painted, bw, bh))
+                }
             }
         }
     }
