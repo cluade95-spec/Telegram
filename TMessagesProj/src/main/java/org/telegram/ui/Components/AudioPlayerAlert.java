@@ -4054,6 +4054,11 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 layoutParams = (FrameLayout.LayoutParams) lyricsListView.getLayoutParams();
                 layoutParams.bottomMargin = dp(getPlayerHeight());
                 lyricsListView.setLayoutParams(layoutParams);
+                if (lyricsViewportFade != null) {
+                    FrameLayout.LayoutParams fadeParams = (FrameLayout.LayoutParams) lyricsViewportFade.getLayoutParams();
+                    fadeParams.bottomMargin = dp(getPlayerHeight());
+                    lyricsViewportFade.setLayoutParams(fadeParams);
+                }
             }
             if (noforwards) {
                 optionsButton.hideSubItem(1);
