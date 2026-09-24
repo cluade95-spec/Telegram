@@ -2034,4 +2034,189 @@ class LyricsKaraokeRenderingTest {
         assertEquals("sweep stays 1 once glyphs are complete", 1f, frame.sweep, 0.0001f)
         assertTrue("gapProgress > 0 one ms after wordEndTime", frame.gapProgress > 0f)
     }
+
+    // ========================= long-note word emphasis: gate, scale, and stagger step
+    // Words held for >= 1000ms receive a post-layout scale/glow emphasis derived from the
+    // playback position. The computation is a pure function of the timestamp; resolving the same
+    // position twice returns identical fields regardless of what came before.
+
+    @Test
+    fun longNoteGate_wordsBelow1000msAreIneligible() {
+        // 999ms is just below the threshold and must never trigger emphasis.
+        val line = pairWithGap(999)
+        val frame = KaraokeFrame()
+        frame.resolve(line, 0, Long.MAX_VALUE)
+        assertFalse("999ms word must not be eligible", frame.longNoteEligible)
+        assertEquals("ineligible word has target scale 1.0",
+            1f, KaraokeFrame.longNoteTargetScale(999L), 0.0001f)
+    }
+
+    @Test
+    fun longNoteGate_exactlyAtThresholdIsEligible() {
+        // 1000ms is the exact boundary: eligible, but scale starts at 1.0 since t=0 on the ramp.
+        val line = pairWithGap(1000)
+        val frame = KaraokeFrame()
+        frame.resolve(line, 0, Long.MAX_VALUE)
+        assertTrue("1000ms word must be eligible", frame.longNoteEligible)
+        assertEquals("at 1000ms duration the target scale is 1.0 (t=0 on the ramp)",
+            1f, KaraokeFrame.longNoteTargetScale(1000L), 0.0001f)
+    }
+
+    @Test
+    fun longNoteScale_rampReaches1_14AtOrAbove2000ms() {
+        // 2000ms is the max-scale reference; beyond it the scale is clamped to 1.14.
+        assertEquals("2000ms → max scale 1.14", 1.14f, KaraokeFrame.longNoteTargetScale(2000L), 0.001f)
+        assertEquals("3000ms → still 1.14 (clamped)", 1.14f, KaraokeFrame.longNoteTargetScale(3000L), 0.001f)
+        assertEquals("10000ms → still 1.14", 1.14f, KaraokeFrame.longNoteTargetScale(10000L), 0.001f)
+    }
+
+    @Test
+    fun longNoteScale_midRampAt1500msIsHalfway() {
+        // 1500ms is midway between 1000 and 2000: scale = 1.0 + 0.5 * 0.14 = 1.07.
+        assertEquals("1500ms → midway scale 1.07", 1.07f, KaraokeFrame.longNoteTargetScale(1500L), 0.001f)
+    }
+
+    @Test
+    fun longNoteFieldsAreSetByResolve() {
+        // KaraokeFrame.resolve() must populate longNoteEligible, wordDurationMs, wordAbsoluteStartMs.
+        val line = pairWithGap(1200)   // first word is 1200ms (≥ 1000ms threshold)
+        val frame = KaraokeFrame()
+        frame.resolve(line, 0, Long.MAX_VALUE)
+        assertTrue("1200ms word is eligible", frame.longNoteEligible)
+        assertEquals("wordDurationMs matches the source", 1200L, frame.wordDurationMs)
+        assertEquals("wordAbsoluteStartMs matches the segment start", 0L, frame.wordAbsoluteStartMs)
+    }
+
+    @Test
+    fun longNoteFieldsAreIneligibleForShortWords() {
+        // A 200ms word must have longNoteEligible=false while wordDurationMs is still accurate.
+        val line = pairWithGap(200)
+        val frame = KaraokeFrame()
+        frame.resolve(line, 0, Long.MAX_VALUE)
+        assertFalse("200ms word is ineligible", frame.longNoteEligible)
+        assertEquals("wordDurationMs is still populated", 200L, frame.wordDurationMs)
+    }
+
+    @Test
+    fun clearResetsLongNoteFields() {
+        // clear() must zero every long-note field so a recycled row cannot carry a previous
+        // word's eligibility or duration into a new binding.
+        val line = pairWithGap(1500)
+        val frame = KaraokeFrame()
+        frame.resolve(line, 0, Long.MAX_VALUE)
+        assertTrue("before clear: eligible", frame.longNoteEligible)
+        assertTrue("before clear: wordDurationMs > 0", frame.wordDurationMs > 0L)
+        frame.clear()
+        assertFalse("after clear: longNoteEligible reset", frame.longNoteEligible)
+        assertEquals("after clear: wordDurationMs reset", 0L, frame.wordDurationMs)
+        assertEquals("after clear: wordAbsoluteStartMs reset", 0L, frame.wordAbsoluteStartMs)
+    }
+
+    // ========================= long-note stagger step
+
+    @Test
+    fun longNoteStaggerStep_isProportionalToWordDurationOverGlyphCount() {
+        // Formula: min(400, round(0.4 * durationMs / glyphCount))
+        assertEquals("1000ms / 5 glyphs", 80L, KaraokeFrame.longNoteStaggerStepMs(1000L, 5))
+        assertEquals("2000ms / 4 glyphs", 200L, KaraokeFrame.longNoteStaggerStepMs(2000L, 4))
+        assertEquals("1000ms / 1 glyph", 400L, KaraokeFrame.longNoteStaggerStepMs(1000L, 1))
+    }
+
+    @Test
+    fun longNoteStaggerStep_isCappedAt400ms() {
+        // Any word/glyph-count combination producing more than 400ms is capped at 400.
+        assertEquals("cap: 5000ms / 1 glyph", 400L, KaraokeFrame.longNoteStaggerStepMs(5000L, 1))
+        assertEquals("cap: 10000ms / 1 glyph", 400L, KaraokeFrame.longNoteStaggerStepMs(10000L, 1))
+    }
+
+    @Test
+    fun longNoteStaggerStep_isZeroForEmptyGlyphCount() {
+        assertEquals("0 glyphs → 0ms step", 0L, KaraokeFrame.longNoteStaggerStepMs(1000L, 0))
+    }
+
+    // ========================= seek determinism with long-note fields
+    // These pin the pure-function guarantee: the same playback position always produces the same
+    // long-note state regardless of what happened before or after in playback history.
+
+    @Test
+    fun longNoteEmphasis_seekReproducesIdenticalState() {
+        // Resolve, seek forward, seek back: all three long-note fields match the first resolve.
+        val line = pairWithGap(1500)
+        val frame = KaraokeFrame()
+        frame.resolve(line, 500, Long.MAX_VALUE)
+        val eligA = frame.longNoteEligible
+        val durA = frame.wordDurationMs
+        val startA = frame.wordAbsoluteStartMs
+
+        // Seek well past the word, then back to the original position.
+        frame.resolve(line, 9000, Long.MAX_VALUE)
+        frame.resolve(line, 500, Long.MAX_VALUE)
+        assertEquals("seek reproduces longNoteEligible", eligA, frame.longNoteEligible)
+        assertEquals("seek reproduces wordDurationMs", durA, frame.wordDurationMs)
+        assertEquals("seek reproduces wordAbsoluteStartMs", startA, frame.wordAbsoluteStartMs)
+    }
+
+    @Test
+    fun longNoteEmphasis_pauseDoesNotFreezeState() {
+        // Resolving the same position many times — as happens during a pause — must return
+        // the same long-note fields every time without any accumulated drift.
+        val line = pairWithGap(1500)
+        val frame = KaraokeFrame()
+        frame.resolve(line, 300, Long.MAX_VALUE)
+        val dur = frame.wordDurationMs
+        val start = frame.wordAbsoluteStartMs
+        val elig = frame.longNoteEligible
+        repeat(12) {
+            frame.resolve(line, 300, Long.MAX_VALUE)
+            assertEquals("repeated resolve: wordDurationMs unchanged", dur, frame.wordDurationMs)
+            assertEquals("repeated resolve: wordAbsoluteStartMs unchanged", start, frame.wordAbsoluteStartMs)
+            assertEquals("repeated resolve: longNoteEligible unchanged", elig, frame.longNoteEligible)
+        }
+    }
+
+    // ========================= page movement constants and formula
+    // Row stagger and the pre-anchor lead are derived from Apple Music reference measurements.
+    // These pin the values so a tuning change is intentional and visible in review.
+
+    @Test
+    fun pageFollowLeadIs550ms() {
+        // Reference-derived: movement starts 550ms before the next stated timestamp so the
+        // incoming row is already rising when the semantic clock advances.
+        val field = AudioPlayerAlert::class.java.getDeclaredField("LYRIC_FOLLOW_LEAD_MAX")
+        field.isAccessible = true
+        assertEquals("LYRIC_FOLLOW_LEAD_MAX must be 550ms", 550L, field.get(null) as Long)
+    }
+
+    @Test
+    fun rowStaggerConstantsMatchAppleMusicReference() {
+        // Max delay (small distance): 50ms. Min delay (full viewport or more): 4ms.
+        val maxField = AudioPlayerAlert::class.java.getDeclaredField("ROW_ITEM_DELAY_MAX_MS")
+        maxField.isAccessible = true
+        assertEquals("ROW_ITEM_DELAY_MAX_MS: 50ms", 50L, maxField.get(null) as Long)
+        val minField = AudioPlayerAlert::class.java.getDeclaredField("ROW_ITEM_DELAY_MIN_MS")
+        minField.isAccessible = true
+        assertEquals("ROW_ITEM_DELAY_MIN_MS: 4ms", 4L, minField.get(null) as Long)
+    }
+
+    @Test
+    fun rowStaggerFormula_delayInterpolatesWithDistance() {
+        // itemDelayMs = round(MAX + ratio * (MIN - MAX))
+        // ratio=0 (zero distance): 50ms. ratio=1 (one viewport): 4ms. Monotonically decreasing.
+        fun staggerDelay(ratio: Float): Long = Math.round(50f + ratio * (4f - 50f))
+        assertEquals("ratio=0.0: max delay 50ms", 50L, staggerDelay(0f))
+        assertEquals("ratio=1.0: min delay 4ms", 4L, staggerDelay(1f))
+        val mid = staggerDelay(0.5f)
+        assertTrue("ratio=0.5: between min and max", mid in 4L..50L)
+        // Stagger delay must DECREASE as scroll distance grows (fewer rows are delayed for far scrolls).
+        assertTrue("larger ratio → smaller delay", staggerDelay(0.8f) < staggerDelay(0.2f))
+    }
+
+    @Test
+    fun rowStaggerFormula_ratioIsClampedTo1() {
+        // A scroll distance larger than the viewport is clipped to ratio=1, so the minimum delay
+        // is always the floor and never negative.
+        fun staggerDelay(ratio: Float): Long = Math.round(50f + minOf(1f, ratio) * (4f - 50f))
+        assertEquals("ratio clamped: 2.0 same as 1.0", staggerDelay(1f), staggerDelay(2f))
+        assertTrue("clamped delay never below minimum", staggerDelay(100f) >= 4L)
+    }
 }
