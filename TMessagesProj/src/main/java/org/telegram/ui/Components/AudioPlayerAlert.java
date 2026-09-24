@@ -154,6 +154,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
     private RecyclerListView lyricsListView;
     private LinearLayoutManager lyricsLayoutManager;
     private LyricsAdapter lyricsAdapter;
+    private View lyricsViewportFade;
     private final ArrayList<Integer> visibleLyrics = new ArrayList<>();
     private boolean showingLyrics;
     private boolean lyricsModeRequested;
@@ -1339,6 +1340,30 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         lyricsParams.topMargin = ActionBar.getCurrentActionBarHeight() + AndroidUtilities.statusBarHeight;
         lyricsParams.bottomMargin = dp(179 + (!isMyList() && !noforwards ? 52 : 0));
         containerView.addView(lyricsListView, lyricsParams);
+
+        // Viewport edge fade: continuous top/bottom gradient that hides lines scrolling in and out.
+        // Drawn above the list so it applies uniformly, independent of per-row alpha or blur.
+        lyricsViewportFade = new View(context) {
+            private final Paint fadePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+            { setWillNotDraw(false); }
+            @Override
+            protected void onDraw(android.graphics.Canvas canvas) {
+                final int w = getWidth(), h = getHeight();
+                final int bg = getThemedColor(Theme.key_player_background);
+                final int fadeH = Math.min(dp(72), h / 3);
+                // Top fade: opaque background -> transparent
+                fadePaint.setShader(new LinearGradient(0, 0, 0, fadeH,
+                        bg, 0, Shader.TileMode.CLAMP));
+                canvas.drawRect(0, 0, w, fadeH, fadePaint);
+                // Bottom fade: transparent -> opaque background
+                fadePaint.setShader(new LinearGradient(0, h - fadeH, 0, h,
+                        0, bg, Shader.TileMode.CLAMP));
+                canvas.drawRect(0, h - fadeH, w, h, fadePaint);
+            }
+        };
+        lyricsViewportFade.setVisibility(View.GONE);
+        containerView.addView(lyricsViewportFade, lyricsParams);
+
         lyricsListView.addOnScrollListener(new RecyclerView.OnScrollListener() {
             @Override
             public void onScrollStateChanged(RecyclerView recyclerView, int newState) {
@@ -2767,6 +2792,10 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         lyricsListView.setTranslationX(direction * (1f - lyricsPageProgress) * width);
         listView.setVisibility(lyricsPageProgress < 1f ? View.VISIBLE : View.GONE);
         lyricsListView.setVisibility(lyricsPageProgress > 0f ? View.VISIBLE : View.GONE);
+        if (lyricsViewportFade != null) {
+            lyricsViewportFade.setTranslationX(direction * (1f - lyricsPageProgress) * width);
+            lyricsViewportFade.setVisibility(lyricsPageProgress > 0f ? View.VISIBLE : View.GONE);
+        }
         if (lyricsExpandButton != null) {
             lyricsExpandButton.setTranslationX(direction * (1f - lyricsPageProgress) * width);
         }
@@ -2961,6 +2990,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                     cancelLyricsPageAnimation();
                     listView.setVisibility(View.VISIBLE);
                     lyricsListView.setVisibility(View.VISIBLE);
+                    if (lyricsViewportFade != null) lyricsViewportFade.setVisibility(View.VISIBLE);
                     listView.setAlpha(1f);
                     lyricsListView.setAlpha(1f);
                     updateLyricsGeometry();
@@ -3567,6 +3597,10 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
     /** How much of it text that has not been sung takes, at rest and on the current line. */
     private static final float KARAOKE_MUTED_REST = 0.10f;
     private static final float KARAOKE_MUTED_ACTIVE = 0.30f;
+    /** Physical width of the soft sung/unsung boundary feather, in dp. */
+    private static final float KARAOKE_FEATHER_DP = 7f;
+    /** Scale applied to the line the vocalist is currently singing. Reading-edge pivot. */
+    private static final float KARAOKE_ACTIVE_SCALE = 1.015f;
 
     /** Resolved once per document: true only when some line genuinely states inline word timing. */
     private boolean lyricsWordTimed;
@@ -3648,7 +3682,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         if (karaoke.resolveRow(currentLyrics.lines.get(karaokeLine), karaokeLine, karaokeLine,
                 karaokePositionMs, karaokeNextLineTimeMs)) {
             ((LyricsTextView) child).setKaraokeFrame(karaoke.wordStart, karaoke.wordEnd,
-                    karaoke.sweep);
+                    karaoke.sweep, karaoke.ownedEnd);
         }
     }
 
@@ -3827,13 +3861,15 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         // subordinate is the point. Linear distance did the opposite of both.
         final float linear = Math.min(1f, distance);
         final float depth = linear * linear * (3f - 2f * linear);
-        // Depth is carried by opacity and a small real blur, and by nothing else. There is no
-        // scale: the page is meant to read as one layered surface, and a zoom on the current line
-        // would fight the word motion. Both line-synced and karaoke documents get this, so the two
-        // differ in capability and never in quality.
+        // Depth is carried by opacity and a small real blur. A subtle scale on the active line
+        // (~1.5%) adds physical presence without fighting the karaoke word motion; the pivot is
+        // at the reading edge so the text stays anchored to the margin as it grows.
         child.setAlpha(lerp(KARAOKE_REST_ALPHA - depth * KARAOKE_REST_ALPHA_FALLOFF, KARAOKE_ACTIVE_ALPHA, focus));
-        child.setScaleX(1f);
-        child.setScaleY(1f);
+        final float scale = lerp(1f, KARAOKE_ACTIVE_SCALE, focus);
+        child.setScaleX(scale);
+        child.setScaleY(scale);
+        child.setPivotX(LocaleController.isRTL ? child.getWidth() : 0f);
+        child.setPivotY(child.getHeight() / 2f);
         if (textView == null) return;
         textView.setDepthBlur(lerp(depth * dp(KARAOKE_BLUR_MAX_DP), 0f, focus));
         if (wordFrame) {
@@ -3848,7 +3884,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                     lerp(KARAOKE_MUTED_REST, KARAOKE_MUTED_ACTIVE, focus));
             textView.setLyricTextColor(mutedColor);
             textView.setKaraokeColors(mutedColor, sungColor);
-            textView.setKaraokeFrame(rowKaraoke.wordStart, rowKaraoke.wordEnd, rowKaraoke.sweep);
+            textView.setKaraokeFrame(rowKaraoke.wordStart, rowKaraoke.wordEnd, rowKaraoke.sweep,
+                    rowKaraoke.ownedEnd);
         } else {
             // Ordinary line-synced text, and any untimed line inside a karaoke document. Line-level
             // hierarchy only: no sweep, no word motion, nothing invented.
@@ -4169,6 +4206,12 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         public int wordEnd;
         /** 0..1 across the word at {@link #wordStart}: how much of it the fill has travelled. */
         public float sweep;
+        /**
+         * Exclusive end of the visual space this word "owns" — from its text start to the next
+         * word's text start (or end-of-line for the terminal word). Including trailing whitespace
+         * lets the continuous cursor traverse inter-word gaps without snapping.
+         */
+        public int ownedEnd;
 
         public void clear() {
             active = false;
@@ -4176,6 +4219,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             wordStart = 0;
             wordEnd = 0;
             sweep = 0f;
+            ownedEnd = 0;
         }
 
         /**
@@ -4200,7 +4244,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 // Already left behind: every word it states has started, so all of it is sung. This
                 // is also what keeps a fast line's last word from being swallowed - it finishes
                 // lit rather than being caught mid-fill by the line change.
-                sungEnd = wordStart = wordEnd = line.text.length();
+                sungEnd = wordStart = wordEnd = ownedEnd = line.text.length();
             }
             // Everything else is a line the position has not reached - including one a player is
             // already moving into view - and clear() has left every boundary at zero.
@@ -4238,6 +4282,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             wordStart = segments.startOffset(index);
             wordEnd = Math.max(wordStart, segments.endOffset(index));
             sungEnd = wordStart;
+            ownedEnd = (index + 1 < segments.size())
+                    ? segments.startOffset(index + 1) : line.text.length();
             final long start = segments.startTimeMs(index);
             final long elapsed = Math.max(0L, positionMs - start);
             final long sweepMs = sweepWindowMs(segments, index, nextLineTimeMs);
@@ -4625,6 +4671,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         private int wordStart;
         private int wordEnd;
         private float sweep;
+        /** Owned visual end: next word's start (or line end for terminal word). See KaraokeFrame. */
+        private int wordOwnedEnd;
         /** The colour boundaries the spans currently carry, so an unchanged frame re-sets nothing. */
         private int spanSungTo = -1;
         private int spanWordTo = -1;
@@ -4712,7 +4760,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
          * position, so pushing the same position twice is a no-op and a settled line costs nothing
          * per tick.
          */
-        void setKaraokeFrame(int start, int end, float sweepProgress) {
+        void setKaraokeFrame(int start, int end, float sweepProgress, int ownedEnd) {
             if (karaokeText == null) return;
             // A row that was not painting karaoke a moment ago - a fresh bind, a recycled view, a
             // line that has just become relevant - carries no spans at all, so its first frame
@@ -4730,6 +4778,10 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                     wordEnd = snappedEnd;
                     changed = true;
                 }
+            }
+            if (wordOwnedEnd != ownedEnd) {
+                wordOwnedEnd = ownedEnd;
+                changed = true;
             }
             if (Math.abs(sweep - sweepProgress) > 0.0015f) {
                 sweep = sweepProgress;
@@ -4766,10 +4818,25 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             float revealed = 0f;
             int sungTo;
             int wordTo;
+            // Owned end clamped to the visual line wordStart is on, so the cursor never crosses a
+            // line-wrap boundary. This lets sweep=1 colour the trailing whitespace gap (the space
+            // between this word and the next) as sung, eliminating the snapping artefact.
+            final int effectiveOwnedEnd;
+            if (wordOwnedEnd > wordEnd) {
+                final Layout layout = getLayout();
+                if (layout != null && wordStart >= 0 && wordStart < karaokeText.length()) {
+                    final int visualLine = layout.getLineForOffset(wordStart);
+                    effectiveOwnedEnd = Math.min(wordOwnedEnd, layout.getLineEnd(visualLine));
+                } else {
+                    effectiveOwnedEnd = wordOwnedEnd;
+                }
+            } else {
+                effectiveOwnedEnd = wordEnd;
+            }
             if (wordEnd <= wordStart) {
                 sungTo = wordTo = wordStart;
             } else if (sweep >= 1f) {
-                sungTo = wordTo = wordEnd;
+                sungTo = wordTo = effectiveOwnedEnd;
             } else if (clusterGeometryCount != clusterCount || clusterCount == 0) {
                 // Not laid out yet. The word reads as still to come, and the next tick - by which
                 // time there is a layout - puts the fill where the clock says it is.
@@ -4779,7 +4846,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 for (int i = 0; i < clusterCount; i++) {
                     final int offset = clusterStart[i];
                     if (offset < wordStart) continue;
-                    if (offset >= wordEnd) break;
+                    if (offset >= effectiveOwnedEnd) break;
                     if (isBlankCluster(i) || !clusterHasRect[i]) continue;
                     total += clusterRight[i] - clusterLeft[i];
                 }
@@ -4791,7 +4858,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                     for (int i = 0; i < clusterCount; i++) {
                         final int offset = clusterStart[i];
                         if (offset < wordStart) continue;
-                        if (offset >= wordEnd) break;
+                        if (offset >= effectiveOwnedEnd) break;
                         if (isBlankCluster(i) || !clusterHasRect[i]) continue;
                         final float width = clusterRight[i] - clusterLeft[i];
                         if (reveal < consumed + width) {
@@ -4803,7 +4870,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                         consumed += width;
                     }
                     if (front < 0) {
-                        sungTo = wordTo = wordEnd;
+                        sungTo = wordTo = effectiveOwnedEnd;
                     } else {
                         sungTo = clusterStart[front];
                         wordTo = clusterStart[front + 1];
@@ -4937,9 +5004,26 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             if (stop > 1f) stop = 1f;
             final int leading = rtl ? mutedColor : sungColor;
             final int trailing = rtl ? sungColor : mutedColor;
+            // Soft physical feather: the boundary blends over ~7dp instead of snapping.
+            // For LTR the feather is in the already-sung region (lo..stop); for RTL it is
+            // in the unsung region (stop..hi), mirroring how the sung side is at the leading edge.
+            final float featherFrac = Math.min(0.35f, dp(KARAOKE_FEATHER_DP) / width);
+            final float lo, hi;
+            if (rtl) {
+                lo = stop;
+                hi = Math.min(1f, stop + featherFrac);
+            } else {
+                lo = Math.max(0f, stop - featherFrac);
+                hi = stop;
+            }
+            float safeLo = lo, safeHi = hi;
+            if (safeHi - safeLo < 0.001f) {
+                safeHi = safeLo + 0.001f;
+                if (safeHi > 1f) { safeHi = 1f; safeLo = Math.max(0f, safeHi - 0.001f); }
+            }
             return new LinearGradient(left, 0f, right, 0f,
                     new int[] {leading, leading, trailing, trailing},
-                    new float[] {0f, stop, stop, 1f}, Shader.TileMode.CLAMP);
+                    new float[] {0f, safeLo, safeHi, 1f}, Shader.TileMode.CLAMP);
         }
 
         @Override
@@ -5143,6 +5227,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             wordStart = 0;
             wordEnd = 0;
             sweep = 0f;
+            wordOwnedEnd = 0;
             requestedStart = -1;
             requestedEnd = -1;
             spanSungTo = -1;

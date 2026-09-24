@@ -1637,4 +1637,116 @@ class LyricsKaraokeRenderingTest {
             }
         }
     }
+
+    // ====================================== ownedEnd: trailing whitespace gap belongs to each word
+
+    @Test
+    fun ownedEndIsTheNextWordStartForNonTerminalWords() {
+        // "Hello world" with starts only: each word owns up to the next word's text start.
+        val line = ttml(
+            """<p begin="00:01.000" end="00:03.000">""" +
+                """<span begin="00:01.000" end="00:01.800">Hello</span> """ +
+                """<span begin="00:02.000" end="00:02.600">world</span></p>"""
+        )
+        val frame = KaraokeFrame()
+        frame.resolve(line, 1400, Long.MAX_VALUE)  // mid-first-word
+        // "Hello" is at [0,5]; " " is at [5,6]; "world" starts at 6.
+        assertEquals("first word owns up to next word's start", 6, frame.ownedEnd)
+        assertEquals("wordEnd is still the stated end of the word",
+            line.segments.endOffset(0), frame.wordEnd)
+    }
+
+    @Test
+    fun ownedEndIsLineEndForTheTerminalWord() {
+        val line = ttml(
+            """<p begin="00:01.000" end="00:03.000">""" +
+                """<span begin="00:01.000" end="00:01.800">Hello</span> """ +
+                """<span begin="00:02.000" end="00:02.600">world</span></p>"""
+        )
+        val frame = KaraokeFrame()
+        frame.resolve(line, 2300, Long.MAX_VALUE)  // mid-second-word
+        assertEquals("terminal word owns to end of line text", line.text.length, frame.ownedEnd)
+    }
+
+    @Test
+    fun ownedEndIsSetForAlreadySungLines() {
+        val line = ttml(
+            """<p begin="00:01.000" end="00:03.000">""" +
+                """<span begin="00:01.000" end="00:01.800">Hello</span> """ +
+                """<span begin="00:02.000" end="00:02.600">world</span></p>"""
+        )
+        val frame = KaraokeFrame()
+        frame.resolveRow(line, 0, 1 /* already past */, 5000, Long.MAX_VALUE)
+        // A line that has been left behind is fully sung: all fields equal text length.
+        assertEquals("sung line: wordEnd = text length", line.text.length, frame.wordEnd)
+        assertEquals("sung line: ownedEnd = text length", line.text.length, frame.ownedEnd)
+    }
+
+    @Test
+    fun ownedEndDoesNotMoveWordStart_wordEnd_orSweep() {
+        // ownedEnd is purely a visual ownership hint — it must never affect timing semantics.
+        val line = ttml(
+            """<p begin="00:01.000" end="00:03.000">""" +
+                """<span begin="00:01.000" end="00:01.800">Hello</span> """ +
+                """<span begin="00:02.000" end="00:02.600">world</span></p>"""
+        )
+        val frame = KaraokeFrame()
+        frame.resolve(line, 1400, Long.MAX_VALUE)
+        val ws = frame.wordStart
+        val we = frame.wordEnd
+        val sw = frame.sweep
+        // Re-resolve at the same position: should be identical
+        frame.resolve(line, 1400, Long.MAX_VALUE)
+        assertEquals(ws, frame.wordStart)
+        assertEquals(we, frame.wordEnd)
+        assertEquals(sw, frame.sweep, 0.0001f)
+        // ownedEnd differs from wordEnd for a non-terminal word.
+        assertTrue("ownedEnd >= wordEnd", frame.ownedEnd >= frame.wordEnd)
+    }
+
+    // =================================== soft feather: gradient geometry must not affect glyph ink
+
+    @Test
+    fun theSoftFeatherDoesNotChangeGlyphGeometryOrInkedWidth() {
+        // The feather changes the gradient *appearance*, never the span ranges, so glyphs must be
+        // identical to the plain (no-shader) render at every sweep value.
+        val bw = 1400; val bh = 220
+        for (text in typographyStrings + shapingStressStrings) {
+            for (width in intArrayOf(1300, 300)) {
+                val plain = renderToPixels(text, width, bw, bh)
+                val refWidth = inkedWidth(plain, bw, bh)
+                val layout = StaticLayout.Builder
+                    .obtain(text, 0, text.length, karaokePaint(), width).build()
+                for (sweep in floatArrayOf(0f, 0.5f, 1f)) {
+                    val styled = SpannableString(text)
+                    val (sungTo, _) = frontOf(text, layout, sweep)
+                    for (run in visualRuns(layout, text.length)) {
+                        val span = if (run.end <= sungTo || run.start >= sungTo) {
+                            newKaraokeSpan(Color.WHITE, null)
+                        } else {
+                            val stop = ((layout.getPrimaryHorizontal(sungTo) - run.left)
+                                    / (run.right - run.left)).coerceIn(0f, 1f)
+                            // Feathered variant with lo = max(0, stop-0.05), hi = stop
+                            val lo = Math.max(0f, stop - 0.05f)
+                            val safeHi = if (stop - lo < 0.001f) lo + 0.001f else stop
+                            newKaraokeSpan(Color.WHITE, LinearGradient(run.left, 0f, run.right, 0f,
+                                intArrayOf(Color.WHITE, Color.WHITE, Color.WHITE, Color.WHITE),
+                                floatArrayOf(0f, lo, safeHi, 1f), Shader.TileMode.CLAMP))
+                        }
+                        styled.setSpan(span, run.start, run.end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                    }
+                    val painted = renderToPixels(styled, width, bw, bh)
+                    var worst = 0
+                    for (i in plain.indices) {
+                        val d = Math.abs(luminance(plain[i]) - luminance(painted[i]))
+                        if (d > worst) worst = d
+                    }
+                    assertTrue("'$text' w=$width sweep=$sweep: feather changed glyphs by $worst levels",
+                        worst <= 2)
+                    assertEquals("'$text' w=$width sweep=$sweep: feather changed inked width",
+                        refWidth, inkedWidth(painted, bw, bh))
+                }
+            }
+        }
+    }
 }
