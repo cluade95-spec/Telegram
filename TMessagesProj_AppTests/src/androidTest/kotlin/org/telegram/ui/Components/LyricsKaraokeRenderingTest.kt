@@ -1873,4 +1873,165 @@ class LyricsKaraokeRenderingTest {
             }
         }
     }
+
+    // ================================ two-phase cursor: explicit TTML end vs start-only
+    // For TTML sources with explicit word ends the cursor runs in two separate phases:
+    //   Phase A (sweep 0→1 during [wordStartTime, wordEndTime]): cursor traverses the word's
+    //   own glyph clusters. gapProgress stays 0 throughout.
+    //   Phase B (gapProgress 0→1 during [wordEndTime, nextWordStartTime]): cursor traverses
+    //   the physical whitespace gap. sweep stays 1 throughout.
+    // For start-only (LRC) sources hasExplicitWordEnd is false, gapProgress stays 0, and sweep
+    // covers the entire owned interval (glyphs + gap) as one continuous sweep.
+
+    @Test
+    fun explicitTtmlEnd_phaseAAndPhaseBAreSeparate() {
+        // Fixture: "Hello world" — Hello 1000–1800ms, world 2000–2600ms.
+        // Phase A drives glyphs during 1000→1800. Phase B drives the whitespace gap 1800→2000.
+        val line = statedEnds()
+        val frame = KaraokeFrame()
+
+        // t=1000: word just started, fill at zero, no gap progress
+        frame.resolve(line, 1000, Long.MAX_VALUE)
+        assertTrue("t=1000: source has explicit end", frame.hasExplicitWordEnd)
+        assertEquals("t=1000: sweep starts at 0", 0f, frame.sweep, 0.0001f)
+        assertEquals("t=1000: no gap progress yet", 0f, frame.gapProgress, 0.0001f)
+
+        // t=1400: 400ms into the 800ms glyph window → sweep = 0.5
+        frame.resolve(line, 1400, Long.MAX_VALUE)
+        assertEquals("t=1400: halfway through 800ms", 0.5f, frame.sweep, 0.01f)
+        assertEquals("t=1400: still in glyph phase", 0f, frame.gapProgress, 0.0001f)
+
+        // t=1799: 799/800ms through the glyph window — almost done, still Phase A
+        frame.resolve(line, 1799, Long.MAX_VALUE)
+        assertTrue("t=1799: sweep nearly 1 but not yet complete", frame.sweep > 0.99f && frame.sweep < 1f)
+        assertEquals("t=1799: gapProgress = 0 before authored word end", 0f, frame.gapProgress, 0.0001f)
+
+        // t=1800: exactly at authored word end — glyphs fully sung, gap NOT yet started
+        frame.resolve(line, 1800, Long.MAX_VALUE)
+        assertEquals("t=1800: sweep reaches 1 at authored end", 1f, frame.sweep, 0.0001f)
+        assertEquals("t=1800: gapProgress = 0 exactly at authored end (gap not yet open)", 0f, frame.gapProgress, 0.0001f)
+
+        // t=1900: 100ms into the 200ms gap (1800→2000) → gapProgress = 0.5
+        frame.resolve(line, 1900, Long.MAX_VALUE)
+        assertEquals("t=1900: sweep stays 1 during gap phase", 1f, frame.sweep, 0.0001f)
+        assertEquals("t=1900: gap halfway (100ms of 200ms)", 0.5f, frame.gapProgress, 0.01f)
+
+        // t=1999: 199ms into the gap — cursor almost at next word
+        frame.resolve(line, 1999, Long.MAX_VALUE)
+        assertEquals("t=1999: sweep stays 1", 1f, frame.sweep, 0.0001f)
+        assertTrue("t=1999: gap nearly complete", frame.gapProgress > 0.99f && frame.gapProgress < 1f)
+
+        // t=2000: "world" becomes current — fresh word, fresh state
+        frame.resolve(line, 2000, Long.MAX_VALUE)
+        assertEquals("t=2000: world is current", line.segments.startOffset(1), frame.wordStart)
+        assertEquals("t=2000: world's fill starts at 0", 0f, frame.sweep, 0.0001f)
+        assertEquals("t=2000: gapProgress resets for new word", 0f, frame.gapProgress, 0.0001f)
+    }
+
+    @Test
+    fun startOnly_sweepAdvancesContinuouslyWithNoGapProgress() {
+        // Start-only (LRC): hasExplicitWordEnd = false, gapProgress = 0 throughout.
+        // The single sweep covers glyphs and whitespace gap in one unbroken advance.
+        val line = lrc("[00:01.000]<00:01.000>Hello <00:02.000>world")
+        val frame = KaraokeFrame()
+
+        frame.resolve(line, 1000, Long.MAX_VALUE)
+        assertFalse("start-only source: hasExplicitWordEnd is false", frame.hasExplicitWordEnd)
+        assertEquals("t=1000: sweep at 0", 0f, frame.sweep, 0.0001f)
+        assertEquals("t=1000: no gap progress", 0f, frame.gapProgress, 0.0001f)
+
+        // t=1500: halfway through the 1000ms ownership interval (1000→2000)
+        frame.resolve(line, 1500, Long.MAX_VALUE)
+        assertEquals("t=1500: sweep halfway", 0.5f, frame.sweep, 0.01f)
+        assertEquals("no gap progress", 0f, frame.gapProgress, 0.0001f)
+
+        // Continuity across the whole interval: no jump at any boundary
+        var prevSweep = frame.sweep
+        for (t in 1501L..1999L) {
+            frame.resolve(line, t, Long.MAX_VALUE)
+            assertFalse("hasExplicitWordEnd is false at t=$t", frame.hasExplicitWordEnd)
+            assertTrue("sweep non-decreasing at t=$t (was $prevSweep, now ${frame.sweep})",
+                frame.sweep >= prevSweep - 0.0001f)
+            assertEquals("gapProgress = 0 at t=$t", 0f, frame.gapProgress, 0.0001f)
+            prevSweep = frame.sweep
+        }
+    }
+
+    @Test
+    fun monotonicPhysicalCursor_sweepThenGapProgressNeverReverse() {
+        // The cursor's virtual position — sweep in Phase A, gapProgress in Phase B — must never
+        // go backwards as time advances. This guards the "Hello un-sings" regression.
+        val line = statedEnds()  // Hello 1000-1800, world 2000-2600
+        val frame = KaraokeFrame()
+
+        // Phase A: glyph phase 1000ms up to (not including) 1800ms
+        var prevSweep = -1f
+        for (t in 1000L until 1800L) {
+            frame.resolve(line, t, Long.MAX_VALUE)
+            assertTrue("sweep non-decreasing in Phase A at t=$t", frame.sweep >= prevSweep - 0.0001f)
+            assertEquals("no gap progress during Phase A at t=$t", 0f, frame.gapProgress, 0.0001f)
+            prevSweep = frame.sweep
+        }
+
+        // Boundary: exactly at authored word end
+        frame.resolve(line, 1800, Long.MAX_VALUE)
+        assertEquals("sweep=1 at authored word end", 1f, frame.sweep, 0.0001f)
+        assertEquals("gapProgress=0 at authored word end (Phase B not yet open)", 0f, frame.gapProgress, 0.0001f)
+
+        // Phase B: gap phase 1801ms→1999ms — sweep stays 1, gapProgress advances
+        var prevGap = 0f
+        for (t in 1801L..1999L) {
+            frame.resolve(line, t, Long.MAX_VALUE)
+            assertEquals("sweep stays 1 in Phase B at t=$t", 1f, frame.sweep, 0.0001f)
+            assertTrue("gapProgress non-decreasing in Phase B at t=$t",
+                frame.gapProgress >= prevGap - 0.0001f)
+            prevGap = frame.gapProgress
+        }
+    }
+
+    @Test
+    fun wrappedLine_ownedEndIsNextWordTextStart() {
+        // KaraokeFrame-level: ownedEnd for "Hello" in a TTML source is the text start of "world"
+        // (the character index of 'w'), giving the gap region. The further narrowing to the current
+        // visual-line boundary (to prevent the cursor crossing a wrap point) happens inside
+        // LyricsTextView.resolveColourBoundaries() via effectiveGapEnd, which requires a real
+        // LyricsTextView instance and is verified by device QA.
+        val line = statedEnds()   // "Hello world": Hello [0,5), space [5,6), world [6,11)
+        val frame = KaraokeFrame()
+        frame.resolve(line, 1400, Long.MAX_VALUE)  // mid Hello
+
+        val worldTextStart = line.segments.startOffset(1)  // = 6
+        assertEquals("ownedEnd is the text start of the next word", worldTextStart, frame.ownedEnd)
+        assertEquals("wordEnd is Hello's exclusive character end", 5, frame.wordEnd)
+        assertEquals("ownedEnd reaches past the space to world's first character", 6, frame.ownedEnd)
+        assertTrue("gap region exists: ownedEnd > wordEnd", frame.ownedEnd > frame.wordEnd)
+    }
+
+    @Test
+    fun authoredEndInvariant_glyphsCompleteBeforeGapOpens() {
+        // The central safety guarantee of the two-phase model:
+        //   • Before wordEndTime: sweep < 1 and gapProgress = 0 (gap cannot consume any of the
+        //     word's authored visual duration).
+        //   • At wordEndTime: sweep = 1 and gapProgress = 0 (all glyph ink sung, gap not yet open).
+        //   • After wordEndTime: gapProgress > 0 (Phase B begins).
+        val line = statedEnds()  // Hello: start=1000ms, end=1800ms
+        val frame = KaraokeFrame()
+
+        // Before authored end: gapProgress must be 0, sweep must be < 1
+        for (t in 1000L until 1800L) {
+            frame.resolve(line, t, Long.MAX_VALUE)
+            assertEquals("gapProgress=0 before wordEndTime at t=$t", 0f, frame.gapProgress, 0.0001f)
+            assertTrue("sweep < 1 before word fully sung at t=$t", frame.sweep < 1f)
+        }
+
+        // Exactly at authored word end: glyphs done, gap not yet open
+        frame.resolve(line, 1800, Long.MAX_VALUE)
+        assertEquals("sweep=1 exactly at wordEndTime", 1f, frame.sweep, 0.0001f)
+        assertEquals("gapProgress=0 at wordEndTime (gap opens strictly after)", 0f, frame.gapProgress, 0.0001f)
+
+        // One ms after: Phase B has opened
+        frame.resolve(line, 1801, Long.MAX_VALUE)
+        assertEquals("sweep stays 1 once glyphs are complete", 1f, frame.sweep, 0.0001f)
+        assertTrue("gapProgress > 0 one ms after wordEndTime", frame.gapProgress > 0f)
+    }
 }

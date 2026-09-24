@@ -3700,7 +3700,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         if (karaoke.resolveRow(currentLyrics.lines.get(karaokeLine), karaokeLine, karaokeLine,
                 karaokePositionMs, karaokeNextLineTimeMs)) {
             ((LyricsTextView) child).setKaraokeFrame(karaoke.wordStart, karaoke.wordEnd,
-                    karaoke.sweep, karaoke.ownedEnd);
+                    karaoke.sweep, karaoke.ownedEnd,
+                    karaoke.hasExplicitWordEnd, karaoke.gapProgress);
         }
     }
 
@@ -3909,7 +3910,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             textView.setLyricTextColor(mutedColor);
             textView.setKaraokeColors(mutedColor, sungColor);
             textView.setKaraokeFrame(rowKaraoke.wordStart, rowKaraoke.wordEnd, rowKaraoke.sweep,
-                    rowKaraoke.ownedEnd);
+                    rowKaraoke.ownedEnd,
+                    rowKaraoke.hasExplicitWordEnd, rowKaraoke.gapProgress);
         } else {
             // Ordinary line-synced text, and any untimed line inside a karaoke document. Line-level
             // hierarchy only: no sweep, no word motion, nothing invented.
@@ -4236,6 +4238,22 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
          * lets the continuous cursor traverse inter-word gaps without snapping.
          */
         public int ownedEnd;
+        /**
+         * True when the source stated an explicit end time for this word (TTML per-span ends).
+         * False for start-only sources (Enhanced LRC) where the ownership interval drives the fill.
+         *
+         * <p>When true, {@link #sweep} covers only the authored glyph duration, and {@link
+         * #gapProgress} drives the post-word gap animation separately. When false, {@link #sweep}
+         * covers the entire owned interval (glyphs + gap) as one continuous sweep.
+         */
+        public boolean hasExplicitWordEnd;
+        /**
+         * Gap-phase progress: 0 during the glyph phase (or for start-only words), then 0→1 while
+         * the cursor traverses the physical whitespace between this word's glyph end and the next
+         * word's visual start. Only meaningful when {@link #hasExplicitWordEnd} is true and
+         * {@link #sweep} has already reached 1.
+         */
+        public float gapProgress;
 
         public void clear() {
             active = false;
@@ -4244,6 +4262,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             wordEnd = 0;
             sweep = 0f;
             ownedEnd = 0;
+            hasExplicitWordEnd = false;
+            gapProgress = 0f;
         }
 
         /**
@@ -4312,6 +4332,30 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             final long elapsed = Math.max(0L, positionMs - start);
             final long sweepMs = sweepWindowMs(segments, index, nextLineTimeMs);
             sweep = sweepMs <= 0 ? 1f : clamp01(elapsed / (float) sweepMs);
+            // For sources with explicit per-word end times (TTML), split the visual animation into
+            // two phases so the authored glyph duration is respected exactly:
+            //   Phase A (sweep 0→1 during [startTime, endTime]): cursor traverses the word's own
+            //   glyph clusters only.
+            //   Phase B (gapProgress 0→1 during [endTime, nextStartTime]): cursor traverses the
+            //   physical gap (whitespace) between this word's glyph end and the next word's start.
+            // For start-only sources, gapProgress stays 0 and the single sweep covers both glyph
+            // and gap clusters over the full ownership interval.
+            hasExplicitWordEnd = segments.hasEndTime(index);
+            gapProgress = 0f;
+            if (hasExplicitWordEnd && ownedEnd > wordEnd) {
+                final long wordEndTimeMs = segments.endTimeMs(index);
+                if (positionMs > wordEndTimeMs) {
+                    final long gapStartMs = wordEndTimeMs;
+                    final long gapEndMs = (index + 1 < segments.size())
+                            ? segments.startTimeMs(index + 1) : nextLineTimeMs;
+                    if (gapEndMs > gapStartMs) {
+                        gapProgress = clamp01(
+                                (positionMs - gapStartMs) / (float) (gapEndMs - gapStartMs));
+                    } else {
+                        gapProgress = 1f;
+                    }
+                }
+            }
             active = true;
             return true;
         }
@@ -4697,6 +4741,10 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         private float sweep;
         /** Owned visual end: next word's start (or line end for terminal word). See KaraokeFrame. */
         private int wordOwnedEnd;
+        /** See {@link KaraokeFrame#hasExplicitWordEnd}. */
+        private boolean wordHasExplicitEnd;
+        /** See {@link KaraokeFrame#gapProgress}. */
+        private float wordGapProgress;
         /** The colour boundaries the spans currently carry, so an unchanged frame re-sets nothing. */
         private int spanSungTo = -1;
         private int spanWordTo = -1;
@@ -4784,7 +4832,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
          * position, so pushing the same position twice is a no-op and a settled line costs nothing
          * per tick.
          */
-        void setKaraokeFrame(int start, int end, float sweepProgress, int ownedEnd) {
+        void setKaraokeFrame(int start, int end, float sweepProgress, int ownedEnd,
+                             boolean hasExplicitEnd, float gapProgress) {
             if (karaokeText == null) return;
             // A row that was not painting karaoke a moment ago - a fresh bind, a recycled view, a
             // line that has just become relevant - carries no spans at all, so its first frame
@@ -4805,6 +4854,14 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             }
             if (wordOwnedEnd != ownedEnd) {
                 wordOwnedEnd = ownedEnd;
+                changed = true;
+            }
+            if (wordHasExplicitEnd != hasExplicitEnd) {
+                wordHasExplicitEnd = hasExplicitEnd;
+                changed = true;
+            }
+            if (Math.abs(wordGapProgress - gapProgress) > 0.005f) {
+                wordGapProgress = gapProgress;
                 changed = true;
             }
             if (Math.abs(sweep - sweepProgress) > 0.0015f) {
@@ -4842,39 +4899,102 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             float revealed = 0f;
             int sungTo;
             int wordTo;
-            // Owned end clamped to the visual line wordStart is on, so the cursor never crosses a
-            // line-wrap boundary. This lets sweep=1 colour the trailing whitespace gap (the space
-            // between this word and the next) as sung, eliminating the snapping artefact.
-            final int effectiveOwnedEnd;
+
+            // The gap end (ownedEnd) is clamped to the same visual line as wordStart, so the cursor
+            // never crosses a line-wrap boundary whether it is traversing glyphs or the trailing gap.
+            final int effectiveGapEnd;
             if (wordOwnedEnd > wordEnd) {
                 final Layout layout = getLayout();
                 if (layout != null && wordStart >= 0 && wordStart < karaokeText.length()) {
                     final int visualLine = layout.getLineForOffset(wordStart);
-                    effectiveOwnedEnd = Math.min(wordOwnedEnd, layout.getLineEnd(visualLine));
+                    effectiveGapEnd = Math.min(wordOwnedEnd, layout.getLineEnd(visualLine));
                 } else {
-                    effectiveOwnedEnd = wordOwnedEnd;
+                    effectiveGapEnd = wordOwnedEnd;
                 }
             } else {
-                effectiveOwnedEnd = wordEnd;
+                effectiveGapEnd = wordEnd;
             }
+
+            // For sources with explicit word-end times (TTML), presentation is two phases:
+            //   Phase A (gapProgress == 0): sweep covers the word's own glyph clusters only.
+            //   Phase B (gapProgress > 0): glyph portion fully sung; gapProgress covers the gap.
+            // For start-only sources (hasExplicitEnd == false), a single sweep covers the entire
+            // owned span (glyphs + gap), reproducing the pre-Phase-B behavior exactly.
+            final boolean inGapPhase = wordHasExplicitEnd && wordGapProgress > 0f;
+            // During the glyph phase of an explicit-end word the traversal stops at wordEnd;
+            // for start-only words it extends to the owned gap end.
+            final int effectiveOwnedEnd = (wordHasExplicitEnd && !inGapPhase) ? wordEnd : effectiveGapEnd;
+
             if (wordEnd <= wordStart) {
                 sungTo = wordTo = wordStart;
+            } else if (inGapPhase) {
+                // ── Gap phase: glyph clusters fully sung; animate gap clusters by gapProgress ──
+                if (wordGapProgress >= 1f || effectiveGapEnd <= wordEnd) {
+                    sungTo = wordTo = effectiveGapEnd;
+                } else if (clusterGeometryCount != clusterCount || clusterCount == 0) {
+                    // Layout not yet measured; hold cursor at word end until geometry arrives.
+                    sungTo = wordTo = wordEnd;
+                } else {
+                    // Sum the physical width of all gap clusters (spaces between words).
+                    float gapTotal = 0f;
+                    for (int i = 0; i < clusterCount; i++) {
+                        final int offset = clusterStart[i];
+                        if (offset < wordEnd) continue;
+                        if (offset >= effectiveGapEnd) break;
+                        if (!clusterHasRect[i]) continue;
+                        gapTotal += clusterRight[i] - clusterLeft[i];
+                    }
+                    if (gapTotal <= 0f) {
+                        // No gap geometry on this visual line; snap cursor to gap end.
+                        sungTo = wordTo = effectiveGapEnd;
+                    } else {
+                        final float reveal = wordGapProgress * gapTotal;
+                        float consumed = 0f;
+                        for (int i = 0; i < clusterCount; i++) {
+                            final int offset = clusterStart[i];
+                            if (offset < wordEnd) continue;
+                            if (offset >= effectiveGapEnd) break;
+                            if (!clusterHasRect[i]) continue;
+                            final float width = clusterRight[i] - clusterLeft[i];
+                            if (reveal < consumed + width) {
+                                front = i;
+                                revealed = reveal - consumed;
+                                if (revealed < 0f) revealed = 0f;
+                                break;
+                            }
+                            consumed += width;
+                        }
+                        if (front < 0) {
+                            sungTo = wordTo = effectiveGapEnd;
+                        } else {
+                            sungTo = clusterStart[front];
+                            wordTo = (front + 1 < clusterCount)
+                                    ? clusterStart[front + 1] : effectiveGapEnd;
+                        }
+                    }
+                }
             } else if (sweep >= 1f) {
+                // Word complete: for explicit-end glyph phase this reaches wordEnd;
+                // for start-only this reaches the full ownership end.
                 sungTo = wordTo = effectiveOwnedEnd;
             } else if (clusterGeometryCount != clusterCount || clusterCount == 0) {
-                // Not laid out yet. The word reads as still to come, and the next tick - by which
-                // time there is a layout - puts the fill where the clock says it is.
+                // Not laid out yet. The word reads as still to come, and the next tick — by which
+                // time there is a layout — puts the fill where the clock says it is.
                 sungTo = wordTo = wordStart;
             } else {
+                // ── Glyph phase (or start-only single sweep) ──
+                // For start-only words: effectiveOwnedEnd == effectiveGapEnd, so blank clusters
+                // in the gap range are included (isBlankCluster guard only covers offset < wordEnd).
+                // For explicit-end glyph phase: effectiveOwnedEnd == wordEnd, so the loop cannot
+                // reach gap clusters regardless of the blank cluster guard.
                 float total = 0f;
                 for (int i = 0; i < clusterCount; i++) {
                     final int offset = clusterStart[i];
                     if (offset < wordStart) continue;
                     if (offset >= effectiveOwnedEnd) break;
                     if (!clusterHasRect[i]) continue;
-                    // Within the word's own glyph range, skip blanks (existing behavior).
-                    // In the owned gap beyond wordEnd, include blank clusters so the cursor
-                    // traverses the physical whitespace in Layout coordinates.
+                    // Within the word's own glyph range, skip blank clusters.
+                    // Beyond wordEnd (start-only gap range), include them.
                     if (isBlankCluster(i) && offset < wordEnd) continue;
                     total += clusterRight[i] - clusterLeft[i];
                 }
@@ -4902,7 +5022,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                         sungTo = wordTo = effectiveOwnedEnd;
                     } else {
                         sungTo = clusterStart[front];
-                        wordTo = clusterStart[front + 1];
+                        wordTo = (front + 1 < clusterCount)
+                                ? clusterStart[front + 1] : effectiveOwnedEnd;
                     }
                 }
             }
@@ -5257,6 +5378,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             wordEnd = 0;
             sweep = 0f;
             wordOwnedEnd = 0;
+            wordHasExplicitEnd = false;
+            wordGapProgress = 0f;
             requestedStart = -1;
             requestedEnd = -1;
             spanSungTo = -1;
