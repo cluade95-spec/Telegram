@@ -1350,6 +1350,10 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             protected void onDraw(android.graphics.Canvas canvas) {
                 final int w = getWidth(), h = getHeight();
                 final int bg = getThemedColor(Theme.key_player_background);
+                // Provisional fade height (72dp) — not verified against Apple Music measurements.
+                // This overlay paints opaque player-background rectangles; it is an approximation
+                // of a true alpha mask (DST_IN) that is safe for flat backgrounds but does not
+                // composite correctly over heterogeneous content. It must not intercept touch.
                 final int fadeH = Math.min(dp(72), h / 3);
                 // Top fade: opaque background -> transparent
                 fadePaint.setShader(new LinearGradient(0, 0, 0, fadeH,
@@ -2355,6 +2359,13 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             params.topMargin = top;
             lyricsListView.setLayoutParams(params);
         }
+        if (lyricsViewportFade != null) {
+            FrameLayout.LayoutParams fadeParams = (FrameLayout.LayoutParams) lyricsViewportFade.getLayoutParams();
+            if (fadeParams.topMargin != top) {
+                fadeParams.topMargin = top;
+                lyricsViewportFade.setLayoutParams(fadeParams);
+            }
+        }
         if (lyricsExpandButton != null) {
             FrameLayout.LayoutParams expandParams = (FrameLayout.LayoutParams) lyricsExpandButton.getLayoutParams();
             int expandTop = top + dp(4);
@@ -3097,6 +3108,11 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         FrameLayout.LayoutParams lyricsParams = (FrameLayout.LayoutParams) lyricsListView.getLayoutParams();
         lyricsParams.bottomMargin = dp(height);
         lyricsListView.setLayoutParams(lyricsParams);
+        if (lyricsViewportFade != null) {
+            FrameLayout.LayoutParams fadeParams = (FrameLayout.LayoutParams) lyricsViewportFade.getLayoutParams();
+            fadeParams.bottomMargin = dp(height);
+            lyricsViewportFade.setLayoutParams(fadeParams);
+        }
         fullscreenPlayerLayoutApplied = fullscreen;
         applyProfileButtonsVisibility(false);
 
@@ -3597,9 +3613,11 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
     /** How much of it text that has not been sung takes, at rest and on the current line. */
     private static final float KARAOKE_MUTED_REST = 0.10f;
     private static final float KARAOKE_MUTED_ACTIVE = 0.30f;
-    /** Physical width of the soft sung/unsung boundary feather, in dp. */
+    /** Physical width of the soft sung/unsung boundary feather, in dp.
+     *  Provisional tuning value — not verified against Apple Music measurements. */
     private static final float KARAOKE_FEATHER_DP = 7f;
-    /** Scale applied to the line the vocalist is currently singing. Reading-edge pivot. */
+    /** Scale applied to the line the vocalist is currently singing. Reading-edge pivot.
+     *  Provisional tuning value — not verified against Apple Music measurements. */
     private static final float KARAOKE_ACTIVE_SCALE = 1.015f;
 
     /** Resolved once per document: true only when some line genuinely states inline word timing. */
@@ -3868,7 +3886,13 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         final float scale = lerp(1f, KARAOKE_ACTIVE_SCALE, focus);
         child.setScaleX(scale);
         child.setScaleY(scale);
-        child.setPivotX(LocaleController.isRTL ? child.getWidth() : 0f);
+        // Pivot at the reading edge of the lyric text — derived from the lyric layout's own
+        // paragraph direction, NOT the app UI locale, so RTL lyrics on an LTR device pivot
+        // correctly and vice versa.
+        final android.text.Layout lyricsTextLayout = textView != null ? textView.getLayout() : null;
+        final boolean lyricsRtl = lyricsTextLayout != null
+                && lyricsTextLayout.getParagraphDirection(0) == android.text.Layout.DIR_RIGHT_TO_LEFT;
+        child.setPivotX(lyricsRtl ? child.getWidth() : 0f);
         child.setPivotY(child.getHeight() / 2f);
         if (textView == null) return;
         textView.setDepthBlur(lerp(depth * dp(KARAOKE_BLUR_MAX_DP), 0f, focus));
@@ -4847,7 +4871,11 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                     final int offset = clusterStart[i];
                     if (offset < wordStart) continue;
                     if (offset >= effectiveOwnedEnd) break;
-                    if (isBlankCluster(i) || !clusterHasRect[i]) continue;
+                    if (!clusterHasRect[i]) continue;
+                    // Within the word's own glyph range, skip blanks (existing behavior).
+                    // In the owned gap beyond wordEnd, include blank clusters so the cursor
+                    // traverses the physical whitespace in Layout coordinates.
+                    if (isBlankCluster(i) && offset < wordEnd) continue;
                     total += clusterRight[i] - clusterLeft[i];
                 }
                 if (total <= 0f) {
@@ -4859,7 +4887,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                         final int offset = clusterStart[i];
                         if (offset < wordStart) continue;
                         if (offset >= effectiveOwnedEnd) break;
-                        if (isBlankCluster(i) || !clusterHasRect[i]) continue;
+                        if (!clusterHasRect[i]) continue;
+                        if (isBlankCluster(i) && offset < wordEnd) continue;
                         final float width = clusterRight[i] - clusterLeft[i];
                         if (reveal < consumed + width) {
                             front = i;

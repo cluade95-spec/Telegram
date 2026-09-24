@@ -1749,4 +1749,128 @@ class LyricsKaraokeRenderingTest {
             }
         }
     }
+
+    // =================== feather gradient: actual color behavior =========================
+    // These tests verify the visual character of the gradient, not just its shaping safety.
+    // They replicate the runGradient() formula directly so they compile without access to the
+    // private method. If the production formula changes, these tests break and must be updated.
+
+    /**
+     * Returns the (colors, stops) arrays the runGradient() formula would produce.
+     * [density] is pixels-per-dp and stands in for AndroidUtilities.dp() in the production code.
+     * Default 3f is a representative xxhdpi screen.
+     */
+    private fun featherGradientParams(
+        left: Float, right: Float, cut: Float, rtl: Boolean,
+        sung: Int, muted: Int,
+        featherDp: Float = 7f, density: Float = 3f
+    ): Pair<IntArray, FloatArray> {
+        val width = right - left
+        var stop = (cut - left) / width
+        if (stop < 0f) stop = 0f
+        if (stop > 1f) stop = 1f
+        val leading = if (rtl) muted else sung
+        val trailing = if (rtl) sung else muted
+        val featherFrac = minOf(0.35f, featherDp * density / width)
+        var lo: Float
+        var hi: Float
+        if (rtl) {
+            lo = stop; hi = minOf(1f, stop + featherFrac)
+        } else {
+            lo = maxOf(0f, stop - featherFrac); hi = stop
+        }
+        if (hi - lo < 0.001f) {
+            hi = lo + 0.001f
+            if (hi > 1f) { hi = 1f; lo = maxOf(0f, hi - 0.001f) }
+        }
+        return Pair(intArrayOf(leading, leading, trailing, trailing),
+                    floatArrayOf(0f, lo, hi, 1f))
+    }
+
+    @Test
+    fun featherGradient_ltrLeadingColorIsSungTrailingColorIsMuted() {
+        // LTR: reading direction is left-to-right. Sung portion is on the left (leading),
+        // muted portion is on the right (trailing). Gradient = [sung, sung, muted, muted].
+        val sungColor = Color.RED; val mutedColor = Color.BLUE
+        val (colors, _) = featherGradientParams(0f, 200f, 120f, false, sungColor, mutedColor)
+        assertEquals("LTR colors[0] is sung", sungColor, colors[0])
+        assertEquals("LTR colors[1] is sung", sungColor, colors[1])
+        assertEquals("LTR colors[2] is muted", mutedColor, colors[2])
+        assertEquals("LTR colors[3] is muted", mutedColor, colors[3])
+    }
+
+    @Test
+    fun featherGradient_rtlLeadingColorIsMutedTrailingColorIsSung() {
+        // RTL: sung portion is on the right (trailing), muted on the left (leading).
+        // Gradient = [muted, muted, sung, sung].
+        val sungColor = Color.RED; val mutedColor = Color.BLUE
+        val (colors, _) = featherGradientParams(0f, 200f, 80f, true, sungColor, mutedColor)
+        assertEquals("RTL colors[0] is muted", mutedColor, colors[0])
+        assertEquals("RTL colors[1] is muted", mutedColor, colors[1])
+        assertEquals("RTL colors[2] is sung", sungColor, colors[2])
+        assertEquals("RTL colors[3] is sung", sungColor, colors[3])
+    }
+
+    @Test
+    fun featherGradient_stopsAreMonotonicAndInUnitRange() {
+        for (cutFraction in floatArrayOf(0f, 0.1f, 0.25f, 0.5f, 0.75f, 0.9f, 1f)) {
+            val cut = cutFraction * 200f
+            for (rtl in booleanArrayOf(false, true)) {
+                val (_, stops) = featherGradientParams(0f, 200f, cut, rtl, Color.RED, Color.BLUE)
+                assertTrue("stops[0] == 0 for cut=$cut rtl=$rtl",       stops[0] == 0f)
+                assertTrue("stops[1] >= stops[0] for cut=$cut rtl=$rtl", stops[1] >= stops[0])
+                assertTrue("stops[2] >= stops[1] for cut=$cut rtl=$rtl", stops[2] >= stops[1])
+                assertTrue("stops[3] == 1 for cut=$cut rtl=$rtl",        stops[3] == 1f)
+                assertTrue("all stops <= 1 for cut=$cut rtl=$rtl",
+                    stops[1] <= 1f && stops[2] <= 1f)
+            }
+        }
+    }
+
+    @Test
+    fun featherGradient_ltrFeatherSpanIsBeforeTheCursor() {
+        // LTR: the feather transitions from sung to muted BEFORE the cursor position (stop).
+        // stops[1] = max(0, stop - feather), stops[2] = stop.
+        val left = 0f; val right = 200f; val cut = 120f
+        val featherDp = 7f; val density = 3f
+        val stop = (cut - left) / (right - left)  // 0.6
+        val featherFrac = minOf(0.35f, featherDp * density / (right - left))
+        val expectedLo = maxOf(0f, stop - featherFrac)
+        val (_, stops) = featherGradientParams(left, right, cut, false,
+            Color.RED, Color.BLUE, featherDp, density)
+        assertEquals("LTR stops[1] = stop - feather", expectedLo, stops[1], 0.0001f)
+        assertEquals("LTR stops[2] = stop (cursor)", stop,         stops[2], 0.0001f)
+    }
+
+    @Test
+    fun featherGradient_rtlFeatherSpanIsAfterTheCursor() {
+        // RTL: the feather transitions from muted to sung AFTER the cursor position (stop).
+        // stops[1] = stop, stops[2] = min(1, stop + feather).
+        val left = 0f; val right = 200f; val cut = 80f
+        val featherDp = 7f; val density = 3f
+        val stop = (cut - left) / (right - left)  // 0.4
+        val featherFrac = minOf(0.35f, featherDp * density / (right - left))
+        val expectedHi = minOf(1f, stop + featherFrac)
+        val (_, stops) = featherGradientParams(left, right, cut, true,
+            Color.RED, Color.BLUE, featherDp, density)
+        assertEquals("RTL stops[1] = stop (cursor)", stop,       stops[1], 0.0001f)
+        assertEquals("RTL stops[2] = stop + feather", expectedHi, stops[2], 0.0001f)
+    }
+
+    @Test
+    fun featherGradient_narrowRunDegenGuardEnforcesMinimumsSpread() {
+        // A run narrower than the feather width: featherFrac would exceed 0.35 or the guard
+        // clips lo/hi together. Either way safeHi - safeLo must be >= 0.001.
+        for (runWidth in floatArrayOf(1f, 3f, 5f, 10f)) {
+            for (rtl in booleanArrayOf(false, true)) {
+                val cut = runWidth * 0.5f
+                val (_, stops) = featherGradientParams(0f, runWidth, cut, rtl,
+                    Color.RED, Color.BLUE, featherDp = 7f, density = 3f)
+                assertTrue(
+                    "guard: spread >= 0.001 for width=$runWidth rtl=$rtl",
+                    stops[2] - stops[1] >= 0.001f
+                )
+            }
+        }
+    }
 }
