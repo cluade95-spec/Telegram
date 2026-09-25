@@ -3245,7 +3245,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
      * the next timestamp the row is already scrolling off and fading down. Anything decorative
      * that must be SEEN on the outgoing line has to finish by then, not by the timestamp.
      */
-    static long lyricFollowLeadMs(long gapMs) {
+    static long lyricFollowLeadMs(long gapMs, boolean wordTimed) {
+        if (wordTimed) return Math.min(LYRIC_FOLLOW_LEAD_MAX, gapMs);
         return Math.min(LYRIC_FOLLOW_LEAD_MAX, Math.max(80, gapMs / 2));
     }
     private static final long LYRIC_FOLLOW_MIN_MS = 160;
@@ -3448,7 +3449,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             final long previousTime = line < 0 ? 0 : currentLyrics.lines.get(line).timeMs;
             final long untilNext = nextTime - position;
             final long gap = Math.max(1, nextTime - previousTime);
-            final long lead = lyricFollowLeadMs(gap);
+            final long lead = lyricFollowLeadMs(gap, lyricsWordTimed);
             final int nextRow = rowForLyricsLine(line + 1);
             if (untilNext <= lead) {
                 // Inside the lead window: move toward the next line now. A blank timestamp has no
@@ -3533,40 +3534,74 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         final int viewportH = lyricsListView.getHeight();
         final float staggerRatio = viewportH > 0 ? Math.min(1f, Math.abs(distance) / (float) viewportH) : 0f;
         final long itemDelayMs = Math.round(ROW_ITEM_DELAY_MAX_MS + staggerRatio * (ROW_ITEM_DELAY_MIN_MS - ROW_ITEM_DELAY_MAX_MS));
-        final long finalDuration = duration;
         // Distance-derived deceleration: factor ≈ 1 for normal moves → power-2 ease-out. Reference-derived (Apple Music).
         final double decelerationExp = 2.0 * (1.0 + Math.min(Math.abs(distance), 1_000_000f) / 1_000_000.0);
+        // Extend total duration to cover the longest-delayed trailing row; tail rows continue
+        // settling after the main scroll has finished rather than being squeezed into it.
+        long maxRowDelay = 0;
+        for (int ci = 0; ci < lyricsListView.getChildCount(); ci++) {
+            final RecyclerView.ViewHolder vh = lyricsListView.findContainingViewHolder(lyricsListView.getChildAt(ci));
+            if (vh == null) continue;
+            final int ap = vh.getAdapterPosition();
+            if (ap != RecyclerView.NO_POSITION && ap > row) {
+                maxRowDelay = Math.max(maxRowDelay, itemDelayMs * (ap - row));
+            }
+        }
+        final long scrollDuration = duration;
+        final long totalDuration = scrollDuration + maxRowDelay;
+        // Capture each row's current translationY for retarget continuity: a re-targeted animation
+        // blends from the captured position rather than snapping to zero.
+        final int childCount = lyricsListView.getChildCount();
+        final float[] startTranslationY = new float[childCount];
+        for (int ci = 0; ci < childCount; ci++) {
+            startTranslationY[ci] = lyricsListView.getChildAt(ci).getTranslationY();
+        }
 
         final int[] applied = {0};
         final ValueAnimator animator = ValueAnimator.ofFloat(0f, 1f);
+        // Linear interpolator: getAnimatedFraction() returns raw t; easing is applied manually so
+        // it is only applied once and scrollDuration / totalDuration arithmetic stays correct.
+        animator.setInterpolator(null);
         animator.addUpdateListener(a -> {
             if (lyricsFollowAnimator != a) return;
-            final float rawT = a.getAnimatedFraction();
-            final float fraction = (float) a.getAnimatedValue();
+            final float rawT = a.getAnimatedFraction();          // genuinely linear [0,1]
+            final float elapsedMs = rawT * totalDuration;
+            // Base scroll fraction: only driven for the first scrollDuration ms.
+            final float scrollRawT = Math.min(1f, totalDuration > 0 ? elapsedMs / scrollDuration : 1f);
+            final float fraction = (float)(1.0 - Math.pow(1.0 - scrollRawT, decelerationExp));
             final int step = Math.round(distance * fraction);
             final int delta = step - applied[0];
             applied[0] = step;
-            if (advancing) lyricsEmphasisProgress = fraction;
+            if (advancing) lyricsEmphasisProgress = Math.min(fraction, 1f);
             if (delta != 0) {
                 lyricsListView.scrollBy(0, delta); // onScrolled repaints the emphasis
             } else if (advancing) {
                 updateLyricsDepth();
             }
-            // Per-row stagger: rows below anchor are held back then eased in with their delay.
+            // Per-row stagger: delayed rows trail behind the anchor with the correct sign.
+            // Positive distance (content scrolls up): delayed row has less fraction → positive
+            // translationY shifts it down = lagging behind the scroll. Reference-derived (Apple Music).
             for (int ci = 0; ci < lyricsListView.getChildCount(); ci++) {
                 final View c = lyricsListView.getChildAt(ci);
                 final RecyclerView.ViewHolder vh = lyricsListView.findContainingViewHolder(c);
-                if (vh == null) continue;
+                if (vh == null) {
+                    c.setTranslationY(0f);
+                    continue;
+                }
                 final int adapterPos = vh.getAdapterPosition();
                 if (adapterPos == RecyclerView.NO_POSITION || adapterPos <= row) {
                     c.setTranslationY(0f);
                     continue;
                 }
                 final long rowDelayMs = itemDelayMs * (adapterPos - row);
-                final float delayFrac = finalDuration > 0 ? Math.min(0.9f, rowDelayMs / (float) finalDuration) : 0f;
-                final float staggeredRawT = rawT <= delayFrac ? 0f : (rawT - delayFrac) / (1f - delayFrac);
-                final float staggeredFraction = 1f - (float) Math.pow(1f - staggeredRawT, decelerationExp);
-                c.setTranslationY((float) distance * (staggeredFraction - fraction));
+                final float rowElapsedMs = Math.max(0f, elapsedMs - rowDelayMs);
+                final float rowRawT = Math.min(1f, scrollDuration > 0 ? rowElapsedMs / scrollDuration : 1f);
+                final float rowFraction = (float)(1.0 - Math.pow(1.0 - rowRawT, decelerationExp));
+                final float staggerOffset = (float) distance * (fraction - rowFraction);
+                // Blend in captured start position so a retargeted animation picks up smoothly.
+                final float decayedStart = ci < startTranslationY.length
+                        ? startTranslationY[ci] * (1f - rawT) : 0f;
+                c.setTranslationY(staggerOffset + decayedStart);
             }
         });
         animator.addListener(new AnimatorListenerAdapter() {
@@ -3574,15 +3609,13 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 if (lyricsFollowAnimator != animation) return;
                 lyricsFollowAnimator = null;
                 if (advancing) resolveLyricsEmphasis();
-                // Clear all stagger translationY offsets; rows reach their final scroll position.
+                // Clear all stagger translationY offsets; rows have reached their final scroll position.
                 for (int ci = 0; ci < lyricsListView.getChildCount(); ci++) {
                     lyricsListView.getChildAt(ci).setTranslationY(0f);
                 }
             }
         });
-        animator.setDuration(duration);
-        // Distance-derived deceleration interpolator. Reference-derived (Apple Music).
-        animator.setInterpolator(t -> (float)(1.0 - Math.pow(1.0 - t, decelerationExp)));
+        animator.setDuration(totalDuration);
         lyricsFollowAnimator = animator;
         animator.start();
     }
@@ -3592,12 +3625,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         final ValueAnimator animator = lyricsFollowAnimator;
         lyricsFollowAnimator = null;
         animator.cancel();
-        // Clear any per-row stagger translationY that the cancelled animation left behind.
-        if (lyricsListView != null) {
-            for (int i = 0; i < lyricsListView.getChildCount(); i++) {
-                lyricsListView.getChildAt(i).setTranslationY(0f);
-            }
-        }
+        // Preserve translationY on cancel: the new animation captures it as startTranslationY[]
+        // and blends from it, so rows pick up smoothly rather than snapping to zero.
     }
 
     private void updateLyricsDepth() {
@@ -3948,25 +3977,25 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         // at the reading edge so the text stays anchored to the margin as it grows.
         child.setAlpha(lerp(KARAOKE_REST_ALPHA - depth * KARAOKE_REST_ALPHA_FALLOFF, KARAOKE_ACTIVE_ALPHA, focus));
         final float lineScale = lerp(1f, KARAOKE_ACTIVE_SCALE, focus);
-        // Long-note word emphasis: eligible words (duration >= 1000ms, 1..7 graphemes) receive an
-        // additional post-layout scale and glow. Pure function of position for seek determinism.
-        float emphasisScale = 1f;
-        float emphasisGlow = 0f;
-        if (wordFrame && rowKaraoke.longNoteEligible && textView != null
-                && visibleLyrics.get(row) == karaokeLine) {
-            final int graphemes = textView.wordGraphemeCount();
-            if (graphemes >= 1 && graphemes <= LONG_NOTE_MAX_GRAPHEMES) {
-                final long elapsed = Math.max(0L, karaokePositionMs - rowKaraoke.wordAbsoluteStartMs);
-                final long animMs = Math.max(1L, Math.min(rowKaraoke.wordDurationMs, LONG_NOTE_MAX_ANIMATION_MS));
-                final float rawT = Math.min(1f, elapsed / (float) animMs);
-                final float easedT = LONG_NOTE_EASING.getInterpolation(rawT);
-                emphasisScale = 1f + (KaraokeFrame.longNoteTargetScale(rowKaraoke.wordDurationMs) - 1f) * easedT;
-                emphasisGlow = LONG_NOTE_MAX_SHADOW_ALPHA * easedT;
+        // Long-note word emphasis: eligible words (explicit end, duration >= 1000ms, 1..7 graphemes)
+        // receive a per-binding glow that rises and returns. Word-local only: scale is not applied
+        // (a sub-view word scale is architecturally impossible without MetricAffectingSpan). Pure
+        // function of position for seek determinism.
+        if (textView != null) {
+            if (wordFrame && rowKaraoke.longNoteEligible && visibleLyrics.get(row) == karaokeLine) {
+                final int graphemes = textView.wordGraphemeCount();
+                if (graphemes >= 1 && graphemes <= LONG_NOTE_MAX_GRAPHEMES) {
+                    final long elapsed = Math.max(0L, karaokePositionMs - rowKaraoke.wordAbsoluteStartMs);
+                    textView.setLongNoteEmphasis(true, elapsed, rowKaraoke.wordDurationMs);
+                } else {
+                    textView.setLongNoteEmphasis(false, -1L, 0L);
+                }
+            } else {
+                textView.setLongNoteEmphasis(false, -1L, 0L);
             }
         }
-        if (textView != null) textView.setLongNoteEmphasis(emphasisScale, emphasisGlow);
-        child.setScaleX(lineScale * emphasisScale);
-        child.setScaleY(lineScale * emphasisScale);
+        child.setScaleX(lineScale);
+        child.setScaleY(lineScale);
         // Pivot at the reading edge of the lyric text — derived from the lyric layout's own
         // paragraph direction, NOT the app UI locale, so RTL lyrics on an LTR device pivot
         // correctly and vice versa.
@@ -3974,10 +4003,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         final boolean lyricsRtl = lyricsTextLayout != null
                 && lyricsTextLayout.getParagraphDirection(0) == android.text.Layout.DIR_RIGHT_TO_LEFT;
         child.setPivotX(lyricsRtl ? child.getWidth() : 0f);
-        // Baseline pivot when long-note emphasis is active; center otherwise. Reference-derived (Apple Music).
-        final float pivotY = emphasisScale > 1.001f && textView != null
-                ? textView.getBaseline() : child.getHeight() / 2f;
-        child.setPivotY(pivotY);
+        child.setPivotY(child.getHeight() / 2f);
         if (textView == null) return;
         textView.setDepthBlur(lerp(depth * dp(KARAOKE_BLUR_MAX_DP), 0f, focus));
         if (wordFrame) {
@@ -4462,7 +4488,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             // validated at display time from the row's layout; here we only gate on duration.
             wordDurationMs = sweepMs > 0 ? sweepMs : ownershipWindowMs(segments, index, nextLineTimeMs);
             wordAbsoluteStartMs = start;
-            longNoteEligible = wordDurationMs >= LONG_NOTE_MIN_DURATION_MS;
+            longNoteEligible = sweepMs > 0 && wordDurationMs >= LONG_NOTE_MIN_DURATION_MS;
             active = true;
             return true;
         }
@@ -4907,10 +4933,12 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         private boolean lyricTextColorSet;
         /** Quantised blur radius currently on the view, or -1 when nothing has been applied yet. */
         private int appliedBlur = -1;
-        /** Long-note scale multiplier (1.0 = none). Composed with lineScale in applyLyricsDepth(). */
-        private float longNoteScale = 1f;
-        /** Long-note glow alpha (0 = none). Applied via KaraokeSpan shadow layer. */
-        private float longNoteGlowAlpha = 0f;
+        /** True when the current word qualifies for long-note glow (authored end, eligible duration). */
+        private boolean longNoteEligible;
+        /** Elapsed ms into the current word for glow animation; -1 = inactive. */
+        private long longNoteElapsedMs = -1L;
+        /** Word duration in ms for the glow rise/return timing. */
+        private long longNoteWordDurationMs = 0L;
         /** True while LAYER_TYPE_SOFTWARE is active for glow rendering. */
         private boolean glowLayerActive;
 
@@ -4947,20 +4975,25 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             setTextColor(color);
         }
 
-        /** Updates the long-note word scale and glow, managing the software layer as needed. */
-        void setLongNoteEmphasis(float scale, float glowAlpha) {
-            final boolean scaleChanged = Math.abs(longNoteScale - scale) >= 0.001f;
-            final boolean glowChanged = Math.abs(longNoteGlowAlpha - glowAlpha) >= 0.005f;
-            if (!scaleChanged && !glowChanged) return;
-            longNoteScale = scale;
-            longNoteGlowAlpha = glowAlpha;
-            final boolean needsGlow = glowAlpha > 0.01f;
+        /**
+         * Pushes long-note glow timing. Per-binding rise/hold/return alpha is computed in
+         * updateAppearance() from elapsed and wordDurationMs, and applied only to runs that
+         * overlap the active word range.
+         */
+        void setLongNoteEmphasis(boolean eligible, long elapsedMs, long wordDurationMs) {
+            final boolean prevEligible = longNoteEligible;
+            final long prevElapsed = longNoteElapsedMs;
+            longNoteEligible = eligible;
+            longNoteElapsedMs = eligible ? elapsedMs : -1L;
+            longNoteWordDurationMs = wordDurationMs;
+            final boolean needsGlow = eligible && longNoteElapsedMs >= 0;
             if (needsGlow != glowLayerActive) {
                 glowLayerActive = needsGlow;
                 setLayerType(needsGlow ? LAYER_TYPE_SOFTWARE : LAYER_TYPE_NONE, null);
             }
-            if (karaokeActive && glowChanged) updateAppearance();
-            invalidate();
+            final boolean changed = eligible != prevEligible || longNoteElapsedMs != prevElapsed;
+            if (karaokeActive && changed) updateAppearance();
+            if (changed) invalidate();
         }
 
         /**
@@ -5225,10 +5258,19 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             final int boundary = boundaryCluster();
             final float cut = boundaryX(boundary);
             final boolean rtl = boundary >= 0 && clusterRtl[boundary];
-            final float glowRadius = longNoteGlowAlpha > 0.01f ? dp(LONG_NOTE_GLOW_RADIUS_DP) : 0f;
-            final int glowColor = glowRadius > 0f
-                    ? ColorUtils.setAlphaComponent(Color.WHITE, Math.round(longNoteGlowAlpha * 255f))
-                    : 0;
+            // Per-binding rise/hold/return glow. Count word-overlapping runs first.
+            int bindingCount = 0;
+            if (longNoteEligible && longNoteElapsedMs >= 0) {
+                for (int r = 0; r < runCount; r++) {
+                    if (runStart[r] < wordEnd && runEnd[r] > wordStart) bindingCount++;
+                }
+            }
+            final long glowAnimMs = bindingCount > 0
+                    ? Math.max(1L, Math.min(longNoteWordDurationMs, LONG_NOTE_MAX_ANIMATION_MS)) : 0L;
+            final long perBindingWindow = bindingCount > 0 ? Math.max(1L, glowAnimMs / bindingCount) : 0L;
+            final long staggerStep = bindingCount > 0
+                    ? KaraokeFrame.longNoteStaggerStepMs(glowAnimMs, bindingCount) : 0L;
+            int bindingIndex = 0;
             for (int r = 0; r < runCount; r++) {
                 final KaraokeSpan span = runSpans[r];
                 if (runEnd[r] <= spanSungTo) {
@@ -5248,7 +5290,39 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                         span.setSolid(mutedColor);
                     }
                 }
-                span.setGlow(glowRadius, glowColor);
+                // Word-local glow only: apply to runs overlapping [wordStart, wordEnd).
+                final boolean isWordBinding = runStart[r] < wordEnd && runEnd[r] > wordStart;
+                if (isWordBinding && bindingCount > 0 && longNoteElapsedMs >= 0) {
+                    final long growStart = staggerStep * bindingIndex;
+                    final long phaseEnd = growStart + perBindingWindow;       // end of rise phase
+                    final long holdEnd = growStart + 2L * perBindingWindow;   // end of hold phase
+                    final long returnEnd = holdEnd + perBindingWindow;        // end of return phase
+                    float alpha;
+                    if (longNoteElapsedMs < growStart) {
+                        alpha = 0f;
+                    } else if (longNoteElapsedMs < phaseEnd) {
+                        final float t = (longNoteElapsedMs - growStart) / (float) perBindingWindow;
+                        alpha = LONG_NOTE_EASING.getInterpolation(Math.min(1f, t)) * LONG_NOTE_MAX_SHADOW_ALPHA;
+                    } else if (longNoteElapsedMs < holdEnd) {
+                        alpha = LONG_NOTE_MAX_SHADOW_ALPHA;
+                    } else if (longNoteElapsedMs < returnEnd) {
+                        final float t = (longNoteElapsedMs - holdEnd) / (float) perBindingWindow;
+                        alpha = (1f - Math.min(1f, t)) * LONG_NOTE_MAX_SHADOW_ALPHA;
+                    } else {
+                        alpha = 0f;
+                    }
+                    if (alpha > 0.01f) {
+                        final float glowRadius = dp(LONG_NOTE_GLOW_RADIUS_DP);
+                        final int glowColor = ColorUtils.setAlphaComponent(Color.WHITE,
+                                Math.round(alpha * 255f));
+                        span.setGlow(glowRadius, glowColor);
+                    } else {
+                        span.setGlow(0f, 0);
+                    }
+                    bindingIndex++;
+                } else {
+                    span.setGlow(0f, 0);
+                }
             }
         }
 
@@ -5358,10 +5432,11 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
 
         /** Returns the row to plain, uniformly coloured text, clearing any long-note emphasis. */
         void clearKaraoke() {
-            final boolean emphasisChanged = longNoteScale != 1f || longNoteGlowAlpha != 0f;
+            final boolean emphasisChanged = longNoteEligible || longNoteElapsedMs >= 0;
             if (emphasisChanged) {
-                longNoteScale = 1f;
-                longNoteGlowAlpha = 0f;
+                longNoteEligible = false;
+                longNoteElapsedMs = -1L;
+                longNoteWordDurationMs = 0L;
                 if (glowLayerActive) {
                     glowLayerActive = false;
                     setLayerType(LAYER_TYPE_NONE, null);

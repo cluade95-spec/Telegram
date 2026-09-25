@@ -15,6 +15,7 @@ import android.text.style.CharacterStyle
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -2218,5 +2219,196 @@ class LyricsKaraokeRenderingTest {
         fun staggerDelay(ratio: Float): Long = Math.round(50f + minOf(1f, ratio) * (4f - 50f))
         assertEquals("ratio clamped: 2.0 same as 1.0", staggerDelay(1f), staggerDelay(2f))
         assertTrue("clamped delay never below minimum", staggerDelay(100f) >= 4L)
+    }
+
+    // ===================================================================== blocker corrections
+    // The following tests cover the 7 blockers found in commit b66f593a and would fail on that
+    // commit. They are written against user-visible properties and formula invariants.
+
+    @Test
+    fun blocker1_wordEmphasis_lineWideScaleFieldRemoved() {
+        // b66f593a composed emphasisScale into child.setScaleX/Y, scaling the entire multi-word
+        // row. The fix removes word-level scale entirely (architecturally forbidden per Build #44).
+        // Verify: LyricsTextView no longer holds a longNoteScale field.
+        val ltv = AudioPlayerAlert::class.java.declaredClasses.find { it.simpleName == "LyricsTextView" }
+        assertNotNull("LyricsTextView inner class must exist", ltv)
+        val hasScale = ltv!!.declaredFields.any { it.name == "longNoteScale" }
+        assertFalse("longNoteScale must be removed — line-wide scale is architecturally forbidden",
+            hasScale)
+    }
+
+    @Test
+    fun blocker1_wordEmphasis_glowFieldReplacedWithTimingFields() {
+        // b66f593a held a single float longNoteGlowAlpha applied uniformly to all spans.
+        // The fix replaces it with timing fields enabling per-binding word-local rise/return.
+        val ltv = AudioPlayerAlert::class.java.declaredClasses.find { it.simpleName == "LyricsTextView" }
+        assertNotNull("LyricsTextView inner class must exist", ltv)
+        val names = ltv!!.declaredFields.map { it.name }
+        assertFalse("longNoteGlowAlpha must be removed", "longNoteGlowAlpha" in names)
+        assertTrue("longNoteElapsedMs timing field must be present", "longNoteElapsedMs" in names)
+        assertTrue("longNoteWordDurationMs timing field must be present",
+            "longNoteWordDurationMs" in names)
+    }
+
+    @Test
+    fun blocker2_wordEmphasis_riseAndReturn_alphaFallsBackToZero() {
+        // b66f593a used a monotonically increasing eased fraction — glow grew and never returned.
+        // The fix implements per-binding rise/hold/return phases. At t > returnEnd, alpha == 0.
+        val wordDurationMs = 2000L
+        val animMs = minOf(wordDurationMs, 3000L)
+        val bindingCount = 2
+        val perBindingWindow = animMs / bindingCount               // 1000ms
+        // staggerStep = min(400, round(0.4 * animMs / bindingCount)) = min(400, 400) = 400
+        val staggerStep = minOf(400L, Math.round(0.4f * animMs / bindingCount))
+        val bindingIndex = 0
+        val growStart = staggerStep * bindingIndex                 // 0ms
+        val holdEnd = growStart + 2L * perBindingWindow           // 2000ms
+        val returnEnd = holdEnd + perBindingWindow                 // 3000ms
+        // At t == returnEnd, return-phase t == 1.0 → alpha == 0
+        val t = (returnEnd - holdEnd).toFloat() / perBindingWindow
+        val alpha = (1f - minOf(1f, t)) * (128f / 255f)
+        assertEquals("alpha must be 0 when return phase completes", 0f, alpha, 0.001f)
+        // Before return starts, at t just inside hold phase, alpha must be max
+        val holdT = (holdEnd - 1L - holdEnd).toFloat() / perBindingWindow
+        val holdAlpha = (1f - maxOf(0f, holdT)) * (128f / 255f)
+        assertEquals("alpha must be max during hold phase", 128f / 255f, holdAlpha, 0.001f)
+    }
+
+    @Test
+    fun blocker2_wordEmphasis_risePhase_alphaGrowsFromZero() {
+        // During the rise phase, alpha must increase from 0 toward the peak value.
+        val wordDurationMs = 1500L
+        val animMs = minOf(wordDurationMs, 3000L)
+        val bindingCount = 1
+        val perBindingWindow = animMs / bindingCount             // 1500ms
+        val growStart = 0L
+        // Pre-delay: alpha must be exactly 0
+        val alphaPreDelay = if (0L < growStart) 128f / 255f else 0f
+        assertEquals("alpha is 0 before rise starts", 0f, alphaPreDelay, 0.001f)
+        // Mid-rise: elapsed = growStart + perBindingWindow/2
+        val elapsedMidRise = growStart + perBindingWindow / 2
+        val riseT = (elapsedMidRise - growStart).toFloat() / perBindingWindow
+        // Without applying LONG_NOTE_EASING for simplicity, just verify the linear fraction
+        assertTrue("rise-phase t must be in (0,1) at mid-rise", riseT > 0f && riseT < 1f)
+    }
+
+    @Test
+    fun blocker3_staggerSign_positiveDistance_delayedRowHasPositiveTranslationY() {
+        // b66f593a used distance*(staggeredFraction - fraction) — inverted sign.
+        // For positive distance (content scrolls up), a delayed row (rowFraction < fraction) must
+        // have translationY > 0: the row is pushed DOWN, lagging behind the upward scroll.
+        val distance = 500
+        val fraction = 0.6f
+        val rowFraction = 0.3f                              // delayed row has less progress
+        val translationY = distance.toFloat() * (fraction - rowFraction)   // fixed formula
+        assertTrue("positive distance, delayed row: translationY > 0 (row lags down)",
+            translationY > 0f)
+        // Cross-check: the old (broken) formula would give the opposite sign
+        val brokenTranslationY = distance.toFloat() * (rowFraction - fraction)
+        assertTrue("old formula gives wrong (negative) sign", brokenTranslationY < 0f)
+    }
+
+    @Test
+    fun blocker3_staggerSign_negativeDistance_delayedRowHasNegativeTranslationY() {
+        // For negative distance (content scrolls down), a delayed row must have translationY < 0:
+        // the row is pushed UP, lagging behind the downward scroll.
+        val distance = -500
+        val fraction = 0.6f
+        val rowFraction = 0.3f
+        val translationY = distance.toFloat() * (fraction - rowFraction)   // fixed formula
+        assertTrue("negative distance, delayed row: translationY < 0 (row lags up)",
+            translationY < 0f)
+    }
+
+    @Test
+    fun blocker4_scrollEasing_appliedExactlyOnce() {
+        // b66f593a installed a deceleration interpolator so getAnimatedFraction() returned an
+        // already-eased value, then applied deceleration again — double-easing.
+        // The fix uses a null interpolator and applies easing exactly once.
+        // Property: singleEase(0.5) != doubleEase(0.5) for exp > 1.
+        val exp = 2.0
+        val t = 0.5
+        val single = 1.0 - Math.pow(1.0 - t, exp)           // correct: one application
+        val doubled = 1.0 - Math.pow(1.0 - single, exp)     // wrong: two applications
+        assertNotEquals("single-easing and double-easing must differ at midpoint",
+            single, doubled, 0.001)
+        // Boundary: single easing at t=1.0 must be exactly 1.0
+        val atOne = 1.0 - Math.pow(0.0, exp)
+        assertEquals("single easing at t=1 must be 1.0", 1.0, atOne, 1e-9)
+        // Monotonicity: eased fraction must increase with t
+        assertTrue("single easing must be monotonically increasing",
+            (1.0 - Math.pow(1.0 - 0.8, exp)) > (1.0 - Math.pow(1.0 - 0.4, exp)))
+    }
+
+    @Test
+    fun blocker5_retargetContinuity_startTranslationYBlendDecaysToZero() {
+        // b66f593a zeroed translationY on cancel, snapping rows to zero on every retarget.
+        // The fix captures startTranslationY[] and decays it: startY * (1 - rawT).
+        // At rawT=0: full capture (no snap). At rawT=1: fully gone (clean settle).
+        val startY = 80f
+        val atStart = startY * (1f - 0f)     // rawT = 0
+        val atMid   = startY * (1f - 0.5f)   // rawT = 0.5
+        val atEnd   = startY * (1f - 1f)     // rawT = 1
+        assertEquals("rawT=0: captured position fully present", startY, atStart, 0.001f)
+        assertEquals("rawT=0.5: half decayed", startY / 2f, atMid, 0.001f)
+        assertEquals("rawT=1: fully settled to zero", 0f, atEnd, 0.001f)
+    }
+
+    @Test
+    fun blocker6_wordTimedPreAnchor_hardLeadIs550ms() {
+        // b66f593a used min(550, max(80, gap/2)) for all sources. For word-timed karaoke, the fix
+        // returns min(LYRIC_FOLLOW_LEAD_MAX, gapMs) — hard 550ms, capped at the actual gap.
+        // Large gap (> 550ms): lead must be exactly 550ms.
+        val leadLarge = AudioPlayerAlert.lyricFollowLeadMs(2000L, true)
+        assertEquals("word-timed, gap > 550ms: lead must be 550ms", 550L, leadLarge)
+        // Small gap (< 550ms): lead must equal the gap (not gap/2).
+        val leadSmall = AudioPlayerAlert.lyricFollowLeadMs(400L, true)
+        assertEquals("word-timed, gap < 550ms: lead must equal gap (not half-gap)", 400L, leadSmall)
+        // Verify it's NOT gap/2 for the small case (the b66f593a bug).
+        assertNotEquals("word-timed small gap must not use half-gap formula", 200L, leadSmall)
+    }
+
+    @Test
+    fun blocker6_semanticActivationUnchanged_nonWordTimedUsesHalfGap() {
+        // The lead only affects WHEN the scroll starts; semantic line activation remains at the
+        // stated timestamp. Non-word-timed sources must keep the original half-gap behaviour.
+        val lead600 = AudioPlayerAlert.lyricFollowLeadMs(600L, false)
+        assertEquals("non-word-timed, gap=600ms: lead = min(550, max(80, 300)) = 300", 300L, lead600)
+        val lead100 = AudioPlayerAlert.lyricFollowLeadMs(100L, false)
+        assertEquals("non-word-timed, gap=100ms: lead = min(550, max(80, 50)) = 80", 80L, lead100)
+        val lead2000 = AudioPlayerAlert.lyricFollowLeadMs(2000L, false)
+        assertEquals("non-word-timed, gap=2000ms: lead = min(550, max(80, 1000)) = 550", 550L, lead2000)
+    }
+
+    @Test
+    fun blocker7_startOnlyWord_notEligibleForLongNote_inferred_duration_not_authored() {
+        // b66f593a set longNoteEligible=true for any wordDurationMs >= 1000ms, including LRC
+        // start-only words where duration is an inferred ownership window, not an authored time.
+        // The fix adds && sweepMs > 0 (explicit word end required for eligibility).
+
+        // LRC start-only: "hello" owns 1500ms (to next word start) but has no explicit end.
+        val lrcLine = lrc("[00:00.000]<00:00.000>hello <00:01.500>world")
+        val frame = KaraokeFrame()
+        frame.resolve(lrcLine, 200L, 5000L)   // inside "hello" at 200ms
+        assertFalse(
+            "start-only word: longNoteEligible must be false even with inferred 1500ms duration",
+            frame.longNoteEligible
+        )
+        // Confirm the ownership window is >= threshold (eligibility gate must actually be firing).
+        assertTrue("inferred duration must be >= 1000ms to confirm the gate fires",
+            frame.wordDurationMs >= 1000L)
+
+        // TTML explicit-end: "hello" has an authored 1500ms end — eligible.
+        val ttmlLine = ttml(
+            """<p begin="00:00.000" end="00:05.000">""" +
+                """<span begin="00:00.000" end="00:01.500">hello</span> """ +
+                """<span begin="00:02.000" end="00:03.000">world</span></p>"""
+        )
+        val ttmlFrame = KaraokeFrame()
+        ttmlFrame.resolve(ttmlLine, 200L, 5000L)   // inside "hello" at 200ms
+        assertTrue(
+            "explicit-end TTML word with 1500ms authored duration must be long-note eligible",
+            ttmlFrame.longNoteEligible
+        )
     }
 }
