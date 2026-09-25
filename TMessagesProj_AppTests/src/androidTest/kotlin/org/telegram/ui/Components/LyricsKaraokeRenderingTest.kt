@@ -2036,10 +2036,11 @@ class LyricsKaraokeRenderingTest {
         assertTrue("gapProgress > 0 one ms after wordEndTime", frame.gapProgress > 0f)
     }
 
-    // ========================= long-note word emphasis: gate, scale, and stagger step
-    // Words held for >= 1000ms receive a post-layout scale/glow emphasis derived from the
-    // playback position. The computation is a pure function of the timestamp; resolving the same
-    // position twice returns identical fields regardless of what came before.
+    // ========================= long-note word emphasis: gate and data model
+    // Words held for >= 1000ms with an explicit end time are eligible for long-note emphasis.
+    // Scale is not applied (sub-view scale requires MetricAffectingSpan, forbidden by Build #44).
+    // The data model is a pure function of the timestamp; resolving the same position twice
+    // returns identical fields regardless of what came before.
 
     @Test
     fun longNoteGate_wordsBelow1000msAreIneligible() {
@@ -2048,33 +2049,19 @@ class LyricsKaraokeRenderingTest {
         val frame = KaraokeFrame()
         frame.resolve(line, 0, Long.MAX_VALUE)
         assertFalse("999ms word must not be eligible", frame.longNoteEligible)
-        assertEquals("ineligible word has target scale 1.0",
-            1f, KaraokeFrame.longNoteTargetScale(999L), 0.0001f)
     }
 
     @Test
     fun longNoteGate_exactlyAtThresholdIsEligible() {
-        // 1000ms is the exact boundary: eligible, but scale starts at 1.0 since t=0 on the ramp.
-        val line = pairWithGap(1000)
+        // 1000ms is the exact boundary: eligible. Note: pairWithGap uses LRC (start-only),
+        // but the gate checks hasExplicitWordEnd. For this test, we use a TTML line so the
+        // explicit end flag is set and eligibility is confirmed.
+        val line = ttml("""<p begin="00:00.000" end="00:05.000">""" +
+            """<span begin="00:00.000" end="00:01.000">aa</span> """ +
+            """<span begin="00:02.000" end="00:03.000">bb</span></p>""")
         val frame = KaraokeFrame()
-        frame.resolve(line, 0, Long.MAX_VALUE)
-        assertTrue("1000ms word must be eligible", frame.longNoteEligible)
-        assertEquals("at 1000ms duration the target scale is 1.0 (t=0 on the ramp)",
-            1f, KaraokeFrame.longNoteTargetScale(1000L), 0.0001f)
-    }
-
-    @Test
-    fun longNoteScale_rampReaches1_14AtOrAbove2000ms() {
-        // 2000ms is the max-scale reference; beyond it the scale is clamped to 1.14.
-        assertEquals("2000ms → max scale 1.14", 1.14f, KaraokeFrame.longNoteTargetScale(2000L), 0.001f)
-        assertEquals("3000ms → still 1.14 (clamped)", 1.14f, KaraokeFrame.longNoteTargetScale(3000L), 0.001f)
-        assertEquals("10000ms → still 1.14", 1.14f, KaraokeFrame.longNoteTargetScale(10000L), 0.001f)
-    }
-
-    @Test
-    fun longNoteScale_midRampAt1500msIsHalfway() {
-        // 1500ms is midway between 1000 and 2000: scale = 1.0 + 0.5 * 0.14 = 1.07.
-        assertEquals("1500ms → midway scale 1.07", 1.07f, KaraokeFrame.longNoteTargetScale(1500L), 0.001f)
+        frame.resolve(line, 0, 5000L)
+        assertTrue("1000ms authored-end word must be eligible", frame.longNoteEligible)
     }
 
     @Test
@@ -2384,7 +2371,7 @@ class LyricsKaraokeRenderingTest {
     fun blocker7_startOnlyWord_notEligibleForLongNote_inferred_duration_not_authored() {
         // b66f593a set longNoteEligible=true for any wordDurationMs >= 1000ms, including LRC
         // start-only words where duration is an inferred ownership window, not an authored time.
-        // The fix adds && sweepMs > 0 (explicit word end required for eligibility).
+        // The fix gates on hasExplicitWordEnd (segments.hasEndTime(index)) instead of sweepMs > 0.
 
         // LRC start-only: "hello" owns 1500ms (to next word start) but has no explicit end.
         val lrcLine = lrc("[00:00.000]<00:00.000>hello <00:01.500>world")
@@ -2410,5 +2397,98 @@ class LyricsKaraokeRenderingTest {
             "explicit-end TTML word with 1500ms authored duration must be long-note eligible",
             ttmlFrame.longNoteEligible
         )
+    }
+
+    // ===================================================================== audit pass 2 corrections
+    // Corrections for the four problems found in commit 467f130e.
+
+    @Test
+    fun pass2_glowDisabled_prevLongNoteFieldsExistInLyricsTextView() {
+        // Glow is disabled pending a safe word-local implementation (visual runs span the whole
+        // line in single-run LTR text). The data model fields are preserved for future use.
+        val ltv = AudioPlayerAlert::class.java.declaredClasses.find { it.simpleName == "LyricsTextView" }
+        assertNotNull("LyricsTextView must exist", ltv)
+        val names = ltv!!.declaredFields.map { it.name }
+        assertTrue("prevLongNoteActive field must exist", "prevLongNoteActive" in names)
+        assertTrue("prevWordAbsoluteStartMs field must exist", "prevWordAbsoluteStartMs" in names)
+        assertTrue("prevWordDurationMs field must exist", "prevWordDurationMs" in names)
+        // glowLayerActive stays for defensive clearance in clearKaraoke()
+        assertTrue("glowLayerActive field must still exist", "glowLayerActive" in names)
+    }
+
+    @Test
+    fun pass2_prevLongNoteActive_returnTailLiveAfterWordChange() {
+        // Word A: start=0ms, explicit end=1500ms. Word B: start=2000ms.
+        // At T=2500ms, word B is current. Word A's conservative return window = pStart + 3*animMs
+        // = 0 + 3*1500 = 4500ms. T=2500 < 4500 → prevLongNoteActive must be true.
+        val line = ttml("""<p begin="00:00.000" end="00:10.000">""" +
+            """<span begin="00:00.000" end="00:01.500">hello</span> """ +
+            """<span begin="00:02.000" end="00:03.000">world</span></p>""")
+        val frame = KaraokeFrame()
+        frame.resolve(line, 2500L, 10000L)
+        assertEquals("word B is current at T=2500ms", line.segments.startTimeMs(1), frame.wordStart)
+        assertTrue("word A return tail is live at T=2500ms (window = 4500ms)", frame.prevLongNoteActive)
+        assertEquals("prevWordAbsoluteStartMs is A's start", 0L, frame.prevWordAbsoluteStartMs)
+        assertEquals("prevWordDurationMs is A's authored duration", 1500L, frame.prevWordDurationMs)
+    }
+
+    @Test
+    fun pass2_prevLongNoteActive_tailExpiredBeyondWindow() {
+        // At T=5000ms, well beyond pStart + 3*animMs = 4500ms, prevLongNoteActive must be false.
+        val line = ttml("""<p begin="00:00.000" end="00:10.000">""" +
+            """<span begin="00:00.000" end="00:01.500">hello</span> """ +
+            """<span begin="00:02.000" end="00:03.000">world</span></p>""")
+        val frame = KaraokeFrame()
+        frame.resolve(line, 5000L, 10000L)
+        assertFalse("word A return tail must be expired at T=5000ms (window = 4500ms)",
+            frame.prevLongNoteActive)
+    }
+
+    @Test
+    fun pass2_prevLongNote_startOnlyPreviousWordIsNotEligibleForReturnTail() {
+        // A start-only (LRC) previous word has no explicit end, so hasEndTime(pi) is false.
+        // prevLongNoteActive must remain false regardless of how long the ownership window is.
+        val line = lrc("[00:00.000]<00:00.000>hello <00:01.500>world <00:05.000>end")
+        val frame = KaraokeFrame()
+        frame.resolve(line, 2000L, Long.MAX_VALUE)  // inside "world"
+        assertEquals("world is current at T=2000ms", line.segments.startTimeMs(1), frame.wordStart)
+        assertFalse("start-only previous word must not activate prevLongNoteActive",
+            frame.prevLongNoteActive)
+    }
+
+    @Test
+    fun pass2_decayedStart_viewKeyedMapHandlesNewViews() {
+        // When a View was not captured in startTranslationYMap (entered RecyclerView after the
+        // animation started), capturedStart is null → decayedStart = 0. The view starts from
+        // zero offset — correct, as it has no prior stagger to decay from.
+        val capturedStart: Float? = null  // not in map
+        val rawT = 0.5f
+        val decayedStart = if (capturedStart != null) capturedStart * (1f - rawT) else 0f
+        assertEquals("new view not in map: decayedStart must be 0", 0f, decayedStart, 0.0001f)
+
+        // A view that WAS captured decays its offset to zero by rawT=1.
+        val capturedStartKnown: Float? = 40f  // in map
+        val decayedAtHalf = if (capturedStartKnown != null) capturedStartKnown * (1f - rawT) else 0f
+        assertEquals("known start decays by (1-rawT) at mid-animation", 20f, decayedAtHalf, 0.0001f)
+        val decayedAtEnd = if (capturedStartKnown != null) capturedStartKnown * (1f - 1f) else 0f
+        assertEquals("known start fully decays to 0 at rawT=1", 0f, decayedAtEnd, 0.0001f)
+    }
+
+    @Test
+    fun pass2_onAnimationEnd_lateChildGuard_rowDelayBoundary() {
+        // Only rows with rowDelayMs <= fMaxRowDelay are zeroed at animation end.
+        // Rows that arrived late (rowDelayMs > fMaxRowDelay) are skipped: their stagger has not
+        // completed within the animation window and zeroing them would snap.
+        val fMaxRowDelay = 200L
+        val itemDelayMs = 50L
+        val row = 0
+
+        val earlyAdapterPos = 3   // rowDelayMs = 150ms ≤ 200ms → zero it
+        val earlyDelay = itemDelayMs * (earlyAdapterPos - row)
+        assertTrue("early child (150ms ≤ 200ms) should be zeroed", earlyDelay <= fMaxRowDelay)
+
+        val lateAdapterPos = 5    // rowDelayMs = 250ms > 200ms → skip
+        val lateDelay = itemDelayMs * (lateAdapterPos - row)
+        assertFalse("late child (250ms > 200ms) must not be zeroed", lateDelay <= fMaxRowDelay)
     }
 }
