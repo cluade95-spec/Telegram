@@ -3597,8 +3597,9 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                     c.setTranslationY(0f);
                     continue;
                 }
-                final long rowDelayMs = itemDelayMs * (adapterPos - row);
-                final float rowElapsedMs = Math.max(0f, elapsedMs - rowDelayMs);
+                final long rawRowDelay = itemDelayMs * (adapterPos - row);
+                final long effectiveRowDelay = Math.min(rawRowDelay, fMaxRowDelay);
+                final float rowElapsedMs = Math.max(0f, elapsedMs - effectiveRowDelay);
                 final float rowRawT = Math.min(1f, scrollDuration > 0 ? rowElapsedMs / scrollDuration : 1f);
                 final float rowFraction = (float)(1.0 - Math.pow(1.0 - rowRawT, decelerationExp));
                 final float staggerOffset = (float) distance * (fraction - rowFraction);
@@ -3614,24 +3615,12 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 if (lyricsFollowAnimator != animation) return;
                 lyricsFollowAnimator = null;
                 if (advancing) resolveLyricsEmphasis();
-                // Zero stagger offsets for rows whose delay fit within the animation window.
-                // Late rows (entered RecyclerView after animation started, rowDelayMs > fMaxRowDelay)
-                // have not completed their stagger; zeroing them would snap — skip them.
+                // Zero all stagger offsets unconditionally. effectiveRowDelay is capped at
+                // fMaxRowDelay in the update listener, so every row's stagger completes by
+                // totalDuration = scrollDuration + fMaxRowDelay regardless of how late it
+                // entered the RecyclerView.
                 for (int ci = 0; ci < lyricsListView.getChildCount(); ci++) {
-                    final View c = lyricsListView.getChildAt(ci);
-                    final RecyclerView.ViewHolder vh = lyricsListView.findContainingViewHolder(c);
-                    if (vh == null) {
-                        c.setTranslationY(0f);
-                        continue;
-                    }
-                    final int ap = vh.getAdapterPosition();
-                    if (ap == RecyclerView.NO_POSITION || ap <= row) {
-                        c.setTranslationY(0f);
-                        continue;
-                    }
-                    if (itemDelayMs * (ap - row) <= fMaxRowDelay) {
-                        c.setTranslationY(0f);
-                    }
+                    lyricsListView.getChildAt(ci).setTranslationY(0f);
                 }
             }
         });
@@ -3999,6 +3988,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         // prevLongNote tracks the previous word's return tail for when glow is re-enabled.
         // Pure function of position for seek determinism.
         if (textView != null) {
+            // Current word emphasis — only when this line is the active karaoke line and eligible.
             if (wordFrame && rowKaraoke.longNoteEligible && visibleLyrics.get(row) == karaokeLine) {
                 final int graphemes = textView.wordGraphemeCount();
                 if (graphemes >= 1 && graphemes <= LONG_NOTE_MAX_GRAPHEMES) {
@@ -4007,11 +3997,16 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 } else {
                     textView.setLongNoteEmphasis(false, -1L, 0L);
                 }
-                textView.setPrevLongNoteEmphasis(rowKaraoke.prevLongNoteActive,
-                        rowKaraoke.prevWordAbsoluteStartMs, rowKaraoke.prevWordDurationMs);
             } else {
                 textView.setLongNoteEmphasis(false, -1L, 0L);
-                textView.setPrevLongNoteEmphasis(false, 0L, 0L);
+            }
+            // Previous word return tails — independent of current-word eligibility.
+            if (wordFrame && visibleLyrics.get(row) == karaokeLine) {
+                textView.setPrevLongNoteEmphasis(rowKaraoke.prevLongNoteCount,
+                        rowKaraoke.prevWordAbsoluteStartMs, rowKaraoke.prevWordDurationMs,
+                        rowKaraoke.prevWordTextStart, rowKaraoke.prevWordTextEnd);
+            } else {
+                textView.setPrevLongNoteEmphasis(0, null, null, null, null);
             }
         }
         child.setScaleX(lineScale);
@@ -4401,16 +4396,22 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         /** Absolute playback-clock start of this word in ms; used for seek-position reconstruction. */
         public long wordAbsoluteStartMs;
         /**
-         * True when the previous eligible word's emphasis return phase has not yet completed at
-         * the resolved playback position. Populated so the presentation layer can keep the tail
-         * alive after the semantic word has advanced.
-         * This is a pure function of the line's timestamps and the current position.
+         * Number of live previous-word emphasis tails at this position. Each entry represents a
+         * word whose conservative return envelope (pStart + 3*animMs) has not yet elapsed. Stored
+         * in reverse chronological order (most-recent eligible word first).
+         * This is a pure function of line timestamps and position; seeking reconstructs it exactly.
          */
-        public boolean prevLongNoteActive;
-        /** Absolute start of the previous eligible word, for computing its elapsed emphasis. */
-        public long prevWordAbsoluteStartMs;
-        /** Authored duration of the previous eligible word, for envelope computation. */
-        public long prevWordDurationMs;
+        public int prevLongNoteCount;
+        /** Maximum number of simultaneous previous tails tracked. */
+        public static final int PREV_LONG_NOTE_MAX = 4;
+        /** Absolute start of each live previous-eligible word, ms. Index 0 = most-recent. */
+        public long[] prevWordAbsoluteStartMs = new long[PREV_LONG_NOTE_MAX];
+        /** Authored duration of each live previous-eligible word, ms. */
+        public long[] prevWordDurationMs = new long[PREV_LONG_NOTE_MAX];
+        /** UTF-16 text start offset of each live previous word in the line's text. */
+        public int[] prevWordTextStart = new int[PREV_LONG_NOTE_MAX];
+        /** UTF-16 text end offset of each live previous word in the line's text. */
+        public int[] prevWordTextEnd = new int[PREV_LONG_NOTE_MAX];
 
         public void clear() {
             active = false;
@@ -4424,9 +4425,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             longNoteEligible = false;
             wordDurationMs = 0L;
             wordAbsoluteStartMs = 0L;
-            prevLongNoteActive = false;
-            prevWordAbsoluteStartMs = 0L;
-            prevWordDurationMs = 0L;
+            prevLongNoteCount = 0;
         }
 
         /**
@@ -4524,30 +4523,28 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             wordDurationMs = sweepMs > 0 ? sweepMs : ownershipWindowMs(segments, index, nextLineTimeMs);
             wordAbsoluteStartMs = start;
             longNoteEligible = hasExplicitWordEnd && wordDurationMs >= LONG_NOTE_MIN_DURATION_MS;
-            // Check whether the previous word's emphasis return phase is still active at this
-            // position. This is a pure time function: it does not require any accumulated state,
-            // so seeking reconstructs it exactly. The presentation layer uses it to keep the
-            // previous word's glow tail alive after the semantic word has advanced.
-            prevLongNoteActive = false;
-            prevWordAbsoluteStartMs = 0L;
-            prevWordDurationMs = 0L;
-            if (index > 0) {
-                final int pi = index - 1;
-                if (segments.hasEndTime(pi)) {
-                    final long pStart = segments.startTimeMs(pi);
-                    final long pEnd = segments.endTimeMs(pi);
-                    final long pDur = pEnd - pStart;
-                    if (pDur >= LONG_NOTE_MIN_DURATION_MS) {
-                        final long pAnimMs = Math.max(1L, Math.min(pDur, LONG_NOTE_MAX_ANIMATION_MS));
-                        // Conservative bound: single-binding return ends at pStart + 3*animMs.
-                        // Multiple bindings always finish earlier, so this is the safe upper limit.
-                        if (positionMs < pStart + 3L * pAnimMs) {
-                            prevLongNoteActive = true;
-                            prevWordAbsoluteStartMs = pStart;
-                            prevWordDurationMs = pDur;
-                        }
-                    }
-                }
+            // Scan backwards to find all previous eligible words whose return-phase envelope
+            // still contains positionMs. This is a pure time function so seeking reconstructs
+            // it exactly. The presentation layer uses each live tail to keep the previous word's
+            // emphasis alive after the semantic word has advanced.
+            // Entries are stored most-recent-first (index-1, index-2, …).
+            // Early-exit: once a backwards-scan word's envelope has expired, all earlier ones
+            // have even smaller start times and are also expired, so we break.
+            prevLongNoteCount = 0;
+            for (int pi = index - 1; pi >= 0 && prevLongNoteCount < PREV_LONG_NOTE_MAX; pi--) {
+                if (!segments.hasEndTime(pi)) continue;
+                final long pStart = segments.startTimeMs(pi);
+                final long pEnd = segments.endTimeMs(pi);
+                final long pDur = pEnd - pStart;
+                if (pDur < LONG_NOTE_MIN_DURATION_MS) continue;
+                final long pAnimMs = Math.max(1L, Math.min(pDur, LONG_NOTE_MAX_ANIMATION_MS));
+                // Conservative bound: single-binding return ends at pStart + 3*animMs.
+                if (positionMs >= pStart + 3L * pAnimMs) break; // expired; earlier words are too
+                prevWordAbsoluteStartMs[prevLongNoteCount] = pStart;
+                prevWordDurationMs[prevLongNoteCount] = pDur;
+                prevWordTextStart[prevLongNoteCount] = segments.startOffset(pi);
+                prevWordTextEnd[prevLongNoteCount] = Math.max(segments.startOffset(pi), segments.endOffset(pi));
+                prevLongNoteCount++;
             }
             active = true;
             return true;
@@ -4980,20 +4977,26 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         private boolean lyricTextColorSet;
         /** Quantised blur radius currently on the view, or -1 when nothing has been applied yet. */
         private int appliedBlur = -1;
-        /** True when the current word qualifies for long-note glow (authored end, eligible duration). */
+        /** True when the current word qualifies for long-note emphasis (authored end, eligible duration). */
         private boolean longNoteEligible;
-        /** Elapsed ms into the current word for glow animation; -1 = inactive. */
+        /** Elapsed ms into the current word for emphasis animation; -1 = inactive. */
         private long longNoteElapsedMs = -1L;
-        /** Word duration in ms for the glow rise/return timing. */
+        /** Word duration in ms for the emphasis rise/return timing. */
         private long longNoteWordDurationMs = 0L;
-        /** True while LAYER_TYPE_SOFTWARE is active for glow rendering. */
+        /** True while LAYER_TYPE_SOFTWARE is active for glow rendering (currently always false). */
         private boolean glowLayerActive;
-        /** True when the previous eligible word's emphasis return tail is still live. */
-        private boolean prevLongNoteActive;
-        /** Absolute start of the previous eligible word, in ms. */
-        private long prevWordAbsoluteStartMs;
-        /** Authored duration of the previous eligible word, in ms. */
-        private long prevWordDurationMs;
+        /** Number of live previous-word emphasis tails pushed by the last setPrevLongNoteEmphasis. */
+        private int prevLongNoteCount;
+        /** Absolute start of each live previous word, ms. Index 0 = most-recent. */
+        private final long[] prevWordAbsoluteStartMs = new long[KaraokeFrame.PREV_LONG_NOTE_MAX];
+        /** Authored duration of each live previous word, ms. */
+        private final long[] prevWordDurationMs = new long[KaraokeFrame.PREV_LONG_NOTE_MAX];
+        /** UTF-16 text start offset of each live previous word. */
+        private final int[] prevWordTextStart = new int[KaraokeFrame.PREV_LONG_NOTE_MAX];
+        /** UTF-16 text end offset of each live previous word. */
+        private final int[] prevWordTextEnd = new int[KaraokeFrame.PREV_LONG_NOTE_MAX];
+        /** Paint for the post-draw brightness overlay on the active long-note word. */
+        private final Paint overlayPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
 
 
         LyricsTextView(Context context) {
@@ -5045,13 +5048,20 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         }
 
         /**
-         * Pushes the previous word's emphasis return-tail state. Stored for when glow is
-         * re-enabled; a pure time function so seeking reconstructs it exactly.
+         * Pushes all live previous-word emphasis return tails. Independent of current-word
+         * eligibility — called even when the current word is ineligible or the line is inactive.
+         * A pure time function so seeking reconstructs it exactly. Pass count=0 or null arrays
+         * to clear.
          */
-        void setPrevLongNoteEmphasis(boolean active, long absStartMs, long durationMs) {
-            prevLongNoteActive = active;
-            prevWordAbsoluteStartMs = absStartMs;
-            prevWordDurationMs = durationMs;
+        void setPrevLongNoteEmphasis(int count, long[] absStarts, long[] durations,
+                int[] textStarts, int[] textEnds) {
+            prevLongNoteCount = count;
+            for (int i = 0; i < count; i++) {
+                prevWordAbsoluteStartMs[i] = absStarts[i];
+                prevWordDurationMs[i] = durations[i];
+                prevWordTextStart[i] = textStarts[i];
+                prevWordTextEnd[i] = textEnds[i];
+            }
         }
 
         /**
@@ -5336,8 +5346,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                     }
                 }
                 // Word-local glow disabled: visual runs span the whole line in single-run LTR
-                // text, so run-wide glow would cover non-active words. Data model fields
-                // (longNoteEligible, prevLongNoteActive) are preserved for a future safe implementation.
+                // text, so run-wide glow would cover non-active words. The canvas overlay in
+                // onDraw() draws the active-word brightness highlight at precise cluster bounds.
                 span.setGlow(0f, 0);
             }
         }
@@ -5446,6 +5456,46 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             if (karaokeActive && resolveColourBoundaries()) invalidate();
         }
 
+        /**
+         * Post-draw brightness overlay for the active long-note word. Calls super.onDraw once for
+         * the normal text, then overlays a white-alpha rect at the active word's cluster bounds.
+         * Pure canvas drawing — no spans, no setSpan, no re-shaping.
+         */
+        @Override
+        protected void onDraw(Canvas canvas) {
+            super.onDraw(canvas);
+            if (!longNoteEligible || !karaokeActive || clusterCount == 0 || wordEnd <= wordStart
+                    || longNoteElapsedMs < 0) return;
+            final long animMs = Math.max(1L, Math.min(longNoteWordDurationMs,
+                    LONG_NOTE_MAX_ANIMATION_MS));
+            final float alpha = longNoteOverlayAlpha(longNoteElapsedMs, animMs);
+            if (alpha <= 0f) return;
+            final Layout layout = getLayout();
+            if (layout == null) return;
+            final int lineIdx = layout.getLineForOffset(Math.max(0, wordStart));
+            final float top = layout.getLineTop(lineIdx) + getCompoundPaddingTop() - getScrollY();
+            final float bottom = layout.getLineBottom(lineIdx) + getCompoundPaddingTop() - getScrollY();
+            final float paddingLeft = getCompoundPaddingLeft();
+            overlayPaint.setColor(Color.WHITE);
+            overlayPaint.setAlpha(Math.round(alpha * 255));
+            for (int i = 0; i < clusterCount; i++) {
+                if (clusterStart[i] < wordStart) continue;
+                if (clusterStart[i] >= wordEnd) break;
+                if (!clusterHasRect[i]) continue;
+                canvas.drawRect(clusterLeft[i] + paddingLeft, top, clusterRight[i] + paddingLeft,
+                        bottom, overlayPaint);
+            }
+        }
+
+        private static float longNoteOverlayAlpha(long elapsedMs, long animMs) {
+            if (animMs <= 0 || elapsedMs < 0) return 0f;
+            final float maxAlpha = 0.30f;
+            if (elapsedMs < animMs) return (elapsedMs / (float) animMs) * maxAlpha;
+            if (elapsedMs < 2L * animMs) return maxAlpha;
+            if (elapsedMs < 3L * animMs) return ((3L * animMs - elapsedMs) / (float) animMs) * maxAlpha;
+            return 0f;
+        }
+
         /** Returns the row to plain, uniformly coloured text, clearing any long-note emphasis. */
         void clearKaraoke() {
             final boolean emphasisChanged = longNoteEligible || longNoteElapsedMs >= 0;
@@ -5458,9 +5508,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                     setLayerType(LAYER_TYPE_NONE, null);
                 }
             }
-            prevLongNoteActive = false;
-            prevWordAbsoluteStartMs = 0L;
-            prevWordDurationMs = 0L;
+            prevLongNoteCount = 0;
             if (!karaokeActive && requestedStart < 0 && requestedEnd < 0) return;
             karaokeActive = false;
             detachSpans();

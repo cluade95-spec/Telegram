@@ -1450,14 +1450,14 @@ class LyricsKaraokeRenderingTest {
 
     @Test
     fun theRowIsDrawnByOneOrdinaryTextViewDrawWithNoCustomRenderer() {
-        // The architecture assertion. The row does not override onDraw AT ALL: there is no strip
-        // renderer, no clipped pass, no canvas translation and no repeated super.onDraw(). One
-        // frame is "set the appearance, invalidate, and let TextView draw the row once".
+        // Architecture assertion: karaoke is appearance-only, backed by a canvas overlay that calls
+        // super.onDraw exactly once, then draws a brightness rect at cluster bounds. There is no
+        // strip renderer, no clipped pass, no canvas translation and no repeated super.onDraw().
+        // onDraw IS overridden (for the post-draw brightness overlay) but draw() is not.
         val type = lyricsTextViewClass()
         for (method in type.declaredMethods) {
-            assertNotEquals("the row must not override $method - karaoke is appearance only",
-                "onDraw", method.name)
-            assertNotEquals("nor draw()", "draw", method.name)
+            assertNotEquals("the row must not override draw() - karaoke is appearance only",
+                "draw", method.name)
         }
     }
 
@@ -2409,9 +2409,11 @@ class LyricsKaraokeRenderingTest {
         val ltv = AudioPlayerAlert::class.java.declaredClasses.find { it.simpleName == "LyricsTextView" }
         assertNotNull("LyricsTextView must exist", ltv)
         val names = ltv!!.declaredFields.map { it.name }
-        assertTrue("prevLongNoteActive field must exist", "prevLongNoteActive" in names)
+        assertTrue("prevLongNoteCount field must exist", "prevLongNoteCount" in names)
         assertTrue("prevWordAbsoluteStartMs field must exist", "prevWordAbsoluteStartMs" in names)
         assertTrue("prevWordDurationMs field must exist", "prevWordDurationMs" in names)
+        assertTrue("prevWordTextStart field must exist", "prevWordTextStart" in names)
+        assertTrue("prevWordTextEnd field must exist", "prevWordTextEnd" in names)
         // glowLayerActive stays for defensive clearance in clearKaraoke()
         assertTrue("glowLayerActive field must still exist", "glowLayerActive" in names)
     }
@@ -2426,10 +2428,10 @@ class LyricsKaraokeRenderingTest {
             """<span begin="00:02.000" end="00:03.000">world</span></p>""")
         val frame = KaraokeFrame()
         frame.resolve(line, 2500L, 10000L)
-        assertEquals("word B is current at T=2500ms", line.segments.startTimeMs(1), frame.wordStart)
-        assertTrue("word A return tail is live at T=2500ms (window = 4500ms)", frame.prevLongNoteActive)
-        assertEquals("prevWordAbsoluteStartMs is A's start", 0L, frame.prevWordAbsoluteStartMs)
-        assertEquals("prevWordDurationMs is A's authored duration", 1500L, frame.prevWordDurationMs)
+        assertEquals("word B is current at T=2500ms", line.segments.startOffset(1), frame.wordStart)
+        assertTrue("word A return tail is live at T=2500ms (window = 4500ms)", frame.prevLongNoteCount >= 1)
+        assertEquals("prevWordAbsoluteStartMs[0] is A's start", 0L, frame.prevWordAbsoluteStartMs[0])
+        assertEquals("prevWordDurationMs[0] is A's authored duration", 1500L, frame.prevWordDurationMs[0])
     }
 
     @Test
@@ -2440,8 +2442,8 @@ class LyricsKaraokeRenderingTest {
             """<span begin="00:02.000" end="00:03.000">world</span></p>""")
         val frame = KaraokeFrame()
         frame.resolve(line, 5000L, 10000L)
-        assertFalse("word A return tail must be expired at T=5000ms (window = 4500ms)",
-            frame.prevLongNoteActive)
+        assertEquals("word A return tail must be expired at T=5000ms (window = 4500ms)",
+            0, frame.prevLongNoteCount)
     }
 
     @Test
@@ -2451,9 +2453,9 @@ class LyricsKaraokeRenderingTest {
         val line = lrc("[00:00.000]<00:00.000>hello <00:01.500>world <00:05.000>end")
         val frame = KaraokeFrame()
         frame.resolve(line, 2000L, Long.MAX_VALUE)  // inside "world"
-        assertEquals("world is current at T=2000ms", line.segments.startTimeMs(1), frame.wordStart)
-        assertFalse("start-only previous word must not activate prevLongNoteActive",
-            frame.prevLongNoteActive)
+        assertEquals("world is current at T=2000ms", line.segments.startOffset(1), frame.wordStart)
+        assertEquals("start-only previous word must not populate prevLongNoteCount",
+            0, frame.prevLongNoteCount)
     }
 
     @Test
@@ -2476,19 +2478,110 @@ class LyricsKaraokeRenderingTest {
 
     @Test
     fun pass2_onAnimationEnd_lateChildGuard_rowDelayBoundary() {
-        // Only rows with rowDelayMs <= fMaxRowDelay are zeroed at animation end.
-        // Rows that arrived late (rowDelayMs > fMaxRowDelay) are skipped: their stagger has not
-        // completed within the animation window and zeroing them would snap.
+        // With effectiveRowDelay = min(rawRowDelay, fMaxRowDelay), every row's stagger completes
+        // by totalDuration = scrollDuration + fMaxRowDelay, so onAnimationEnd zeroes all rows.
+        // This test verifies the cap arithmetic: a late row's rawDelay (250ms) exceeds fMaxRowDelay
+        // (200ms), but after capping its effectiveDelay equals fMaxRowDelay, so it finishes on time.
         val fMaxRowDelay = 200L
         val itemDelayMs = 50L
         val row = 0
 
-        val earlyAdapterPos = 3   // rowDelayMs = 150ms ≤ 200ms → zero it
-        val earlyDelay = itemDelayMs * (earlyAdapterPos - row)
-        assertTrue("early child (150ms ≤ 200ms) should be zeroed", earlyDelay <= fMaxRowDelay)
+        val earlyAdapterPos = 3   // rawDelay = 150ms ≤ 200ms → effectiveDelay = 150ms
+        val earlyRaw = itemDelayMs * (earlyAdapterPos - row)
+        val earlyEffective = minOf(earlyRaw, fMaxRowDelay)
+        assertEquals("early row effective delay equals raw delay", earlyRaw, earlyEffective)
 
-        val lateAdapterPos = 5    // rowDelayMs = 250ms > 200ms → skip
-        val lateDelay = itemDelayMs * (lateAdapterPos - row)
-        assertFalse("late child (250ms > 200ms) must not be zeroed", lateDelay <= fMaxRowDelay)
+        val lateAdapterPos = 5    // rawDelay = 250ms > 200ms → effectiveDelay = 200ms (capped)
+        val lateRaw = itemDelayMs * (lateAdapterPos - row)
+        val lateEffective = minOf(lateRaw, fMaxRowDelay)
+        assertTrue("late row raw delay exceeds fMaxRowDelay", lateRaw > fMaxRowDelay)
+        assertEquals("late row effective delay is capped at fMaxRowDelay", fMaxRowDelay, lateEffective)
+    }
+
+    // ===================================================================== audit pass 3 tests
+
+    @Test
+    fun pass3_overlayAlpha_risePhase_zeroAtStart() {
+        // Alpha starts at 0 when elapsedMs = 0.
+        val animMs = 1000L
+        val alpha = invokeOverlayAlpha(0L, animMs)
+        assertEquals("alpha must be 0 at elapsed=0", 0f, alpha, 0.001f)
+    }
+
+    @Test
+    fun pass3_overlayAlpha_risePhase_maxAtAnimMs() {
+        // Alpha reaches maxAlpha (0.30) exactly at elapsed = animMs (end of rise phase).
+        val animMs = 1000L
+        val alpha = invokeOverlayAlpha(animMs, animMs)
+        assertEquals("alpha must equal maxAlpha at elapsed=animMs", 0.30f, alpha, 0.001f)
+    }
+
+    @Test
+    fun pass3_overlayAlpha_holdPhase_staysAtMax() {
+        // Alpha stays at maxAlpha during hold phase: animMs ≤ elapsed < 2*animMs.
+        val animMs = 1000L
+        val alphaMid = invokeOverlayAlpha(1500L, animMs)  // midpoint of hold
+        assertEquals("alpha must stay at maxAlpha during hold", 0.30f, alphaMid, 0.001f)
+    }
+
+    @Test
+    fun pass3_overlayAlpha_returnPhase_zeroAt3xAnimMs() {
+        // Alpha returns to 0 exactly at elapsed = 3*animMs (end of return phase).
+        val animMs = 1000L
+        val alpha = invokeOverlayAlpha(3L * animMs, animMs)
+        assertEquals("alpha must be 0 at elapsed=3*animMs", 0f, alpha, 0.001f)
+    }
+
+    @Test
+    fun pass3_overlayAlpha_expiredBeyond3x_staysZero() {
+        // After elapsed > 3*animMs, alpha stays 0.
+        val animMs = 1000L
+        val alpha = invokeOverlayAlpha(4000L, animMs)
+        assertEquals("alpha must be 0 beyond 3*animMs", 0f, alpha, 0.001f)
+    }
+
+    @Test
+    fun pass3_prevLongNoteCount_multipleLiveEligibleWords() {
+        // When two previous words are both eligible and their return envelopes overlap positionMs,
+        // prevLongNoteCount must be 2.
+        // Word A: 0–1500ms (dur=1500, animMs=1500, window=0+3*1500=4500ms)
+        // Word B: 2000–3500ms (dur=1500, animMs=1500, window=2000+3*1500=6500ms)
+        // Word C (current): start=5000ms
+        // At T=4200ms, both A (window 4500ms) and B (window 6500ms) are live.
+        val line = ttml("""<p begin="00:00.000" end="00:15.000">""" +
+            """<span begin="00:00.000" end="00:01.500">alpha</span> """ +
+            """<span begin="00:02.000" end="00:03.500">beta</span> """ +
+            """<span begin="00:05.000" end="00:06.000">gamma</span></p>""")
+        val frame = KaraokeFrame()
+        frame.resolve(line, 4200L, 15000L)
+        assertEquals("both A and B are live previous tails at T=4200ms", 2, frame.prevLongNoteCount)
+    }
+
+    @Test
+    fun pass3_prevLongNoteCount_expiredWordTerminatesBackwardScan() {
+        // Once a word's return envelope is expired (elapsed > 3*animMs), older words are too
+        // (monotonic timestamps). The scan must stop there.
+        // Word A: 0–1000ms (animMs=1000, window=0+3*1000=3000ms) — expired at T=3500ms
+        // Word B: 2000–3000ms (animMs=1000, window=2000+3*1000=5000ms) — live at T=3500ms
+        // Word C (current): start=4000ms
+        // At T=3500ms: B is live but A is expired → count must be 1 (B only), scan stops at A.
+        val line = ttml("""<p begin="00:00.000" end="00:10.000">""" +
+            """<span begin="00:00.000" end="00:01.000">one</span> """ +
+            """<span begin="00:02.000" end="00:03.000">two</span> """ +
+            """<span begin="00:04.000" end="00:05.000">three</span></p>""")
+        val frame = KaraokeFrame()
+        frame.resolve(line, 3500L, 10000L)
+        assertEquals("only B is live at T=3500ms; expired A stops the scan", 1, frame.prevLongNoteCount)
+        assertEquals("the live tail is word B (start=2000ms)", 2000L, frame.prevWordAbsoluteStartMs[0])
+    }
+
+    // ------------------------------------------------------------------ helpers for pass3 tests
+
+    private fun invokeOverlayAlpha(elapsedMs: Long, animMs: Long): Float {
+        val ltv = lyricsTextViewClass()
+        val method = ltv.declaredMethods.find { it.name == "longNoteOverlayAlpha" }
+            ?: error("longNoteOverlayAlpha method not found in LyricsTextView")
+        method.isAccessible = true
+        return method.invoke(null, elapsedMs, animMs) as Float
     }
 }
