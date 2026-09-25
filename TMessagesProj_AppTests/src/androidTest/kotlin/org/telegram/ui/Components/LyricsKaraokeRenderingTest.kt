@@ -2410,7 +2410,7 @@ class LyricsKaraokeRenderingTest {
         assertNotNull("LyricsTextView must exist", ltv)
         val names = ltv!!.declaredFields.map { it.name }
         assertTrue("prevLongNoteCount field must exist", "prevLongNoteCount" in names)
-        assertTrue("prevWordAbsoluteStartMs field must exist", "prevWordAbsoluteStartMs" in names)
+        assertTrue("prevWordElapsedMs field must exist", "prevWordElapsedMs" in names)
         assertTrue("prevWordDurationMs field must exist", "prevWordDurationMs" in names)
         assertTrue("prevWordTextStart field must exist", "prevWordTextStart" in names)
         assertTrue("prevWordTextEnd field must exist", "prevWordTextEnd" in names)
@@ -2543,36 +2543,135 @@ class LyricsKaraokeRenderingTest {
     @Test
     fun pass3_prevLongNoteCount_multipleLiveEligibleWords() {
         // When two previous words are both eligible and their return envelopes overlap positionMs,
-        // prevLongNoteCount must be 2.
-        // Word A: 0–1500ms (dur=1500, animMs=1500, window=0+3*1500=4500ms)
-        // Word B: 2000–3500ms (dur=1500, animMs=1500, window=2000+3*1500=6500ms)
-        // Word C (current): start=5000ms
-        // At T=4200ms, both A (window 4500ms) and B (window 6500ms) are live.
+        // prevLongNoteCount must be 2. Fixture ensures gamma is the semantic current word at T=5800ms
+        // so alpha and beta are both in the previous-word collection.
+        //
+        // Word A (alpha): 0–3000ms  → dur=3000ms, animMs=3000ms, window=0+9000=9000ms
+        // Word B (beta):  3500–5000ms → dur=1500ms, animMs=1500ms, window=3500+4500=8000ms
+        // Word C (gamma): 5500–6000ms (dur=500ms — current at T=5800ms, ineligible as current)
+        // At T=5800ms: A window=9000 > 5800 ✓  B window=8000 > 5800 ✓  both are live.
         val line = ttml("""<p begin="00:00.000" end="00:15.000">""" +
-            """<span begin="00:00.000" end="00:01.500">alpha</span> """ +
-            """<span begin="00:02.000" end="00:03.500">beta</span> """ +
-            """<span begin="00:05.000" end="00:06.000">gamma</span></p>""")
+            """<span begin="00:00.000" end="00:03.000">alpha</span> """ +
+            """<span begin="00:03.500" end="00:05.000">beta</span> """ +
+            """<span begin="00:05.500" end="00:06.000">gamma</span></p>""")
         val frame = KaraokeFrame()
-        frame.resolve(line, 4200L, 15000L)
-        assertEquals("both A and B are live previous tails at T=4200ms", 2, frame.prevLongNoteCount)
+        frame.resolve(line, 5800L, 15000L)
+        assertEquals("both alpha and beta are live previous tails at T=5800ms", 2, frame.prevLongNoteCount)
     }
 
     @Test
-    fun pass3_prevLongNoteCount_expiredWordTerminatesBackwardScan() {
-        // Once a word's return envelope is expired (elapsed > 3*animMs), older words are too
-        // (monotonic timestamps). The scan must stop there.
-        // Word A: 0–1000ms (animMs=1000, window=0+3*1000=3000ms) — expired at T=3500ms
-        // Word B: 2000–3000ms (animMs=1000, window=2000+3*1000=5000ms) — live at T=3500ms
-        // Word C (current): start=4000ms
-        // At T=3500ms: B is live but A is expired → count must be 1 (B only), scan stops at A.
+    fun pass3_prevLongNoteCount_expiredNewerWordDoesNotTerminateScan() {
+        // An expired NEWER previous word must NOT terminate the backward scan, because an OLDER
+        // word may have a longer authored duration and therefore a window that extends further.
+        //
+        // Word A (alpha, older): 0–3000ms → dur=3000ms, animMs=3000ms, window=0+9000=9000ms
+        // Word B (beta, newer):  4000–5000ms → dur=1000ms, animMs=1000ms, window=4000+3000=7000ms
+        // Word C (gamma, current): 5500–6000ms
+        // At T=7500ms: beta window=7000 < 7500 → beta EXPIRED; alpha window=9000 > 7500 → alpha LIVE
+        //
+        // With the old (wrong) break: beta expired → break → alpha missed → count=0
+        // With the correct continue:  beta expired → continue → alpha found → count=1
         val line = ttml("""<p begin="00:00.000" end="00:10.000">""" +
-            """<span begin="00:00.000" end="00:01.000">one</span> """ +
-            """<span begin="00:02.000" end="00:03.000">two</span> """ +
-            """<span begin="00:04.000" end="00:05.000">three</span></p>""")
+            """<span begin="00:00.000" end="00:03.000">alpha</span> """ +
+            """<span begin="00:04.000" end="00:05.000">beta</span> """ +
+            """<span begin="00:05.500" end="00:06.000">gamma</span></p>""")
         val frame = KaraokeFrame()
-        frame.resolve(line, 3500L, 10000L)
-        assertEquals("only B is live at T=3500ms; expired A stops the scan", 1, frame.prevLongNoteCount)
-        assertEquals("the live tail is word B (start=2000ms)", 2000L, frame.prevWordAbsoluteStartMs[0])
+        frame.resolve(line, 7500L, 10000L)
+        assertEquals("scan must continue past expired beta to find live alpha", 1, frame.prevLongNoteCount)
+        assertEquals("the live tail is alpha (start=0ms)", 0L, frame.prevWordAbsoluteStartMs[0])
+    }
+
+    @Test
+    fun pass3_prevTails_oneLiveTailInFrame() {
+        // Exactly one previous eligible word live — prevLongNoteCount == 1.
+        val line = ttml("""<p begin="00:00.000" end="00:10.000">""" +
+            """<span begin="00:00.000" end="00:01.500">hello</span> """ +
+            """<span begin="00:02.000" end="00:03.000">world</span></p>""")
+        val frame = KaraokeFrame()
+        frame.resolve(line, 2500L, 10000L)  // inside "world"
+        assertEquals("exactly one previous live tail (hello)", 1, frame.prevLongNoteCount)
+        assertEquals("the tail is hello (start=0ms)", 0L, frame.prevWordAbsoluteStartMs[0])
+    }
+
+    @Test
+    fun pass3_prevTails_allExpiredCountIsZero() {
+        // All previous eligible words have passed their 3×animMs window → prevLongNoteCount == 0.
+        // alpha: window = 0 + 3*1500 = 4500ms.  beta: window = 2000 + 3*3000 = 11000ms.
+        // At T=15000ms both windows are exceeded.
+        val line = ttml("""<p begin="00:00.000" end="00:20.000">""" +
+            """<span begin="00:00.000" end="00:01.500">alpha</span> """ +
+            """<span begin="00:02.000" end="00:05.000">beta</span></p>""")
+        val frame = KaraokeFrame()
+        frame.resolve(line, 15000L, Long.MAX_VALUE)
+        assertEquals("all previous tails expired at T=15000ms", 0, frame.prevLongNoteCount)
+    }
+
+    @Test
+    fun pass3_prevTails_currentAndPreviousSimultaneous() {
+        // Both current-word eligibility (longNoteEligible) and a live previous tail
+        // (prevLongNoteCount >= 1) can coexist — the two data paths are independent.
+        val line = ttml("""<p begin="00:00.000" end="00:10.000">""" +
+            """<span begin="00:00.000" end="00:01.500">hello</span> """ +
+            """<span begin="00:02.000" end="00:04.000">world</span></p>""")
+        val frame = KaraokeFrame()
+        frame.resolve(line, 2500L, 10000L)  // inside "world": eligible (dur=2000ms >= 1000ms)
+        assertTrue("current word (world) is eligible", frame.longNoteEligible)
+        assertEquals("previous tail (hello) is live at T=2500ms", 1, frame.prevLongNoteCount)
+    }
+
+    @Test
+    fun pass3_prevTails_prevWordElapsedMs_fieldExistsInLyricsTextView() {
+        // LyricsTextView stores pre-computed elapsed ms for each previous tail so it does not
+        // need to know absolute playback time. The field is prevWordElapsedMs (not absStartMs).
+        val ltv = lyricsTextViewClass()
+        val names = ltv.declaredFields.map { it.name }
+        assertTrue("prevWordElapsedMs field must exist in LyricsTextView", "prevWordElapsedMs" in names)
+        assertFalse("prevWordAbsoluteStartMs must NOT exist in LyricsTextView (renamed to elapsed)",
+            "prevWordAbsoluteStartMs" in names)
+    }
+
+    @Test
+    fun pass3_glyphOverlay_methodsExistForGlyphFollowingRendering() {
+        // Structural guard: the glyph-following overlay needs two helpers plus a static xfermode.
+        val ltv = lyricsTextViewClass()
+        val methodNames = ltv.declaredMethods.map { it.name }
+        assertTrue("drawGlyphOverlay must exist for glyph-following overlay",
+            "drawGlyphOverlay" in methodNames)
+        assertTrue("renderOverlayLine must exist for per-line saveLayer passes",
+            "renderOverlayLine" in methodNames)
+        val fieldNames = ltv.declaredFields.map { it.name }
+        assertTrue("OVERLAY_SRC_IN static xfermode must exist to avoid per-frame allocation",
+            "OVERLAY_SRC_IN" in fieldNames)
+    }
+
+    @Test
+    fun pass3_glyphOverlay_overlaySrcInIsPorterDuffXfermode() {
+        // OVERLAY_SRC_IN must be a non-null PorterDuffXfermode to ensure glyph-following compositing.
+        val ltv = lyricsTextViewClass()
+        val field = ltv.declaredFields.find { it.name == "OVERLAY_SRC_IN" }
+            ?: error("OVERLAY_SRC_IN field not found")
+        field.isAccessible = true
+        val value = field.get(null)
+        assertNotNull("OVERLAY_SRC_IN must not be null", value)
+        assertTrue("OVERLAY_SRC_IN must be a PorterDuffXfermode",
+            value is android.graphics.PorterDuffXfermode)
+    }
+
+    @Test
+    fun pass3_prevTails_expiredNewerBoundaryExact_notZero() {
+        // At the exact boundary T = pStart + 3*animMs the word IS expired (>= is strictly expired).
+        // beta: start=4000ms, dur=1000ms, animMs=1000ms, exact expiry = 4000+3*1000 = 7000ms
+        // alpha: start=0ms, dur=3000ms, animMs=3000ms, window = 0+9000 = 9000ms > 7000ms → live
+        // At T=7000ms: beta is exactly expired and alpha is alive → count must be 1.
+        val line = ttml("""<p begin="00:00.000" end="00:10.000">""" +
+            """<span begin="00:00.000" end="00:03.000">alpha</span> """ +
+            """<span begin="00:04.000" end="00:05.000">beta</span> """ +
+            """<span begin="00:06.000" end="00:07.000">gamma</span></p>""")
+        val frame = KaraokeFrame()
+        frame.resolve(line, 7000L, 10000L)
+        assertEquals("beta exactly expired at T=7000ms, alpha still live: count=1",
+            1, frame.prevLongNoteCount)
+        assertEquals("the remaining tail is alpha (start=0ms)", 0L, frame.prevWordAbsoluteStartMs[0])
     }
 
     // ------------------------------------------------------------------ helpers for pass3 tests

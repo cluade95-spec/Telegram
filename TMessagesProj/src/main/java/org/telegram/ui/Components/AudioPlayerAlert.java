@@ -3739,6 +3739,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
     private final KaraokeFrame karaoke = new KaraokeFrame();
     /** Scratch holder for painting one row; never carries state between two calls. */
     private final KaraokeFrame rowKaraoke = new KaraokeFrame();
+    /** Pre-allocated scratch for previous-word elapsed-ms computation to avoid per-frame allocation. */
+    private final long[] prevElapsedScratch = new long[KaraokeFrame.PREV_LONG_NOTE_MAX];
     /** The line the playback position is actually inside, whether or not it states word timing. */
     private int karaokeLine = Integer.MIN_VALUE;
     private long karaokePositionMs;
@@ -4002,8 +4004,13 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             }
             // Previous word return tails — independent of current-word eligibility.
             if (wordFrame && visibleLyrics.get(row) == karaokeLine) {
-                textView.setPrevLongNoteEmphasis(rowKaraoke.prevLongNoteCount,
-                        rowKaraoke.prevWordAbsoluteStartMs, rowKaraoke.prevWordDurationMs,
+                final int prevCount = rowKaraoke.prevLongNoteCount;
+                for (int i = 0; i < prevCount; i++) {
+                    prevElapsedScratch[i] = Math.max(0L,
+                            karaokePositionMs - rowKaraoke.prevWordAbsoluteStartMs[i]);
+                }
+                textView.setPrevLongNoteEmphasis(prevCount, prevElapsedScratch,
+                        rowKaraoke.prevWordDurationMs,
                         rowKaraoke.prevWordTextStart, rowKaraoke.prevWordTextEnd);
             } else {
                 textView.setPrevLongNoteEmphasis(0, null, null, null, null);
@@ -4523,23 +4530,24 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             wordDurationMs = sweepMs > 0 ? sweepMs : ownershipWindowMs(segments, index, nextLineTimeMs);
             wordAbsoluteStartMs = start;
             longNoteEligible = hasExplicitWordEnd && wordDurationMs >= LONG_NOTE_MIN_DURATION_MS;
-            // Scan backwards to find all previous eligible words whose return-phase envelope
-            // still contains positionMs. This is a pure time function so seeking reconstructs
-            // it exactly. The presentation layer uses each live tail to keep the previous word's
-            // emphasis alive after the semantic word has advanced.
-            // Entries are stored most-recent-first (index-1, index-2, …).
-            // Early-exit: once a backwards-scan word's envelope has expired, all earlier ones
-            // have even smaller start times and are also expired, so we break.
+            // Scan backwards for previous eligible words whose return-phase envelope still contains
+            // positionMs. Stored most-recent-first. A word that is expired (positionMs >=
+            // pStart + 3*pAnimMs) is skipped with continue, NOT break, because an older word may
+            // have a longer authored duration and therefore a later envelope end. We break only when
+            // the word's pStart is so early that even the longest possible envelope (pStart +
+            // 3*LONG_NOTE_MAX_ANIMATION_MS) has elapsed; any earlier word starts even sooner so
+            // its envelope also ends before positionMs.
             prevLongNoteCount = 0;
             for (int pi = index - 1; pi >= 0 && prevLongNoteCount < PREV_LONG_NOTE_MAX; pi--) {
                 if (!segments.hasEndTime(pi)) continue;
                 final long pStart = segments.startTimeMs(pi);
                 final long pEnd = segments.endTimeMs(pi);
                 final long pDur = pEnd - pStart;
+                // Provably no earlier word can be alive past this bound.
+                if (positionMs >= pStart + 3L * LONG_NOTE_MAX_ANIMATION_MS) break;
                 if (pDur < LONG_NOTE_MIN_DURATION_MS) continue;
                 final long pAnimMs = Math.max(1L, Math.min(pDur, LONG_NOTE_MAX_ANIMATION_MS));
-                // Conservative bound: single-binding return ends at pStart + 3*animMs.
-                if (positionMs >= pStart + 3L * pAnimMs) break; // expired; earlier words are too
+                if (positionMs >= pStart + 3L * pAnimMs) continue; // this word expired; older may not have
                 prevWordAbsoluteStartMs[prevLongNoteCount] = pStart;
                 prevWordDurationMs[prevLongNoteCount] = pDur;
                 prevWordTextStart[prevLongNoteCount] = segments.startOffset(pi);
@@ -4987,8 +4995,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         private boolean glowLayerActive;
         /** Number of live previous-word emphasis tails pushed by the last setPrevLongNoteEmphasis. */
         private int prevLongNoteCount;
-        /** Absolute start of each live previous word, ms. Index 0 = most-recent. */
-        private final long[] prevWordAbsoluteStartMs = new long[KaraokeFrame.PREV_LONG_NOTE_MAX];
+        /** Elapsed ms from each live previous word's absolute start, at the last applyLyricsDepth tick. */
+        private final long[] prevWordElapsedMs = new long[KaraokeFrame.PREV_LONG_NOTE_MAX];
         /** Authored duration of each live previous word, ms. */
         private final long[] prevWordDurationMs = new long[KaraokeFrame.PREV_LONG_NOTE_MAX];
         /** UTF-16 text start offset of each live previous word. */
@@ -4997,6 +5005,9 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         private final int[] prevWordTextEnd = new int[KaraokeFrame.PREV_LONG_NOTE_MAX];
         /** Paint for the post-draw brightness overlay on the active long-note word. */
         private final Paint overlayPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        /** Precomputed SRC_IN xfermode for the glyph-following overlay; shared across all draws. */
+        private static final PorterDuffXfermode OVERLAY_SRC_IN =
+                new PorterDuffXfermode(PorterDuff.Mode.SRC_IN);
 
 
         LyricsTextView(Context context) {
@@ -5050,14 +5061,15 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         /**
          * Pushes all live previous-word emphasis return tails. Independent of current-word
          * eligibility — called even when the current word is ineligible or the line is inactive.
-         * A pure time function so seeking reconstructs it exactly. Pass count=0 or null arrays
-         * to clear.
+         * {@code elapsedMs[i]} is already computed as {@code positionMs - prevWordAbsoluteStartMs[i]}
+         * by the caller so this view does not need to know absolute time.
+         * Pass count=0 or null arrays to clear.
          */
-        void setPrevLongNoteEmphasis(int count, long[] absStarts, long[] durations,
+        void setPrevLongNoteEmphasis(int count, long[] elapsedMs, long[] durations,
                 int[] textStarts, int[] textEnds) {
             prevLongNoteCount = count;
             for (int i = 0; i < count; i++) {
-                prevWordAbsoluteStartMs[i] = absStarts[i];
+                prevWordElapsedMs[i] = elapsedMs[i];
                 prevWordDurationMs[i] = durations[i];
                 prevWordTextStart[i] = textStarts[i];
                 prevWordTextEnd[i] = textEnds[i];
@@ -5457,34 +5469,94 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         }
 
         /**
-         * Post-draw brightness overlay for the active long-note word. Calls super.onDraw once for
-         * the normal text, then overlays a white-alpha rect at the active word's cluster bounds.
-         * Pure canvas drawing — no spans, no setSpan, no re-shaping.
+         * Post-draw brightness overlay for the active long-note word and any live previous-word
+         * return tails. Calls super.onDraw once for normal text, then for each active overlay
+         * region opens a hardware saveLayer, re-draws the text into it as a glyph alpha mask, and
+         * composites a white rect through that mask using SRC_IN. The white therefore follows the
+         * exact ink outlines of the glyphs rather than their rectangular bounding boxes.
+         *
+         * <p>Handles line-wrapping: clusters that belong to the same eligible word but appear on
+         * different Layout lines each get their own saveLayer pass.
+         *
+         * <p>No spans, no setSpan, no re-shaping. layout.draw() uses pre-shaped text only.
          */
         @Override
         protected void onDraw(Canvas canvas) {
             super.onDraw(canvas);
-            if (!longNoteEligible || !karaokeActive || clusterCount == 0 || wordEnd <= wordStart
-                    || longNoteElapsedMs < 0) return;
-            final long animMs = Math.max(1L, Math.min(longNoteWordDurationMs,
-                    LONG_NOTE_MAX_ANIMATION_MS));
-            final float alpha = longNoteOverlayAlpha(longNoteElapsedMs, animMs);
-            if (alpha <= 0f) return;
+            // Current word glyph overlay
+            if (longNoteEligible && karaokeActive && wordEnd > wordStart && longNoteElapsedMs >= 0) {
+                final long animMs = Math.max(1L, Math.min(longNoteWordDurationMs,
+                        LONG_NOTE_MAX_ANIMATION_MS));
+                final float alpha = longNoteOverlayAlpha(longNoteElapsedMs, animMs);
+                if (alpha > 0f) drawGlyphOverlay(canvas, wordStart, wordEnd, alpha);
+            }
+            // Previous-word return tails — independent of current eligibility.
+            for (int pi = 0; pi < prevLongNoteCount; pi++) {
+                final long pAnimMs = Math.max(1L, Math.min(prevWordDurationMs[pi],
+                        LONG_NOTE_MAX_ANIMATION_MS));
+                final float alpha = longNoteOverlayAlpha(prevWordElapsedMs[pi], pAnimMs);
+                if (alpha > 0f) drawGlyphOverlay(canvas, prevWordTextStart[pi], prevWordTextEnd[pi], alpha);
+            }
+        }
+
+        /**
+         * Renders a glyph-following white-alpha overlay for the text range [{@code textStart},
+         * {@code textEnd}). Handles line-wrapping by grouping clusters per Layout line and
+         * issuing one saveLayer pass per line.
+         */
+        private void drawGlyphOverlay(Canvas canvas, int textStart, int textEnd, float alpha) {
+            if (clusterCount == 0 || textEnd <= textStart) return;
             final Layout layout = getLayout();
             if (layout == null) return;
-            final int lineIdx = layout.getLineForOffset(Math.max(0, wordStart));
-            final float top = layout.getLineTop(lineIdx) + getCompoundPaddingTop() - getScrollY();
-            final float bottom = layout.getLineBottom(lineIdx) + getCompoundPaddingTop() - getScrollY();
-            final float paddingLeft = getCompoundPaddingLeft();
+            final float txX = getCompoundPaddingLeft();
+            final float txY = getCompoundPaddingTop() - getScrollY();
             overlayPaint.setColor(Color.WHITE);
             overlayPaint.setAlpha(Math.round(alpha * 255));
+            overlayPaint.setXfermode(OVERLAY_SRC_IN);
+            int currentLine = -1;
+            float lineMinLeft = 0f, lineMaxRight = 0f;
             for (int i = 0; i < clusterCount; i++) {
-                if (clusterStart[i] < wordStart) continue;
-                if (clusterStart[i] >= wordEnd) break;
+                final int offset = clusterStart[i];
+                if (offset < textStart) continue;
+                if (offset >= textEnd) break;
                 if (!clusterHasRect[i]) continue;
-                canvas.drawRect(clusterLeft[i] + paddingLeft, top, clusterRight[i] + paddingLeft,
-                        bottom, overlayPaint);
+                final int line = layout.getLineForOffset(offset);
+                if (line != currentLine) {
+                    if (currentLine >= 0) {
+                        renderOverlayLine(canvas, layout, currentLine,
+                                lineMinLeft, lineMaxRight, txX, txY);
+                    }
+                    currentLine = line;
+                    lineMinLeft = clusterLeft[i];
+                    lineMaxRight = clusterRight[i];
+                } else {
+                    lineMinLeft = Math.min(lineMinLeft, clusterLeft[i]);
+                    lineMaxRight = Math.max(lineMaxRight, clusterRight[i]);
+                }
             }
+            if (currentLine >= 0) {
+                renderOverlayLine(canvas, layout, currentLine, lineMinLeft, lineMaxRight, txX, txY);
+            }
+            overlayPaint.setXfermode(null);
+        }
+
+        /**
+         * One saveLayer pass for a single Layout line. Draws all text into the layer as a glyph
+         * alpha mask, then composites white through it with SRC_IN so only ink pixels are lit.
+         */
+        private void renderOverlayLine(Canvas canvas, Layout layout, int lineNum,
+                float minLeft, float maxRight, float txX, float txY) {
+            final float cl = minLeft + txX;
+            final float ct = layout.getLineTop(lineNum) + txY;
+            final float cr = maxRight + txX;
+            final float cb = layout.getLineBottom(lineNum) + txY;
+            if (cl >= cr || ct >= cb) return;
+            final int save = canvas.saveLayer(cl, ct, cr, cb, null);
+            canvas.translate(txX, txY);
+            layout.draw(canvas); // draws pre-shaped text into layer as glyph alpha mask
+            canvas.translate(-txX, -txY);
+            canvas.drawRect(cl, ct, cr, cb, overlayPaint); // SRC_IN: white only over glyph ink
+            canvas.restoreToCount(save);
         }
 
         private static float longNoteOverlayAlpha(long elapsedMs, long animMs) {
