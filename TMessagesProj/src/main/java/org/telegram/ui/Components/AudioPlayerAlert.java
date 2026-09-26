@@ -5019,6 +5019,12 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         private int runCount;
         /** The view's own mutable copy of the text, or null for a line with no inline timing. */
         private Spannable karaokeText;
+        /**
+         * Plain-string snapshot of {@code karaokeText}, cached once in {@link #setLyricText} so
+         * that {@link #drawGlyphOverlay} can call {@code drawTextRun} without allocating a String
+         * per frame. Null when {@code karaokeText} is null.
+         */
+        private String karaokeTextStr;
 
         private boolean karaokeActive;
         private int mutedColor;
@@ -5087,7 +5093,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         private int[] prevWordTextStart = new int[KaraokeFrame.PREV_LONG_NOTE_MAX];
         /** UTF-16 text end offset of each live previous word. Grown lazily. */
         private int[] prevWordTextEnd = new int[KaraokeFrame.PREV_LONG_NOTE_MAX];
-        // overlayPaint and OVERLAY_SRC_IN removed: the saveLayerAlpha+drawText approach
+        // overlayPaint and OVERLAY_SRC_IN removed: the saveLayerAlpha+drawTextRun approach
         // no longer uses SRC_IN compositing (see drawGlyphOverlay).
 
 
@@ -5119,6 +5125,9 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 setText(text);
                 karaokeText = null;
             }
+            // Cache a plain-string snapshot so drawGlyphOverlay can call drawTextRun without
+            // allocating a String per frame. Replaced whenever the row is rebound.
+            karaokeTextStr = karaokeText != null ? karaokeText.toString() : null;
         }
 
         /** Sets the text colour without the ColorStateList a repeated call would allocate. */
@@ -5595,14 +5604,17 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         /**
          * Post-draw brightness overlay for the active long-note word and any live previous-word
          * return tails. Calls super.onDraw once for normal text, then for each active overlay
-         * region opens a hardware saveLayer, re-draws the text into it as a glyph alpha mask, and
-         * composites a white rect through that mask using SRC_IN. The white therefore follows the
-         * exact ink outlines of the glyphs rather than their rectangular bounding boxes.
+         * region opens a {@code saveLayerAlpha} and re-draws only the target clusters via
+         * {@code drawTextRun} with full-line shaping context. The composited white layer is then
+         * blended at the requested alpha onto the normal draw.
          *
-         * <p>Handles line-wrapping: clusters that belong to the same eligible word but appear on
-         * different Layout lines each get their own saveLayer pass.
+         * <p>Handles line-wrapping: each cluster resolves its baseline via
+         * {@code layout.getLineForOffset()}. All clusters for one overlay call share a single
+         * {@code saveLayerAlpha} pass; the layer is composited once at the end.
          *
-         * <p>No spans, no setSpan, no re-shaping. layout.draw() uses pre-shaped text only.
+         * <p>No spans, no setSpan, no per-frame re-layout. {@code drawTextRun} uses the
+         * pre-shaped layout paint with full-line context, so Arabic contextual forms, kerning
+         * pairs, and ligatures match the platform layout output.
          */
         @Override
         protected void onDraw(Canvas canvas) {
@@ -5625,55 +5637,72 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
 
         /**
          * Renders a white-alpha glyph overlay for [{@code textStart}, {@code textEnd}) using
-         * {@code canvas.drawText()} per cluster rather than {@code layout.draw()} as a mask.
+         * {@code canvas.drawTextRun()} with full-line shaping context.
          *
-         * <p><b>Why this isolates target glyph ink:</b> only target-cluster {@code drawText}
-         * calls are made into the {@code saveLayerAlpha} layer. No {@code layout.draw()} is
-         * called, so non-target glyph ink is physically absent from the layer. The approach
-         * therefore does not rely on layer clipping to reject neighboring glyphs.
+         * <p><b>Shaping fidelity:</b> each cluster is drawn with
+         * {@code contextStart = layout.getLineStart(line)},
+         * {@code contextEnd = layout.getLineEnd(line)}, matching the context range the platform
+         * itself uses. Arabic contextual forms, kerning pairs, and ligatures therefore match the
+         * Layout-rendered output. The {@code x} coordinate comes from
+         * {@code layout.getPrimaryHorizontal(offset)}: the leading edge in the run's direction
+         * (left for LTR, right for RTL), which is what {@code drawTextRun} expects.
          *
-         * <p><b>Glyph overhang:</b> {@code drawText} renders the full glyph extent including
-         * ink that overhangs the advance bounds. The layer uses the full view dimensions so that
-         * overhang is never clipped.
+         * <p><b>Coordinate fidelity:</b> the translation replicates TextView's own
+         * {@code canvas.translate(compoundPaddingLeft - scrollX, extendedPaddingTop + voffset - scrollY)}
+         * before {@code layout.draw()}, including the {@code CENTER_VERTICAL} offset.
          *
-         * <p><b>No double-brightening:</b> {@code saveLayerAlpha} composites the layer (which
-         * has fully-opaque white ink where clusters overlap) at the desired overlay alpha. Whether
-         * two adjacent clusters produce overlapping white ink in the layer is irrelevant: the
-         * composited contribution is capped at the layer alpha.
+         * <p><b>Isolation:</b> only target-cluster {@code drawTextRun} calls are made into the
+         * {@code saveLayerAlpha} layer. Non-target glyph ink is physically absent.
          *
-         * <p>Handles line-wrapping: each cluster resolves its baseline via
-         * {@code layout.getLineForOffset()}. No spans, no setSpan, no re-shaping.
+         * <p><b>Glyph overhang:</b> the saveLayer uses full view dimensions so that overhang
+         * is never clipped.
          *
-         * <p>Shaping note: each cluster is drawn as an independent {@code drawText} run.
-         * Intra-word kerning pairs at cluster boundaries and complex-script contextual forms that
-         * depend on neighboring non-target characters may differ from the shaped layout. At the
-         * 30% maximum overlay alpha this difference is imperceptible.
+         * <p><b>No double-brightening:</b> {@code saveLayerAlpha} composites the layer at the
+         * desired overlay alpha; overlapping white ink from adjacent clusters is capped at that
+         * alpha.
+         *
+         * <p>No spans, no setSpan, no per-frame allocation. The plain-text snapshot
+         * ({@link #karaokeTextStr}) is cached in {@link #setLyricText}.
          */
         private void drawGlyphOverlay(Canvas canvas, int textStart, int textEnd, float alpha) {
             if (clusterCount == 0 || textEnd <= textStart || karaokeText == null) return;
+            if (karaokeTextStr == null) return;
             final Layout layout = getLayout();
             if (layout == null) return;
             if (alpha <= 0f) return;
-            final float txX = getCompoundPaddingLeft();
-            final float txY = getCompoundPaddingTop() - getScrollY();
+            // Replicate the coordinate transform TextView applies before Layout.draw():
+            //   canvas.translate(compoundPaddingLeft - scrollX, extendedPaddingTop + voffset - scrollY)
+            // where voffset = (boxHeight - layoutHeight) >> 1 for CENTER_VERTICAL, clamped to >= 0.
+            final int compTop = getCompoundPaddingTop();
+            final int compBottom = getCompoundPaddingBottom();
+            final int boxHeight = getMeasuredHeight() - compTop - compBottom;
+            final int layoutHeight = layout.getHeight();
+            final int voffset = layoutHeight < boxHeight ? (boxHeight - layoutHeight) >> 1 : 0;
+            final float txX = getCompoundPaddingLeft() - getScrollX();
+            final float txY = getExtendedPaddingTop() + voffset - getScrollY();
             // Full view bounds: no saveLayer clip that would cut glyph overhang.
             final int save = canvas.saveLayerAlpha(0, 0, getWidth(), getHeight(),
                     Math.round(alpha * 255));
             final TextPaint lp = layout.getPaint();
             final int savedColor = lp.getColor();
             lp.setColor(Color.WHITE);
-            final String textStr = karaokeText.toString(); // String avoids span color overrides
             for (int i = 0; i < clusterCount; i++) {
                 final int offset = clusterStart[i];
                 if (offset < textStart) continue;
                 if (offset >= textEnd) break;
                 if (!clusterHasRect[i]) continue;
                 final int nextOffset = (i + 1 < clusterCount)
-                        ? clusterStart[i + 1] : karaokeText.length();
+                        ? clusterStart[i + 1] : karaokeTextStr.length();
                 final int drawEnd = Math.min(nextOffset, textEnd);
                 final int lineNum = layout.getLineForOffset(offset);
-                canvas.drawText(textStr, offset, drawEnd,
-                        clusterLeft[i] + txX, layout.getLineBaseline(lineNum) + txY, lp);
+                final int contextStart = layout.getLineStart(lineNum);
+                final int contextEnd = layout.getLineEnd(lineNum);
+                // getPrimaryHorizontal gives the leading edge in the cluster's run direction:
+                // left edge for LTR, right edge for RTL — exactly what drawTextRun expects for x.
+                final float x = layout.getPrimaryHorizontal(offset) + txX;
+                final float y = layout.getLineBaseline(lineNum) + txY;
+                canvas.drawTextRun(karaokeTextStr, offset, drawEnd,
+                        contextStart, contextEnd, x, y, clusterRtl[i], lp);
             }
             lp.setColor(savedColor);
             canvas.restoreToCount(save);
