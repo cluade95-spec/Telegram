@@ -2634,32 +2634,29 @@ class LyricsKaraokeRenderingTest {
 
     @Test
     fun pass3_glyphOverlay_methodsExistForGlyphFollowingRendering() {
-        // Structural guard: the glyph-following overlay needs two helpers plus a static xfermode.
-        // renderOverlayCluster (per-cluster isolation) supersedes the old renderOverlayLine.
+        // Structural guard: the glyph-following overlay uses drawGlyphOverlay with saveLayerAlpha.
+        // Pass-6 redesign: renderOverlayCluster and OVERLAY_SRC_IN are removed; the overlay now
+        // uses saveLayerAlpha + canvas.drawText directly in drawGlyphOverlay (no SRC_IN needed).
         val ltv = lyricsTextViewClass()
         val methodNames = ltv.declaredMethods.map { it.name }
         assertTrue("drawGlyphOverlay must exist for glyph-following overlay",
             "drawGlyphOverlay" in methodNames)
-        assertTrue("renderOverlayCluster must exist for per-cluster saveLayer isolation (BLOCKER-1 fix)",
+        assertFalse("renderOverlayCluster must NOT exist — pass-6 uses saveLayerAlpha+drawText",
             "renderOverlayCluster" in methodNames)
-        assertFalse("renderOverlayLine must NOT exist — replaced by per-cluster renderOverlayCluster",
+        assertFalse("renderOverlayLine must NOT exist — replaced by saveLayerAlpha+drawText",
             "renderOverlayLine" in methodNames)
         val fieldNames = ltv.declaredFields.map { it.name }
-        assertTrue("OVERLAY_SRC_IN static xfermode must exist to avoid per-frame allocation",
+        assertFalse("OVERLAY_SRC_IN must NOT exist — pass-6 uses saveLayerAlpha, no SRC_IN needed",
             "OVERLAY_SRC_IN" in fieldNames)
     }
 
     @Test
     fun pass3_glyphOverlay_overlaySrcInIsPorterDuffXfermode() {
-        // OVERLAY_SRC_IN must be a non-null PorterDuffXfermode to ensure glyph-following compositing.
+        // Pass-6: OVERLAY_SRC_IN is removed. The new saveLayerAlpha+drawText approach does not
+        // use a PorterDuffXfermode for compositing — saveLayerAlpha handles alpha compositing directly.
         val ltv = lyricsTextViewClass()
         val field = ltv.declaredFields.find { it.name == "OVERLAY_SRC_IN" }
-            ?: error("OVERLAY_SRC_IN field not found")
-        field.isAccessible = true
-        val value = field.get(null)
-        assertNotNull("OVERLAY_SRC_IN must not be null", value)
-        assertTrue("OVERLAY_SRC_IN must be a PorterDuffXfermode",
-            value is android.graphics.PorterDuffXfermode)
+        assertNull("OVERLAY_SRC_IN must not exist — pass-6 uses saveLayerAlpha+drawText, no SRC_IN", field)
     }
 
     @Test
@@ -2683,13 +2680,14 @@ class LyricsKaraokeRenderingTest {
 
     @Test
     fun pass5_renderOverlayCluster_existsLineVersionRemoved() {
-        // BLOCKER-1: per-cluster saveLayer (renderOverlayCluster) replaces the per-line version.
-        // renderOverlayLine is gone; any unrelated-glyph path it created is closed.
+        // Pass-6: renderOverlayCluster is fully removed. The overlay now uses saveLayerAlpha +
+        // canvas.drawText per cluster in drawGlyphOverlay, with no per-cluster SRC_IN saveLayer
+        // helper. Neither renderOverlayCluster nor renderOverlayLine exist any more.
         val ltv = lyricsTextViewClass()
         val methods = ltv.declaredMethods.map { it.name }
-        assertTrue("renderOverlayCluster must exist for per-cluster SRC_IN isolation",
+        assertFalse("renderOverlayCluster must NOT exist — pass-6 removed it for saveLayerAlpha+drawText",
             "renderOverlayCluster" in methods)
-        assertFalse("renderOverlayLine must not exist — replaced by per-cluster renderOverlayCluster",
+        assertFalse("renderOverlayLine must not exist — replaced by saveLayerAlpha+drawText",
             "renderOverlayLine" in methods)
     }
 
@@ -2822,6 +2820,134 @@ class LyricsKaraokeRenderingTest {
             count >= 5)
         assertTrue("prevWordAbsoluteStartMs array must be >= count after capacity grow",
             frame.prevWordAbsoluteStartMs.size >= count)
+    }
+
+    // ===================================================================== audit pass 6 corrections
+
+    @Test
+    fun pass6_drawText_overlay_noSrcInNoRenderOverlayHelper() {
+        // BLOCKER-1 final: saveLayerAlpha+drawText design guard.
+        // drawGlyphOverlay still exists; renderOverlayCluster is gone; OVERLAY_SRC_IN is gone.
+        // isIgnorableInterWordSpace static helper must exist (BLOCKER-4).
+        val ltv = lyricsTextViewClass()
+        val methodNames = ltv.declaredMethods.map { it.name }
+        assertTrue("drawGlyphOverlay must exist", "drawGlyphOverlay" in methodNames)
+        assertFalse("renderOverlayCluster must NOT exist (removed in pass-6)",
+            "renderOverlayCluster" in methodNames)
+        val fieldNames = ltv.declaredFields.map { it.name }
+        assertFalse("OVERLAY_SRC_IN must NOT exist (removed in pass-6)",
+            "OVERLAY_SRC_IN" in fieldNames)
+        assertTrue("isIgnorableInterWordSpace must exist for BLOCKER-4 spacing gate",
+            "isIgnorableInterWordSpace" in methodNames)
+    }
+
+    @Test
+    fun pass6_prevTailCapacity_geometricGrowth() {
+        // BLOCKER-2: KaraokeFrame capacity must NOT reallocate for every +1 growth.
+        // PREV_LONG_NOTE_MAX is 4. Growing to 5 tails should double capacity to 8.
+        val frame = KaraokeFrame()
+        val line = ttml("""<p begin="00:00.000" end="00:15.000">""" +
+            """<span begin="00:00.000" end="00:05.000">w1</span> """ +
+            """<span begin="00:00.500" end="00:05.000">w2</span> """ +
+            """<span begin="00:01.000" end="00:05.000">w3</span> """ +
+            """<span begin="00:01.500" end="00:05.000">w4</span> """ +
+            """<span begin="00:02.000" end="00:05.000">w5</span> """ +
+            """<span begin="00:02.500" end="00:03.000">cur</span></p>""")
+        frame.resolve(line, 2600L, 15000L)
+        // Geometric growth: first overflow of capacity 4 grows to max(5, 4*2) = 8.
+        // So after 5 tails, array length >= 8 (not just 5).
+        assertTrue("prevWordAbsoluteStartMs.length must be >= 8 after geometric growth from 4 to 5 tails",
+            frame.prevWordAbsoluteStartMs.size >= 8)
+        // A second resolve at the same position must NOT re-allocate (capacity already sufficient).
+        val sizeBefore = frame.prevWordAbsoluteStartMs.size
+        frame.resolve(line, 2600L, 15000L)
+        assertEquals("repeated resolve at same position must not re-allocate capacity arrays",
+            sizeBefore, frame.prevWordAbsoluteStartMs.size)
+    }
+
+    @Test
+    fun pass6_stableTimestamp_resolveIdenticalPositionTwice() {
+        // BLOCKER-3 stable timestamp: resolving the same position twice must produce identical fields.
+        val line = pairWithGap(1500)
+        val frame = KaraokeFrame()
+        frame.resolve(line, 700, Long.MAX_VALUE)
+        val elig = frame.longNoteEligible
+        val dur = frame.wordDurationMs
+        val absStart = frame.wordAbsoluteStartMs
+        val wordStart = frame.wordStart
+        val wordEnd = frame.wordEnd
+        val sweep = frame.sweep
+        // Re-resolve at the exact same position.
+        frame.resolve(line, 700, Long.MAX_VALUE)
+        assertEquals("second resolve: longNoteEligible unchanged", elig, frame.longNoteEligible)
+        assertEquals("second resolve: wordDurationMs unchanged", dur, frame.wordDurationMs)
+        assertEquals("second resolve: wordAbsoluteStartMs unchanged", absStart, frame.wordAbsoluteStartMs)
+        assertEquals("second resolve: wordStart unchanged", wordStart, frame.wordStart)
+        assertEquals("second resolve: wordEnd unchanged", wordEnd, frame.wordEnd)
+        assertEquals("second resolve: sweep unchanged", sweep, frame.sweep, 0.0001f)
+    }
+
+    @Test
+    fun pass6_isIgnorableInterWordSpace_helperExists() {
+        // BLOCKER-4: isIgnorableInterWordSpace must be a static helper in LyricsTextView.
+        val ltv = lyricsTextViewClass()
+        val methods = ltv.declaredMethods.map { it.name }
+        assertTrue("isIgnorableInterWordSpace static helper must exist for Unicode spacing gate",
+            "isIgnorableInterWordSpace" in methods)
+    }
+
+    @Test
+    fun pass6_unicodeSpacing_nbspAndOtherZsNotCounted() {
+        // BLOCKER-4: NBSP U+00A0, narrow NBSP U+202F, and figure space U+2007 must all be
+        // ignorable. Character.isWhitespace() returns false for NBSP (old bug: NBSP was counted).
+        // isIgnorableInterWordSpace must return true for all three.
+        val ltv = lyricsTextViewClass()
+        val isIgnorable = ltv.getDeclaredMethod("isIgnorableInterWordSpace",
+            CharSequence::class.java, Int::class.javaPrimitiveType)
+            .apply { isAccessible = true }
+        // NBSP U+00A0 — isWhitespace returns false, but isSpaceChar returns true.
+        assertFalse("sanity: Character.isWhitespace(0xA0) should be false",
+            Character.isWhitespace(' '.code))
+        assertTrue("NBSP U+00A0 must be ignorable via isSpaceChar",
+            isIgnorable.invoke(null, " ", 0) as Boolean)
+        // Narrow NBSP U+202F.
+        assertTrue("narrow NBSP U+202F must be ignorable",
+            isIgnorable.invoke(null, " ", 0) as Boolean)
+        // Figure space U+2007.
+        assertTrue("figure space U+2007 must be ignorable",
+            isIgnorable.invoke(null, " ", 0) as Boolean)
+        // ASCII space — isWhitespace returns true.
+        assertTrue("ASCII space must be ignorable",
+            isIgnorable.invoke(null, " ", 0) as Boolean)
+        // Regular grapheme must NOT be ignorable.
+        assertFalse("regular char 'a' must not be ignorable",
+            isIgnorable.invoke(null, "a", 0) as Boolean)
+    }
+
+    @Test
+    fun pass6_recycling_staleCurrentEmphasisCleared() {
+        // BLOCKER-3 recycling: setLyricText must clear both longNoteEligible and longNoteElapsedMs
+        // so a recycled row cannot render the previous text's current-word overlay.
+        val ctx = InstrumentationRegistry.getInstrumentation().targetContext
+        val ltvClass = lyricsTextViewClass()
+        val ctor = ltvClass.getDeclaredConstructor(Context::class.java).apply { isAccessible = true }
+        val ltv = ctor.newInstance(ctx)
+        // Simulate a row with active current-word emphasis.
+        val eligField = ltvClass.getDeclaredField("longNoteEligible").apply { isAccessible = true }
+        val elapsedField = ltvClass.getDeclaredField("longNoteElapsedMs").apply { isAccessible = true }
+        eligField.setBoolean(ltv, true)
+        elapsedField.setLong(ltv, 500L)
+        assertEquals("precondition: longNoteEligible=true before rebind", true, eligField.getBoolean(ltv))
+        assertEquals("precondition: longNoteElapsedMs=500 before rebind", 500L, elapsedField.getLong(ltv))
+        // Rebind via setLyricText.
+        ltvClass.getDeclaredMethod("setLyricText",
+            CharSequence::class.java, Boolean::class.javaPrimitiveType)
+            .apply { isAccessible = true }
+            .invoke(ltv, "new text", false)
+        assertFalse("longNoteEligible must be false after setLyricText rebind",
+            eligField.getBoolean(ltv))
+        assertEquals("longNoteElapsedMs must be -1 after setLyricText rebind (inactive)",
+            -1L, elapsedField.getLong(ltv))
     }
 
     // ------------------------------------------------------------------ helpers for pass3 tests

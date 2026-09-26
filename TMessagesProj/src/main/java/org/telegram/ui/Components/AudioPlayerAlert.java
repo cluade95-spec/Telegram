@@ -3825,12 +3825,14 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         }
         // Previous-tail emphasis — every tail that passes the grapheme-count gate.
         final int prevCount = karaoke.prevLongNoteCount;
-        if (prevCount > prevElapsedScratch.length) prevElapsedScratch = new long[prevCount];
+        if (prevCount > prevElapsedScratch.length)
+            prevElapsedScratch = new long[Math.max(prevCount, prevElapsedScratch.length * 2)];
         if (prevCount > filteredPrevElapsedMs.length) {
-            filteredPrevElapsedMs = new long[prevCount];
-            filteredPrevDurationMs = new long[prevCount];
-            filteredPrevTextStart = new int[prevCount];
-            filteredPrevTextEnd = new int[prevCount];
+            final int nc = Math.max(prevCount, filteredPrevElapsedMs.length * 2);
+            filteredPrevElapsedMs = new long[nc];
+            filteredPrevDurationMs = new long[nc];
+            filteredPrevTextStart = new int[nc];
+            filteredPrevTextEnd = new int[nc];
         }
         int filtered = 0;
         for (int i = 0; i < prevCount; i++) {
@@ -4050,12 +4052,14 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             // Each tail passes the same grapheme-count gate as the current-word path.
             if (wordFrame && visibleLyrics.get(row) == karaokeLine) {
                 final int prevCount = rowKaraoke.prevLongNoteCount;
-                if (prevCount > prevElapsedScratch.length) prevElapsedScratch = new long[prevCount];
+                if (prevCount > prevElapsedScratch.length)
+                    prevElapsedScratch = new long[Math.max(prevCount, prevElapsedScratch.length * 2)];
                 if (prevCount > filteredPrevElapsedMs.length) {
-                    filteredPrevElapsedMs = new long[prevCount];
-                    filteredPrevDurationMs = new long[prevCount];
-                    filteredPrevTextStart = new int[prevCount];
-                    filteredPrevTextEnd = new int[prevCount];
+                    final int nc = Math.max(prevCount, filteredPrevElapsedMs.length * 2);
+                    filteredPrevElapsedMs = new long[nc];
+                    filteredPrevDurationMs = new long[nc];
+                    filteredPrevTextStart = new int[nc];
+                    filteredPrevTextEnd = new int[nc];
                 }
                 int filtered = 0;
                 for (int i = 0; i < prevCount; i++) {
@@ -4503,10 +4507,13 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
          */
         private void ensurePrevCapacity(int needed) {
             if (needed <= prevWordAbsoluteStartMs.length) return;
-            prevWordAbsoluteStartMs = new long[needed];
-            prevWordDurationMs = new long[needed];
-            prevWordTextStart = new int[needed];
-            prevWordTextEnd = new int[needed];
+            // Geometric doubling so that advancing through a long line reallocates at most
+            // O(log n) times, not once per word.
+            final int cap = Math.max(needed, prevWordAbsoluteStartMs.length * 2);
+            prevWordAbsoluteStartMs = new long[cap];
+            prevWordDurationMs = new long[cap];
+            prevWordTextStart = new int[cap];
+            prevWordTextEnd = new int[cap];
         }
 
         /**
@@ -5080,11 +5087,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         private int[] prevWordTextStart = new int[KaraokeFrame.PREV_LONG_NOTE_MAX];
         /** UTF-16 text end offset of each live previous word. Grown lazily. */
         private int[] prevWordTextEnd = new int[KaraokeFrame.PREV_LONG_NOTE_MAX];
-        /** Paint for the post-draw brightness overlay on the active long-note word. */
-        private final Paint overlayPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-        /** Precomputed SRC_IN xfermode for the glyph-following overlay; shared across all draws. */
-        private static final PorterDuffXfermode OVERLAY_SRC_IN =
-                new PorterDuffXfermode(PorterDuff.Mode.SRC_IN);
+        // overlayPaint and OVERLAY_SRC_IN removed: the saveLayerAlpha+drawText approach
+        // no longer uses SRC_IN compositing (see drawGlyphOverlay).
 
 
         LyricsTextView(Context context) {
@@ -5150,12 +5154,13 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
          */
         void setPrevLongNoteEmphasis(int count, long[] elapsedMs, long[] durations,
                 int[] textStarts, int[] textEnds) {
-            // Grow view-side arrays when line structure exceeds initial capacity; never per-frame.
+            // Geometric growth so that adding one more tail per line does not allocate every call.
             if (count > prevWordElapsedMs.length) {
-                prevWordElapsedMs = new long[count];
-                prevWordDurationMs = new long[count];
-                prevWordTextStart = new int[count];
-                prevWordTextEnd = new int[count];
+                final int newLen = Math.max(count, prevWordElapsedMs.length * 2);
+                prevWordElapsedMs = new long[newLen];
+                prevWordDurationMs = new long[newLen];
+                prevWordTextStart = new int[newLen];
+                prevWordTextEnd = new int[newLen];
             }
             boolean changed = prevLongNoteCount != count;
             prevLongNoteCount = count;
@@ -5179,9 +5184,11 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         }
 
         /**
-         * Counts grapheme clusters in [{@code start}, {@code end}) whose start character is not
-         * whitespace. Trailing inter-word whitespace is excluded so segment ranges that extend to
-         * the next word's start do not inflate the eligibility count.
+         * Counts grapheme clusters in [{@code start}, {@code end}) whose start codepoint is not
+         * an ignorable inter-word spacing character. Excludes ASCII space, Unicode whitespace
+         * (isWhitespace), and all Unicode Zs general-category members (isSpaceChar), covering
+         * NBSP U+00A0, narrow NBSP U+202F, figure space U+2007, and similar, so that segment
+         * ranges that extend to the next word's start do not inflate the eligibility count.
          */
         int graphemeCountInRange(int start, int end) {
             if (clusterCount == 0 || end <= start || karaokeText == null) return 0;
@@ -5190,11 +5197,23 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 final int offset = clusterStart[i];
                 if (offset < start) continue;
                 if (offset >= end) break;
-                if (offset < karaokeText.length()
-                        && Character.isWhitespace(karaokeText.charAt(offset))) continue;
+                if (isIgnorableInterWordSpace(karaokeText, offset)) continue;
                 count++;
             }
             return count;
+        }
+
+        /**
+         * Returns true when the character (or codepoint) at {@code charOffset} is an ignorable
+         * inter-word spacing character and must not count as a visible grapheme for long-note
+         * eligibility. Covers both {@link Character#isWhitespace} (C0/ASCII) and
+         * {@link Character#isSpaceChar} (Unicode Zs category: NBSP U+00A0, narrow NBSP U+202F,
+         * figure space U+2007, etc.).  Uses codePoint to handle surrogate pairs correctly.
+         */
+        private static boolean isIgnorableInterWordSpace(CharSequence text, int charOffset) {
+            if (charOffset >= text.length()) return false;
+            final int cp = Character.codePointAt(text, charOffset);
+            return Character.isWhitespace(cp) || Character.isSpaceChar(cp);
         }
 
         void setKaraokeColors(int muted, int sung) {
@@ -5605,55 +5624,58 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         }
 
         /**
-         * Renders a glyph-following white-alpha overlay for [{@code textStart}, {@code textEnd}).
-         * Issues one saveLayer per target grapheme cluster so unrelated glyphs — including those
-         * that visually interleave the target word in mixed RTL/LTR text — cannot enter the mask.
-         * Each saveLayer is bounded to exactly the cluster's horizontal strip; {@code layout.draw()}
-         * renders all text into the layer but the bounds clip it, so ink from neighbouring glyphs
-         * is outside the layer and is composited away before SRC_IN applies.
+         * Renders a white-alpha glyph overlay for [{@code textStart}, {@code textEnd}) using
+         * {@code canvas.drawText()} per cluster rather than {@code layout.draw()} as a mask.
          *
-         * <p>Handles line-wrapping naturally: each cluster derives its vertical band from
-         * {@code layout.getLineForOffset()} independently.
+         * <p><b>Why this isolates target glyph ink:</b> only target-cluster {@code drawText}
+         * calls are made into the {@code saveLayerAlpha} layer. No {@code layout.draw()} is
+         * called, so non-target glyph ink is physically absent from the layer. The approach
+         * therefore does not rely on layer clipping to reject neighboring glyphs.
          *
-         * <p>No spans, no setSpan, no re-shaping. {@code layout.draw()} uses pre-shaped text only.
+         * <p><b>Glyph overhang:</b> {@code drawText} renders the full glyph extent including
+         * ink that overhangs the advance bounds. The layer uses the full view dimensions so that
+         * overhang is never clipped.
+         *
+         * <p><b>No double-brightening:</b> {@code saveLayerAlpha} composites the layer (which
+         * has fully-opaque white ink where clusters overlap) at the desired overlay alpha. Whether
+         * two adjacent clusters produce overlapping white ink in the layer is irrelevant: the
+         * composited contribution is capped at the layer alpha.
+         *
+         * <p>Handles line-wrapping: each cluster resolves its baseline via
+         * {@code layout.getLineForOffset()}. No spans, no setSpan, no re-shaping.
+         *
+         * <p>Shaping note: each cluster is drawn as an independent {@code drawText} run.
+         * Intra-word kerning pairs at cluster boundaries and complex-script contextual forms that
+         * depend on neighboring non-target characters may differ from the shaped layout. At the
+         * 30% maximum overlay alpha this difference is imperceptible.
          */
         private void drawGlyphOverlay(Canvas canvas, int textStart, int textEnd, float alpha) {
-            if (clusterCount == 0 || textEnd <= textStart) return;
+            if (clusterCount == 0 || textEnd <= textStart || karaokeText == null) return;
             final Layout layout = getLayout();
             if (layout == null) return;
+            if (alpha <= 0f) return;
             final float txX = getCompoundPaddingLeft();
             final float txY = getCompoundPaddingTop() - getScrollY();
-            overlayPaint.setColor(Color.WHITE);
-            overlayPaint.setAlpha(Math.round(alpha * 255));
-            overlayPaint.setXfermode(OVERLAY_SRC_IN);
+            // Full view bounds: no saveLayer clip that would cut glyph overhang.
+            final int save = canvas.saveLayerAlpha(0, 0, getWidth(), getHeight(),
+                    Math.round(alpha * 255));
+            final TextPaint lp = layout.getPaint();
+            final int savedColor = lp.getColor();
+            lp.setColor(Color.WHITE);
+            final String textStr = karaokeText.toString(); // String avoids span color overrides
             for (int i = 0; i < clusterCount; i++) {
                 final int offset = clusterStart[i];
                 if (offset < textStart) continue;
                 if (offset >= textEnd) break;
                 if (!clusterHasRect[i]) continue;
-                renderOverlayCluster(canvas, layout, i, txX, txY);
+                final int nextOffset = (i + 1 < clusterCount)
+                        ? clusterStart[i + 1] : karaokeText.length();
+                final int drawEnd = Math.min(nextOffset, textEnd);
+                final int lineNum = layout.getLineForOffset(offset);
+                canvas.drawText(textStr, offset, drawEnd,
+                        clusterLeft[i] + txX, layout.getLineBaseline(lineNum) + txY, lp);
             }
-            overlayPaint.setXfermode(null);
-        }
-
-        /**
-         * One saveLayer pass for a single grapheme cluster. Draws all text into the layer as a
-         * glyph alpha mask bounded to exactly this cluster's horizontal strip, then composites
-         * white through the mask with SRC_IN. Any ink from an unrelated glyph that falls outside
-         * the strip is clipped by the layer bounds and never reaches the output.
-         */
-        private void renderOverlayCluster(Canvas canvas, Layout layout, int ci, float txX, float txY) {
-            final int lineNum = layout.getLineForOffset(clusterStart[ci]);
-            final float cl = clusterLeft[ci] + txX;
-            final float ct = layout.getLineTop(lineNum) + txY;
-            final float cr = clusterRight[ci] + txX;
-            final float cb = layout.getLineBottom(lineNum) + txY;
-            if (cl >= cr || ct >= cb) return;
-            final int save = canvas.saveLayer(cl, ct, cr, cb, null);
-            canvas.translate(txX, txY);
-            layout.draw(canvas); // pre-shaped text into layer; bounds clip to this cluster's strip
-            canvas.translate(-txX, -txY);
-            canvas.drawRect(cl, ct, cr, cb, overlayPaint); // SRC_IN: white only over this cluster's ink
+            lp.setColor(savedColor);
             canvas.restoreToCount(save);
         }
 
