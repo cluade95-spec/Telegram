@@ -135,7 +135,9 @@ import org.telegram.ui.SyncedLyricsEditorFragment;
 import java.io.File;
 import java.text.BreakIterator;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.NotificationCenterDelegate, DownloadController.FileDownloadProgressListener {
 
@@ -154,6 +156,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
     private RecyclerListView lyricsListView;
     private LinearLayoutManager lyricsLayoutManager;
     private LyricsAdapter lyricsAdapter;
+    private View lyricsViewportFade;
     private final ArrayList<Integer> visibleLyrics = new ArrayList<>();
     private boolean showingLyrics;
     private boolean lyricsModeRequested;
@@ -1339,6 +1342,34 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         lyricsParams.topMargin = ActionBar.getCurrentActionBarHeight() + AndroidUtilities.statusBarHeight;
         lyricsParams.bottomMargin = dp(179 + (!isMyList() && !noforwards ? 52 : 0));
         containerView.addView(lyricsListView, lyricsParams);
+
+        // Viewport edge fade: continuous top/bottom gradient that hides lines scrolling in and out.
+        // Drawn above the list so it applies uniformly, independent of per-row alpha or blur.
+        lyricsViewportFade = new View(context) {
+            private final Paint fadePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+            { setWillNotDraw(false); }
+            @Override
+            protected void onDraw(android.graphics.Canvas canvas) {
+                final int w = getWidth(), h = getHeight();
+                final int bg = getThemedColor(Theme.key_player_background);
+                // Provisional fade height (72dp) — not verified against Apple Music measurements.
+                // This overlay paints opaque player-background rectangles; it is an approximation
+                // of a true alpha mask (DST_IN) that is safe for flat backgrounds but does not
+                // composite correctly over heterogeneous content. It must not intercept touch.
+                final int fadeH = Math.min(dp(72), h / 3);
+                // Top fade: opaque background -> transparent
+                fadePaint.setShader(new LinearGradient(0, 0, 0, fadeH,
+                        bg, 0, Shader.TileMode.CLAMP));
+                canvas.drawRect(0, 0, w, fadeH, fadePaint);
+                // Bottom fade: transparent -> opaque background
+                fadePaint.setShader(new LinearGradient(0, h - fadeH, 0, h,
+                        0, bg, Shader.TileMode.CLAMP));
+                canvas.drawRect(0, h - fadeH, w, h, fadePaint);
+            }
+        };
+        lyricsViewportFade.setVisibility(View.GONE);
+        containerView.addView(lyricsViewportFade, lyricsParams);
+
         lyricsListView.addOnScrollListener(new RecyclerView.OnScrollListener() {
             @Override
             public void onScrollStateChanged(RecyclerView recyclerView, int newState) {
@@ -2330,6 +2361,13 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             params.topMargin = top;
             lyricsListView.setLayoutParams(params);
         }
+        if (lyricsViewportFade != null) {
+            FrameLayout.LayoutParams fadeParams = (FrameLayout.LayoutParams) lyricsViewportFade.getLayoutParams();
+            if (fadeParams.topMargin != top) {
+                fadeParams.topMargin = top;
+                lyricsViewportFade.setLayoutParams(fadeParams);
+            }
+        }
         if (lyricsExpandButton != null) {
             FrameLayout.LayoutParams expandParams = (FrameLayout.LayoutParams) lyricsExpandButton.getLayoutParams();
             int expandTop = top + dp(4);
@@ -2767,6 +2805,10 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         lyricsListView.setTranslationX(direction * (1f - lyricsPageProgress) * width);
         listView.setVisibility(lyricsPageProgress < 1f ? View.VISIBLE : View.GONE);
         lyricsListView.setVisibility(lyricsPageProgress > 0f ? View.VISIBLE : View.GONE);
+        if (lyricsViewportFade != null) {
+            lyricsViewportFade.setTranslationX(direction * (1f - lyricsPageProgress) * width);
+            lyricsViewportFade.setVisibility(lyricsPageProgress > 0f ? View.VISIBLE : View.GONE);
+        }
         if (lyricsExpandButton != null) {
             lyricsExpandButton.setTranslationX(direction * (1f - lyricsPageProgress) * width);
         }
@@ -2961,6 +3003,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                     cancelLyricsPageAnimation();
                     listView.setVisibility(View.VISIBLE);
                     lyricsListView.setVisibility(View.VISIBLE);
+                    if (lyricsViewportFade != null) lyricsViewportFade.setVisibility(View.VISIBLE);
                     listView.setAlpha(1f);
                     lyricsListView.setAlpha(1f);
                     updateLyricsGeometry();
@@ -3067,6 +3110,11 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         FrameLayout.LayoutParams lyricsParams = (FrameLayout.LayoutParams) lyricsListView.getLayoutParams();
         lyricsParams.bottomMargin = dp(height);
         lyricsListView.setLayoutParams(lyricsParams);
+        if (lyricsViewportFade != null) {
+            FrameLayout.LayoutParams fadeParams = (FrameLayout.LayoutParams) lyricsViewportFade.getLayoutParams();
+            fadeParams.bottomMargin = dp(height);
+            lyricsViewportFade.setLayoutParams(fadeParams);
+        }
         fullscreenPlayerLayoutApplied = fullscreen;
         applyProfileButtonsVisibility(false);
 
@@ -3186,7 +3234,10 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
     // line (emphasis, colour, tap-to-seek) still changes exactly at the real timestamp.
     // ---------------------------------------------------------------------------------------
 
-    private static final long LYRIC_FOLLOW_LEAD_MAX = 440;
+    /** Natural-follow pre-anchor lead: movement starts this many ms before the next line's stated
+     *  time, so the incoming row is already rising when the semantic clock advances.
+     *  Reference-derived (Apple Music). */
+    private static final long LYRIC_FOLLOW_LEAD_MAX = 550;
 
     /**
      * How long BEFORE a line's stated time the list starts carrying the previous line away.
@@ -3196,7 +3247,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
      * the next timestamp the row is already scrolling off and fading down. Anything decorative
      * that must be SEEN on the outgoing line has to finish by then, not by the timestamp.
      */
-    static long lyricFollowLeadMs(long gapMs) {
+    static long lyricFollowLeadMs(long gapMs, boolean wordTimed) {
+        if (wordTimed) return Math.min(LYRIC_FOLLOW_LEAD_MAX, gapMs);
         return Math.min(LYRIC_FOLLOW_LEAD_MAX, Math.max(80, gapMs / 2));
     }
     private static final long LYRIC_FOLLOW_MIN_MS = 160;
@@ -3399,7 +3451,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             final long previousTime = line < 0 ? 0 : currentLyrics.lines.get(line).timeMs;
             final long untilNext = nextTime - position;
             final long gap = Math.max(1, nextTime - previousTime);
-            final long lead = lyricFollowLeadMs(gap);
+            final long lead = lyricFollowLeadMs(gap, lyricsWordTimed);
             final int nextRow = rowForLyricsLine(line + 1);
             if (untilNext <= lead) {
                 // Inside the lead window: move toward the next line now. A blank timestamp has no
@@ -3480,19 +3532,82 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             // zero and the half-promoted row from jumping to full in a single frame.
             retargetLyricsEmphasis(row);
         }
+        // Row stagger: distance-to-viewport ratio gives per-row delay. Reference-derived (Apple Music).
+        final int viewportH = lyricsListView.getHeight();
+        final float staggerRatio = viewportH > 0 ? Math.min(1f, Math.abs(distance) / (float) viewportH) : 0f;
+        final long itemDelayMs = Math.round(ROW_ITEM_DELAY_MAX_MS + staggerRatio * (ROW_ITEM_DELAY_MIN_MS - ROW_ITEM_DELAY_MAX_MS));
+        // Distance-derived deceleration: factor ≈ 1 for normal moves → power-2 ease-out. Reference-derived (Apple Music).
+        final double decelerationExp = 2.0 * (1.0 + Math.min(Math.abs(distance), 1_000_000f) / 1_000_000.0);
+        // Extend total duration to cover the longest-delayed trailing row; tail rows continue
+        // settling after the main scroll has finished rather than being squeezed into it.
+        long maxRowDelay = 0;
+        for (int ci = 0; ci < lyricsListView.getChildCount(); ci++) {
+            final RecyclerView.ViewHolder vh = lyricsListView.findContainingViewHolder(lyricsListView.getChildAt(ci));
+            if (vh == null) continue;
+            final int ap = vh.getAdapterPosition();
+            if (ap != RecyclerView.NO_POSITION && ap > row) {
+                maxRowDelay = Math.max(maxRowDelay, itemDelayMs * (ap - row));
+            }
+        }
+        final long scrollDuration = duration;
+        final long fMaxRowDelay = maxRowDelay;
+        final long totalDuration = scrollDuration + fMaxRowDelay;
+        // Capture each row's current translationY keyed by View identity for retarget continuity.
+        // A float[] indexed by child position is unstable: RecyclerView can recycle and reorder
+        // children, so index ci at capture time may refer to a different View during animation.
+        final Map<View, Float> startTranslationYMap = new HashMap<>();
+        for (int ci = 0; ci < lyricsListView.getChildCount(); ci++) {
+            final View v = lyricsListView.getChildAt(ci);
+            startTranslationYMap.put(v, v.getTranslationY());
+        }
+
         final int[] applied = {0};
         final ValueAnimator animator = ValueAnimator.ofFloat(0f, 1f);
+        // Linear interpolator: getAnimatedFraction() returns raw t; easing is applied manually so
+        // it is only applied once and scrollDuration / totalDuration arithmetic stays correct.
+        animator.setInterpolator(null);
         animator.addUpdateListener(a -> {
             if (lyricsFollowAnimator != a) return;
-            final float fraction = (float) a.getAnimatedValue();
+            final float rawT = a.getAnimatedFraction();          // genuinely linear [0,1]
+            final float elapsedMs = rawT * totalDuration;
+            // Base scroll fraction: only driven for the first scrollDuration ms.
+            final float scrollRawT = Math.min(1f, totalDuration > 0 ? elapsedMs / scrollDuration : 1f);
+            final float fraction = (float)(1.0 - Math.pow(1.0 - scrollRawT, decelerationExp));
             final int step = Math.round(distance * fraction);
             final int delta = step - applied[0];
             applied[0] = step;
-            if (advancing) lyricsEmphasisProgress = fraction;
+            if (advancing) lyricsEmphasisProgress = Math.min(fraction, 1f);
             if (delta != 0) {
                 lyricsListView.scrollBy(0, delta); // onScrolled repaints the emphasis
             } else if (advancing) {
                 updateLyricsDepth();
+            }
+            // Per-row stagger: delayed rows trail behind the anchor with the correct sign.
+            // Positive distance (content scrolls up): delayed row has less fraction → positive
+            // translationY shifts it down = lagging behind the scroll. Reference-derived (Apple Music).
+            for (int ci = 0; ci < lyricsListView.getChildCount(); ci++) {
+                final View c = lyricsListView.getChildAt(ci);
+                final RecyclerView.ViewHolder vh = lyricsListView.findContainingViewHolder(c);
+                if (vh == null) {
+                    c.setTranslationY(0f);
+                    continue;
+                }
+                final int adapterPos = vh.getAdapterPosition();
+                if (adapterPos == RecyclerView.NO_POSITION || adapterPos <= row) {
+                    c.setTranslationY(0f);
+                    continue;
+                }
+                final long rawRowDelay = itemDelayMs * (adapterPos - row);
+                final long effectiveRowDelay = Math.min(rawRowDelay, fMaxRowDelay);
+                final float rowElapsedMs = Math.max(0f, elapsedMs - effectiveRowDelay);
+                final float rowRawT = Math.min(1f, scrollDuration > 0 ? rowElapsedMs / scrollDuration : 1f);
+                final float rowFraction = (float)(1.0 - Math.pow(1.0 - rowRawT, decelerationExp));
+                final float staggerOffset = (float) distance * (fraction - rowFraction);
+                // Blend captured start (by View identity) so retarget picks up smoothly.
+                // New views not in the map get 0, which is correct: they have no prior offset.
+                final Float capturedStart = startTranslationYMap.get(c);
+                final float decayedStart = capturedStart != null ? capturedStart * (1f - rawT) : 0f;
+                c.setTranslationY(staggerOffset + decayedStart);
             }
         });
         animator.addListener(new AnimatorListenerAdapter() {
@@ -3500,11 +3615,16 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 if (lyricsFollowAnimator != animation) return;
                 lyricsFollowAnimator = null;
                 if (advancing) resolveLyricsEmphasis();
+                // Zero all stagger offsets unconditionally. effectiveRowDelay is capped at
+                // fMaxRowDelay in the update listener, so every row's stagger completes by
+                // totalDuration = scrollDuration + fMaxRowDelay regardless of how late it
+                // entered the RecyclerView.
+                for (int ci = 0; ci < lyricsListView.getChildCount(); ci++) {
+                    lyricsListView.getChildAt(ci).setTranslationY(0f);
+                }
             }
         });
-        animator.setDuration(duration);
-        // Same easing family as the compact lyric transition: soft in, soft out, no snap.
-        animator.setInterpolator(CubicBezierInterpolator.EASE_BOTH);
+        animator.setDuration(totalDuration);
         lyricsFollowAnimator = animator;
         animator.start();
     }
@@ -3514,6 +3634,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         final ValueAnimator animator = lyricsFollowAnimator;
         lyricsFollowAnimator = null;
         animator.cancel();
+        // Preserve translationY on cancel: the new animation captures it in startTranslationYMap
+        // (keyed by View identity) and blends from it, so rows pick up smoothly rather than snapping.
     }
 
     private void updateLyricsDepth() {
@@ -3567,6 +3689,33 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
     /** How much of it text that has not been sung takes, at rest and on the current line. */
     private static final float KARAOKE_MUTED_REST = 0.10f;
     private static final float KARAOKE_MUTED_ACTIVE = 0.30f;
+    /** Physical width of the soft sung/unsung boundary feather, in dp.
+     *  Provisional tuning value — not verified against Apple Music measurements. */
+    private static final float KARAOKE_FEATHER_DP = 7f;
+    /** Scale applied to the line the vocalist is currently singing. Reading-edge pivot.
+     *  Provisional tuning value — not verified against Apple Music measurements. */
+    private static final float KARAOKE_ACTIVE_SCALE = 1.015f;
+
+    // Long-note word emphasis constants
+    /** Minimum word duration to qualify for long-note scale/glow emphasis. Reference-derived (Apple Music). */
+    private static final long LONG_NOTE_MIN_DURATION_MS = 1000L;
+    /** Cap on long-note emphasis animation duration. Reference-derived (Apple Music). */
+    private static final long LONG_NOTE_MAX_ANIMATION_MS = 3000L;
+    /** Maximum eligible grapheme count for long-note emphasis; >7 skips the effect. Reference-derived (Apple Music). */
+    private static final int LONG_NOTE_MAX_GRAPHEMES = 7;
+    /** Maximum glow shadow alpha: 128/255. Reference-derived (Apple Music). */
+    private static final float LONG_NOTE_MAX_SHADOW_ALPHA = 128f / 255f;
+    /** Glow radius in dp. PROVISIONAL TELEGRAM VALUE — Apple glow resource not recovered. */
+    private static final float LONG_NOTE_GLOW_RADIUS_DP = 5f;
+    /** Long-note emphasis easing: cubic-bezier(0.25, 0.10, 0.25, 1.0). Reference-derived (Apple Music). */
+    private static final CubicBezierInterpolator LONG_NOTE_EASING =
+            new CubicBezierInterpolator(0.25, 0.10, 0.25, 1.0);
+
+    // Row motion constants
+    /** Maximum stagger delay per row at small scroll distance. Reference-derived (Apple Music). */
+    private static final long ROW_ITEM_DELAY_MAX_MS = 50L;
+    /** Minimum stagger delay per row at large scroll distance. Reference-derived (Apple Music). */
+    private static final long ROW_ITEM_DELAY_MIN_MS = 4L;
 
     /** Resolved once per document: true only when some line genuinely states inline word timing. */
     private boolean lyricsWordTimed;
@@ -3590,6 +3739,13 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
     private final KaraokeFrame karaoke = new KaraokeFrame();
     /** Scratch holder for painting one row; never carries state between two calls. */
     private final KaraokeFrame rowKaraoke = new KaraokeFrame();
+    /** Pre-allocated scratch for raw previous-word elapsed-ms (before grapheme-count gate). Grown lazily. */
+    private long[] prevElapsedScratch = new long[KaraokeFrame.PREV_LONG_NOTE_MAX];
+    /** Filtered previous-tail scratch arrays; entries pass the same 1..LONG_NOTE_MAX_GRAPHEMES gate. Grown lazily. */
+    private long[] filteredPrevElapsedMs = new long[KaraokeFrame.PREV_LONG_NOTE_MAX];
+    private long[] filteredPrevDurationMs = new long[KaraokeFrame.PREV_LONG_NOTE_MAX];
+    private int[] filteredPrevTextStart = new int[KaraokeFrame.PREV_LONG_NOTE_MAX];
+    private int[] filteredPrevTextEnd = new int[KaraokeFrame.PREV_LONG_NOTE_MAX];
     /** The line the playback position is actually inside, whether or not it states word timing. */
     private int karaokeLine = Integer.MIN_VALUE;
     private long karaokePositionMs;
@@ -3638,18 +3794,60 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         repaintKaraokeRow();
     }
 
-    /** Pushes the frame the current position states to the one row that can be showing a word. */
+    /**
+     * Pushes the frame the current position states to the one row that can be showing a word.
+     * Also refreshes long-note and previous-tail timing on every tick so the overlay alpha
+     * advances even when the focus/depth animation is fully settled.
+     */
     private void repaintKaraokeRow() {
         if (!lyricsWordTimed || currentLyrics == null || lyricsLayoutManager == null) return;
         if (karaokeRow == RecyclerView.NO_POSITION) return;
         if (karaokeLine < 0 || karaokeLine >= currentLyrics.lines.size()) return;
         final View child = lyricsLayoutManager.findViewByPosition(karaokeRow);
         if (!(child instanceof LyricsTextView)) return;
-        if (karaoke.resolveRow(currentLyrics.lines.get(karaokeLine), karaokeLine, karaokeLine,
-                karaokePositionMs, karaokeNextLineTimeMs)) {
-            ((LyricsTextView) child).setKaraokeFrame(karaoke.wordStart, karaoke.wordEnd,
-                    karaoke.sweep);
+        final LyricsTextView textView = (LyricsTextView) child;
+        if (!karaoke.resolveRow(currentLyrics.lines.get(karaokeLine), karaokeLine, karaokeLine,
+                karaokePositionMs, karaokeNextLineTimeMs)) return;
+        textView.setKaraokeFrame(karaoke.wordStart, karaoke.wordEnd,
+                karaoke.sweep, karaoke.ownedEnd,
+                karaoke.hasExplicitWordEnd, karaoke.gapProgress);
+        // Current-word long-note emphasis — same eligibility gate as applyLyricsDepth.
+        if (karaoke.longNoteEligible) {
+            final int graphemes = textView.wordGraphemeCount();
+            if (graphemes >= 1 && graphemes <= LONG_NOTE_MAX_GRAPHEMES) {
+                final long elapsed = Math.max(0L, karaokePositionMs - karaoke.wordAbsoluteStartMs);
+                textView.setLongNoteEmphasis(true, elapsed, karaoke.wordDurationMs);
+            } else {
+                textView.setLongNoteEmphasis(false, -1L, 0L);
+            }
+        } else {
+            textView.setLongNoteEmphasis(false, -1L, 0L);
         }
+        // Previous-tail emphasis — every tail that passes the grapheme-count gate.
+        final int prevCount = karaoke.prevLongNoteCount;
+        if (prevCount > prevElapsedScratch.length)
+            prevElapsedScratch = new long[Math.max(prevCount, prevElapsedScratch.length * 2)];
+        if (prevCount > filteredPrevElapsedMs.length) {
+            final int nc = Math.max(prevCount, filteredPrevElapsedMs.length * 2);
+            filteredPrevElapsedMs = new long[nc];
+            filteredPrevDurationMs = new long[nc];
+            filteredPrevTextStart = new int[nc];
+            filteredPrevTextEnd = new int[nc];
+        }
+        int filtered = 0;
+        for (int i = 0; i < prevCount; i++) {
+            prevElapsedScratch[i] = Math.max(0L, karaokePositionMs - karaoke.prevWordAbsoluteStartMs[i]);
+            final int g = textView.graphemeCountInRange(
+                    karaoke.prevWordTextStart[i], karaoke.prevWordTextEnd[i]);
+            if (g < 1 || g > LONG_NOTE_MAX_GRAPHEMES) continue;
+            filteredPrevElapsedMs[filtered] = prevElapsedScratch[i];
+            filteredPrevDurationMs[filtered] = karaoke.prevWordDurationMs[i];
+            filteredPrevTextStart[filtered] = karaoke.prevWordTextStart[i];
+            filteredPrevTextEnd[filtered] = karaoke.prevWordTextEnd[i];
+            filtered++;
+        }
+        textView.setPrevLongNoteEmphasis(filtered, filteredPrevElapsedMs,
+                filteredPrevDurationMs, filteredPrevTextStart, filteredPrevTextEnd);
     }
 
     /**
@@ -3827,13 +4025,71 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         // subordinate is the point. Linear distance did the opposite of both.
         final float linear = Math.min(1f, distance);
         final float depth = linear * linear * (3f - 2f * linear);
-        // Depth is carried by opacity and a small real blur, and by nothing else. There is no
-        // scale: the page is meant to read as one layered surface, and a zoom on the current line
-        // would fight the word motion. Both line-synced and karaoke documents get this, so the two
-        // differ in capability and never in quality.
+        // Depth is carried by opacity and a small real blur. A subtle scale on the active line
+        // (~1.5%) adds physical presence without fighting the karaoke word motion; the pivot is
+        // at the reading edge so the text stays anchored to the margin as it grows.
         child.setAlpha(lerp(KARAOKE_REST_ALPHA - depth * KARAOKE_REST_ALPHA_FALLOFF, KARAOKE_ACTIVE_ALPHA, focus));
-        child.setScaleX(1f);
-        child.setScaleY(1f);
+        final float lineScale = lerp(1f, KARAOKE_ACTIVE_SCALE, focus);
+        // Long-note word emphasis: eligible words (explicit end, duration >= 1000ms, 1..7 graphemes)
+        // store timing state. Glow is disabled pending a safe word-local implementation; scale is
+        // not applied (sub-view scale requires MetricAffectingSpan, forbidden by Build #44).
+        // prevLongNote tracks the previous word's return tail for when glow is re-enabled.
+        // Pure function of position for seek determinism.
+        if (textView != null) {
+            // Current word emphasis — only when this line is the active karaoke line and eligible.
+            if (wordFrame && rowKaraoke.longNoteEligible && visibleLyrics.get(row) == karaokeLine) {
+                final int graphemes = textView.wordGraphemeCount();
+                if (graphemes >= 1 && graphemes <= LONG_NOTE_MAX_GRAPHEMES) {
+                    final long elapsed = Math.max(0L, karaokePositionMs - rowKaraoke.wordAbsoluteStartMs);
+                    textView.setLongNoteEmphasis(true, elapsed, rowKaraoke.wordDurationMs);
+                } else {
+                    textView.setLongNoteEmphasis(false, -1L, 0L);
+                }
+            } else {
+                textView.setLongNoteEmphasis(false, -1L, 0L);
+            }
+            // Previous word return tails — independent of current-word eligibility.
+            // Each tail passes the same grapheme-count gate as the current-word path.
+            if (wordFrame && visibleLyrics.get(row) == karaokeLine) {
+                final int prevCount = rowKaraoke.prevLongNoteCount;
+                if (prevCount > prevElapsedScratch.length)
+                    prevElapsedScratch = new long[Math.max(prevCount, prevElapsedScratch.length * 2)];
+                if (prevCount > filteredPrevElapsedMs.length) {
+                    final int nc = Math.max(prevCount, filteredPrevElapsedMs.length * 2);
+                    filteredPrevElapsedMs = new long[nc];
+                    filteredPrevDurationMs = new long[nc];
+                    filteredPrevTextStart = new int[nc];
+                    filteredPrevTextEnd = new int[nc];
+                }
+                int filtered = 0;
+                for (int i = 0; i < prevCount; i++) {
+                    prevElapsedScratch[i] = Math.max(0L,
+                            karaokePositionMs - rowKaraoke.prevWordAbsoluteStartMs[i]);
+                    final int g = textView.graphemeCountInRange(
+                            rowKaraoke.prevWordTextStart[i], rowKaraoke.prevWordTextEnd[i]);
+                    if (g < 1 || g > LONG_NOTE_MAX_GRAPHEMES) continue;
+                    filteredPrevElapsedMs[filtered] = prevElapsedScratch[i];
+                    filteredPrevDurationMs[filtered] = rowKaraoke.prevWordDurationMs[i];
+                    filteredPrevTextStart[filtered] = rowKaraoke.prevWordTextStart[i];
+                    filteredPrevTextEnd[filtered] = rowKaraoke.prevWordTextEnd[i];
+                    filtered++;
+                }
+                textView.setPrevLongNoteEmphasis(filtered, filteredPrevElapsedMs,
+                        filteredPrevDurationMs, filteredPrevTextStart, filteredPrevTextEnd);
+            } else {
+                textView.setPrevLongNoteEmphasis(0, null, null, null, null);
+            }
+        }
+        child.setScaleX(lineScale);
+        child.setScaleY(lineScale);
+        // Pivot at the reading edge of the lyric text — derived from the lyric layout's own
+        // paragraph direction, NOT the app UI locale, so RTL lyrics on an LTR device pivot
+        // correctly and vice versa.
+        final android.text.Layout lyricsTextLayout = textView != null ? textView.getLayout() : null;
+        final boolean lyricsRtl = lyricsTextLayout != null
+                && lyricsTextLayout.getParagraphDirection(0) == android.text.Layout.DIR_RIGHT_TO_LEFT;
+        child.setPivotX(lyricsRtl ? child.getWidth() : 0f);
+        child.setPivotY(child.getHeight() / 2f);
         if (textView == null) return;
         textView.setDepthBlur(lerp(depth * dp(KARAOKE_BLUR_MAX_DP), 0f, focus));
         if (wordFrame) {
@@ -3848,7 +4104,9 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                     lerp(KARAOKE_MUTED_REST, KARAOKE_MUTED_ACTIVE, focus));
             textView.setLyricTextColor(mutedColor);
             textView.setKaraokeColors(mutedColor, sungColor);
-            textView.setKaraokeFrame(rowKaraoke.wordStart, rowKaraoke.wordEnd, rowKaraoke.sweep);
+            textView.setKaraokeFrame(rowKaraoke.wordStart, rowKaraoke.wordEnd, rowKaraoke.sweep,
+                    rowKaraoke.ownedEnd,
+                    rowKaraoke.hasExplicitWordEnd, rowKaraoke.gapProgress);
         } else {
             // Ordinary line-synced text, and any untimed line inside a karaoke document. Line-level
             // hierarchy only: no sweep, no word motion, nothing invented.
@@ -3991,6 +4249,11 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 layoutParams = (FrameLayout.LayoutParams) lyricsListView.getLayoutParams();
                 layoutParams.bottomMargin = dp(getPlayerHeight());
                 lyricsListView.setLayoutParams(layoutParams);
+                if (lyricsViewportFade != null) {
+                    FrameLayout.LayoutParams fadeParams = (FrameLayout.LayoutParams) lyricsViewportFade.getLayoutParams();
+                    fadeParams.bottomMargin = dp(getPlayerHeight());
+                    lyricsViewportFade.setLayoutParams(fadeParams);
+                }
             }
             if (noforwards) {
                 optionsButton.hideSubItem(1);
@@ -4169,6 +4432,57 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         public int wordEnd;
         /** 0..1 across the word at {@link #wordStart}: how much of it the fill has travelled. */
         public float sweep;
+        /**
+         * Exclusive end of the visual space this word "owns" — from its text start to the next
+         * word's text start (or end-of-line for the terminal word). Including trailing whitespace
+         * lets the continuous cursor traverse inter-word gaps without snapping.
+         */
+        public int ownedEnd;
+        /**
+         * True when the source stated an explicit end time for this word (TTML per-span ends).
+         * False for start-only sources (Enhanced LRC) where the ownership interval drives the fill.
+         *
+         * <p>When true, {@link #sweep} covers only the authored glyph duration, and {@link
+         * #gapProgress} drives the post-word gap animation separately. When false, {@link #sweep}
+         * covers the entire owned interval (glyphs + gap) as one continuous sweep.
+         */
+        public boolean hasExplicitWordEnd;
+        /**
+         * Gap-phase progress: 0 during the glyph phase (or for start-only words), then 0→1 while
+         * the cursor traverses the physical whitespace between this word's glyph end and the next
+         * word's visual start. Only meaningful when {@link #hasExplicitWordEnd} is true and
+         * {@link #sweep} has already reached 1.
+         */
+        public float gapProgress;
+        /**
+         * Whether this word qualifies for long-note glow emphasis.
+         * Gate: explicit authored end ({@link #hasExplicitWordEnd}) and
+         * {@link AudioPlayerAlert#LONG_NOTE_MIN_DURATION_MS} duration.
+         * Grapheme count (1..{@link AudioPlayerAlert#LONG_NOTE_MAX_GRAPHEMES}) must be verified
+         * at display time from the row's layout, since the frame has no layout reference.
+         */
+        public boolean longNoteEligible;
+        /** Duration of this word's timing window in ms; used for emphasis animation scheduling. */
+        public long wordDurationMs;
+        /** Absolute playback-clock start of this word in ms; used for seek-position reconstruction. */
+        public long wordAbsoluteStartMs;
+        /**
+         * Number of live previous-word emphasis tails at this position. Each entry represents a
+         * word whose conservative return envelope (pStart + 3*animMs) has not yet elapsed. Stored
+         * in reverse chronological order (most-recent eligible word first).
+         * This is a pure function of line timestamps and position; seeking reconstructs it exactly.
+         */
+        public int prevLongNoteCount;
+        /** Initial capacity for previous-tail arrays; grown on demand when line structure requires. */
+        public static final int PREV_LONG_NOTE_MAX = 4;
+        /** Absolute start of each live previous-eligible word, ms. Index 0 = most-recent. */
+        public long[] prevWordAbsoluteStartMs = new long[PREV_LONG_NOTE_MAX];
+        /** Authored duration of each live previous-eligible word, ms. */
+        public long[] prevWordDurationMs = new long[PREV_LONG_NOTE_MAX];
+        /** UTF-16 text start offset of each live previous word in the line's text. */
+        public int[] prevWordTextStart = new int[PREV_LONG_NOTE_MAX];
+        /** UTF-16 text end offset of each live previous word in the line's text. */
+        public int[] prevWordTextEnd = new int[PREV_LONG_NOTE_MAX];
 
         public void clear() {
             active = false;
@@ -4176,6 +4490,30 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             wordStart = 0;
             wordEnd = 0;
             sweep = 0f;
+            ownedEnd = 0;
+            hasExplicitWordEnd = false;
+            gapProgress = 0f;
+            longNoteEligible = false;
+            wordDurationMs = 0L;
+            wordAbsoluteStartMs = 0L;
+            prevLongNoteCount = 0;
+        }
+
+        /**
+         * Grows the previous-tail arrays to at least {@code needed} entries when the current
+         * capacity is smaller. Allocation happens at most once per line-structure change (driven
+         * by {@code resolve()} seeing more previous words than current capacity holds), never
+         * once per playback tick.
+         */
+        private void ensurePrevCapacity(int needed) {
+            if (needed <= prevWordAbsoluteStartMs.length) return;
+            // Geometric doubling so that advancing through a long line reallocates at most
+            // O(log n) times, not once per word.
+            final int cap = Math.max(needed, prevWordAbsoluteStartMs.length * 2);
+            prevWordAbsoluteStartMs = new long[cap];
+            prevWordDurationMs = new long[cap];
+            prevWordTextStart = new int[cap];
+            prevWordTextEnd = new int[cap];
         }
 
         /**
@@ -4200,7 +4538,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 // Already left behind: every word it states has started, so all of it is sung. This
                 // is also what keeps a fast line's last word from being swallowed - it finishes
                 // lit rather than being caught mid-fill by the line change.
-                sungEnd = wordStart = wordEnd = line.text.length();
+                sungEnd = wordStart = wordEnd = ownedEnd = line.text.length();
             }
             // Everything else is a line the position has not reached - including one a player is
             // already moving into view - and clear() has left every boundary at zero.
@@ -4238,12 +4576,79 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             wordStart = segments.startOffset(index);
             wordEnd = Math.max(wordStart, segments.endOffset(index));
             sungEnd = wordStart;
+            ownedEnd = (index + 1 < segments.size())
+                    ? segments.startOffset(index + 1) : line.text.length();
             final long start = segments.startTimeMs(index);
             final long elapsed = Math.max(0L, positionMs - start);
             final long sweepMs = sweepWindowMs(segments, index, nextLineTimeMs);
             sweep = sweepMs <= 0 ? 1f : clamp01(elapsed / (float) sweepMs);
+            // For sources with explicit per-word end times (TTML), split the visual animation into
+            // two phases so the authored glyph duration is respected exactly:
+            //   Phase A (sweep 0→1 during [startTime, endTime]): cursor traverses the word's own
+            //   glyph clusters only.
+            //   Phase B (gapProgress 0→1 during [endTime, nextStartTime]): cursor traverses the
+            //   physical gap (whitespace) between this word's glyph end and the next word's start.
+            // For start-only sources, gapProgress stays 0 and the single sweep covers both glyph
+            // and gap clusters over the full ownership interval.
+            hasExplicitWordEnd = segments.hasEndTime(index);
+            gapProgress = 0f;
+            if (hasExplicitWordEnd && ownedEnd > wordEnd) {
+                final long wordEndTimeMs = segments.endTimeMs(index);
+                if (positionMs > wordEndTimeMs) {
+                    final long gapStartMs = wordEndTimeMs;
+                    final long gapEndMs = (index + 1 < segments.size())
+                            ? segments.startTimeMs(index + 1) : nextLineTimeMs;
+                    if (gapEndMs > gapStartMs) {
+                        gapProgress = clamp01(
+                                (positionMs - gapStartMs) / (float) (gapEndMs - gapStartMs));
+                    } else {
+                        gapProgress = 1f;
+                    }
+                }
+            }
+            // Long-note emphasis eligibility. The grapheme count (1..LONG_NOTE_MAX_GRAPHEMES) is
+            // validated at display time from the row's layout; here we only gate on duration.
+            wordDurationMs = sweepMs > 0 ? sweepMs : ownershipWindowMs(segments, index, nextLineTimeMs);
+            wordAbsoluteStartMs = start;
+            longNoteEligible = hasExplicitWordEnd && wordDurationMs >= LONG_NOTE_MIN_DURATION_MS;
+            // Scan backwards for previous eligible words whose return-phase envelope still contains
+            // positionMs. Stored most-recent-first. A word that is expired (positionMs >=
+            // pStart + 3*pAnimMs) is skipped with continue, NOT break, because an older word may
+            // have a longer authored duration and therefore a later envelope end. We break only when
+            // the word's pStart is so early that even the longest possible envelope (pStart +
+            // 3*LONG_NOTE_MAX_ANIMATION_MS) has elapsed; any earlier word starts even sooner so
+            // its envelope also ends before positionMs.
+            // Ensure the arrays can hold all previous words in this line; allocation only when
+            // line structure exceeds current capacity, never once per tick.
+            ensurePrevCapacity(index);
+            prevLongNoteCount = 0;
+            for (int pi = index - 1; pi >= 0; pi--) {
+                if (!segments.hasEndTime(pi)) continue;
+                final long pStart = segments.startTimeMs(pi);
+                final long pEnd = segments.endTimeMs(pi);
+                final long pDur = pEnd - pStart;
+                // Provably no earlier word can be alive past this bound.
+                if (positionMs >= pStart + 3L * LONG_NOTE_MAX_ANIMATION_MS) break;
+                if (pDur < LONG_NOTE_MIN_DURATION_MS) continue;
+                final long pAnimMs = Math.max(1L, Math.min(pDur, LONG_NOTE_MAX_ANIMATION_MS));
+                if (positionMs >= pStart + 3L * pAnimMs) continue; // this word expired; older may not have
+                prevWordAbsoluteStartMs[prevLongNoteCount] = pStart;
+                prevWordDurationMs[prevLongNoteCount] = pDur;
+                prevWordTextStart[prevLongNoteCount] = segments.startOffset(pi);
+                prevWordTextEnd[prevLongNoteCount] = Math.max(segments.startOffset(pi), segments.endOffset(pi));
+                prevLongNoteCount++;
+            }
             active = true;
             return true;
+        }
+
+        /**
+         * Stagger step in ms for per-glyph emphasis (reference-derived, Apple Music).
+         * {@code staggerStep = min(MAX_STAGGER_MS, STAGGER_FRACTION * durationMs / glyphCount)}
+         */
+        public static long longNoteStaggerStepMs(long durationMs, int glyphCount) {
+            if (glyphCount <= 0) return 0L;
+            return Math.min(400L, Math.round(0.4f * durationMs / glyphCount));
         }
 
         /**
@@ -4614,6 +5019,12 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         private int runCount;
         /** The view's own mutable copy of the text, or null for a line with no inline timing. */
         private Spannable karaokeText;
+        /**
+         * Plain-string snapshot of {@code karaokeText}, cached once in {@link #setLyricText} so
+         * that {@link #drawGlyphOverlay} can call {@code drawTextRun} without allocating a String
+         * per frame. Null when {@code karaokeText} is null.
+         */
+        private String karaokeTextStr;
 
         private boolean karaokeActive;
         private int mutedColor;
@@ -4625,6 +5036,12 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         private int wordStart;
         private int wordEnd;
         private float sweep;
+        /** Owned visual end: next word's start (or line end for terminal word). See KaraokeFrame. */
+        private int wordOwnedEnd;
+        /** See {@link KaraokeFrame#hasExplicitWordEnd}. */
+        private boolean wordHasExplicitEnd;
+        /** See {@link KaraokeFrame#gapProgress}. */
+        private float wordGapProgress;
         /** The colour boundaries the spans currently carry, so an unchanged frame re-sets nothing. */
         private int spanSungTo = -1;
         private int spanWordTo = -1;
@@ -4658,6 +5075,26 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         private boolean lyricTextColorSet;
         /** Quantised blur radius currently on the view, or -1 when nothing has been applied yet. */
         private int appliedBlur = -1;
+        /** True when the current word qualifies for long-note emphasis (authored end, eligible duration). */
+        private boolean longNoteEligible;
+        /** Elapsed ms into the current word for emphasis animation; -1 = inactive. */
+        private long longNoteElapsedMs = -1L;
+        /** Word duration in ms for the emphasis rise/return timing. */
+        private long longNoteWordDurationMs = 0L;
+        /** True while LAYER_TYPE_SOFTWARE is active for glow rendering (currently always false). */
+        private boolean glowLayerActive;
+        /** Number of live previous-word emphasis tails pushed by the last setPrevLongNoteEmphasis. */
+        private int prevLongNoteCount;
+        /** Elapsed ms from each live previous word's absolute start, at the last emphasis push. Grown lazily. */
+        private long[] prevWordElapsedMs = new long[KaraokeFrame.PREV_LONG_NOTE_MAX];
+        /** Authored duration of each live previous word, ms. Grown lazily. */
+        private long[] prevWordDurationMs = new long[KaraokeFrame.PREV_LONG_NOTE_MAX];
+        /** UTF-16 text start offset of each live previous word. Grown lazily. */
+        private int[] prevWordTextStart = new int[KaraokeFrame.PREV_LONG_NOTE_MAX];
+        /** UTF-16 text end offset of each live previous word. Grown lazily. */
+        private int[] prevWordTextEnd = new int[KaraokeFrame.PREV_LONG_NOTE_MAX];
+        // overlayPaint and OVERLAY_SRC_IN removed: the saveLayerAlpha+drawTextRun approach
+        // no longer uses SRC_IN compositing (see drawGlyphOverlay).
 
 
         LyricsTextView(Context context) {
@@ -4672,6 +5109,12 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         void setLyricText(CharSequence text, boolean wordTimed) {
             detachSpans();
             karaokeActive = false;
+            // Clear all long-note emphasis so a recycled row cannot render stale previous tails
+            // before the next karaoke-state push arrives.
+            longNoteEligible = false;
+            longNoteElapsedMs = -1L;
+            longNoteWordDurationMs = 0L;
+            prevLongNoteCount = 0;
             if (wordTimed) {
                 // TextView always makes its own spannable copy here, so the one to colour is the
                 // one it ends up holding, not the one handed in.
@@ -4682,6 +5125,9 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 setText(text);
                 karaokeText = null;
             }
+            // Cache a plain-string snapshot so drawGlyphOverlay can call drawTextRun without
+            // allocating a String per frame. Replaced whenever the row is rebound.
+            karaokeTextStr = karaokeText != null ? karaokeText.toString() : null;
         }
 
         /** Sets the text colour without the ColorStateList a repeated call would allocate. */
@@ -4690,6 +5136,93 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             lyricTextColor = color;
             lyricTextColorSet = true;
             setTextColor(color);
+        }
+
+        /**
+         * Pushes long-note timing state. Glow is disabled pending a safe word-local implementation;
+         * LAYER_TYPE_SOFTWARE is not activated here (no per-span shadow rendered).
+         */
+        void setLongNoteEmphasis(boolean eligible, long elapsedMs, long wordDurationMs) {
+            final boolean prevEligible = longNoteEligible;
+            final long prevElapsed = longNoteElapsedMs;
+            longNoteEligible = eligible;
+            longNoteElapsedMs = eligible ? elapsedMs : -1L;
+            longNoteWordDurationMs = wordDurationMs;
+            // Glow disabled: software layer stays off.
+            final boolean changed = eligible != prevEligible || longNoteElapsedMs != prevElapsed;
+            if (karaokeActive && changed) updateAppearance();
+            if (changed) invalidate();
+        }
+
+        /**
+         * Pushes all live previous-word emphasis return tails. Independent of current-word
+         * eligibility — called even when the current word is ineligible or the line is inactive.
+         * {@code elapsedMs[i]} is already computed as {@code positionMs - prevWordAbsoluteStartMs[i]}
+         * by the caller so this view does not need to know absolute time.
+         * Pass count=0 or null arrays to clear.
+         */
+        void setPrevLongNoteEmphasis(int count, long[] elapsedMs, long[] durations,
+                int[] textStarts, int[] textEnds) {
+            // Geometric growth so that adding one more tail per line does not allocate every call.
+            if (count > prevWordElapsedMs.length) {
+                final int newLen = Math.max(count, prevWordElapsedMs.length * 2);
+                prevWordElapsedMs = new long[newLen];
+                prevWordDurationMs = new long[newLen];
+                prevWordTextStart = new int[newLen];
+                prevWordTextEnd = new int[newLen];
+            }
+            boolean changed = prevLongNoteCount != count;
+            prevLongNoteCount = count;
+            for (int i = 0; i < count; i++) {
+                if (prevWordElapsedMs[i] != elapsedMs[i]) changed = true;
+                prevWordElapsedMs[i] = elapsedMs[i];
+                prevWordDurationMs[i] = durations[i];
+                prevWordTextStart[i] = textStarts[i];
+                prevWordTextEnd[i] = textEnds[i];
+            }
+            if (changed) invalidate();
+        }
+
+        /**
+         * Counts the non-whitespace grapheme clusters in [wordStart, wordEnd).
+         * Returns 0 when the geometry is not yet built or there is no active word range.
+         */
+        int wordGraphemeCount() {
+            if (wordEnd <= wordStart) return 0;
+            return graphemeCountInRange(wordStart, wordEnd);
+        }
+
+        /**
+         * Counts grapheme clusters in [{@code start}, {@code end}) whose start codepoint is not
+         * an ignorable inter-word spacing character. Excludes ASCII space, Unicode whitespace
+         * (isWhitespace), and all Unicode Zs general-category members (isSpaceChar), covering
+         * NBSP U+00A0, narrow NBSP U+202F, figure space U+2007, and similar, so that segment
+         * ranges that extend to the next word's start do not inflate the eligibility count.
+         */
+        int graphemeCountInRange(int start, int end) {
+            if (clusterCount == 0 || end <= start || karaokeText == null) return 0;
+            int count = 0;
+            for (int i = 0; i < clusterCount; i++) {
+                final int offset = clusterStart[i];
+                if (offset < start) continue;
+                if (offset >= end) break;
+                if (isIgnorableInterWordSpace(karaokeText, offset)) continue;
+                count++;
+            }
+            return count;
+        }
+
+        /**
+         * Returns true when the character (or codepoint) at {@code charOffset} is an ignorable
+         * inter-word spacing character and must not count as a visible grapheme for long-note
+         * eligibility. Covers both {@link Character#isWhitespace} (C0/ASCII) and
+         * {@link Character#isSpaceChar} (Unicode Zs category: NBSP U+00A0, narrow NBSP U+202F,
+         * figure space U+2007, etc.).  Uses codePoint to handle surrogate pairs correctly.
+         */
+        private static boolean isIgnorableInterWordSpace(CharSequence text, int charOffset) {
+            if (charOffset >= text.length()) return false;
+            final int cp = Character.codePointAt(text, charOffset);
+            return Character.isWhitespace(cp) || Character.isSpaceChar(cp);
         }
 
         void setKaraokeColors(int muted, int sung) {
@@ -4712,7 +5245,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
          * position, so pushing the same position twice is a no-op and a settled line costs nothing
          * per tick.
          */
-        void setKaraokeFrame(int start, int end, float sweepProgress) {
+        void setKaraokeFrame(int start, int end, float sweepProgress, int ownedEnd,
+                             boolean hasExplicitEnd, float gapProgress) {
             if (karaokeText == null) return;
             // A row that was not painting karaoke a moment ago - a fresh bind, a recycled view, a
             // line that has just become relevant - carries no spans at all, so its first frame
@@ -4730,6 +5264,18 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                     wordEnd = snappedEnd;
                     changed = true;
                 }
+            }
+            if (wordOwnedEnd != ownedEnd) {
+                wordOwnedEnd = ownedEnd;
+                changed = true;
+            }
+            if (wordHasExplicitEnd != hasExplicitEnd) {
+                wordHasExplicitEnd = hasExplicitEnd;
+                changed = true;
+            }
+            if (Math.abs(wordGapProgress - gapProgress) > 0.005f) {
+                wordGapProgress = gapProgress;
+                changed = true;
             }
             if (Math.abs(sweep - sweepProgress) > 0.0015f) {
                 sweep = sweepProgress;
@@ -4766,21 +5312,103 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             float revealed = 0f;
             int sungTo;
             int wordTo;
+
+            // The gap end (ownedEnd) is clamped to the same visual line as wordStart, so the cursor
+            // never crosses a line-wrap boundary whether it is traversing glyphs or the trailing gap.
+            final int effectiveGapEnd;
+            if (wordOwnedEnd > wordEnd) {
+                final Layout layout = getLayout();
+                if (layout != null && wordStart >= 0 && wordStart < karaokeText.length()) {
+                    final int visualLine = layout.getLineForOffset(wordStart);
+                    effectiveGapEnd = Math.min(wordOwnedEnd, layout.getLineEnd(visualLine));
+                } else {
+                    effectiveGapEnd = wordOwnedEnd;
+                }
+            } else {
+                effectiveGapEnd = wordEnd;
+            }
+
+            // For sources with explicit word-end times (TTML), presentation is two phases:
+            //   Phase A (gapProgress == 0): sweep covers the word's own glyph clusters only.
+            //   Phase B (gapProgress > 0): glyph portion fully sung; gapProgress covers the gap.
+            // For start-only sources (hasExplicitEnd == false), a single sweep covers the entire
+            // owned span (glyphs + gap), reproducing the pre-Phase-B behavior exactly.
+            final boolean inGapPhase = wordHasExplicitEnd && wordGapProgress > 0f;
+            // During the glyph phase of an explicit-end word the traversal stops at wordEnd;
+            // for start-only words it extends to the owned gap end.
+            final int effectiveOwnedEnd = (wordHasExplicitEnd && !inGapPhase) ? wordEnd : effectiveGapEnd;
+
             if (wordEnd <= wordStart) {
                 sungTo = wordTo = wordStart;
+            } else if (inGapPhase) {
+                // ── Gap phase: glyph clusters fully sung; animate gap clusters by gapProgress ──
+                if (wordGapProgress >= 1f || effectiveGapEnd <= wordEnd) {
+                    sungTo = wordTo = effectiveGapEnd;
+                } else if (clusterGeometryCount != clusterCount || clusterCount == 0) {
+                    // Layout not yet measured; hold cursor at word end until geometry arrives.
+                    sungTo = wordTo = wordEnd;
+                } else {
+                    // Sum the physical width of all gap clusters (spaces between words).
+                    float gapTotal = 0f;
+                    for (int i = 0; i < clusterCount; i++) {
+                        final int offset = clusterStart[i];
+                        if (offset < wordEnd) continue;
+                        if (offset >= effectiveGapEnd) break;
+                        if (!clusterHasRect[i]) continue;
+                        gapTotal += clusterRight[i] - clusterLeft[i];
+                    }
+                    if (gapTotal <= 0f) {
+                        // No gap geometry on this visual line; snap cursor to gap end.
+                        sungTo = wordTo = effectiveGapEnd;
+                    } else {
+                        final float reveal = wordGapProgress * gapTotal;
+                        float consumed = 0f;
+                        for (int i = 0; i < clusterCount; i++) {
+                            final int offset = clusterStart[i];
+                            if (offset < wordEnd) continue;
+                            if (offset >= effectiveGapEnd) break;
+                            if (!clusterHasRect[i]) continue;
+                            final float width = clusterRight[i] - clusterLeft[i];
+                            if (reveal < consumed + width) {
+                                front = i;
+                                revealed = reveal - consumed;
+                                if (revealed < 0f) revealed = 0f;
+                                break;
+                            }
+                            consumed += width;
+                        }
+                        if (front < 0) {
+                            sungTo = wordTo = effectiveGapEnd;
+                        } else {
+                            sungTo = clusterStart[front];
+                            wordTo = (front + 1 < clusterCount)
+                                    ? clusterStart[front + 1] : effectiveGapEnd;
+                        }
+                    }
+                }
             } else if (sweep >= 1f) {
-                sungTo = wordTo = wordEnd;
+                // Word complete: for explicit-end glyph phase this reaches wordEnd;
+                // for start-only this reaches the full ownership end.
+                sungTo = wordTo = effectiveOwnedEnd;
             } else if (clusterGeometryCount != clusterCount || clusterCount == 0) {
-                // Not laid out yet. The word reads as still to come, and the next tick - by which
-                // time there is a layout - puts the fill where the clock says it is.
+                // Not laid out yet. The word reads as still to come, and the next tick — by which
+                // time there is a layout — puts the fill where the clock says it is.
                 sungTo = wordTo = wordStart;
             } else {
+                // ── Glyph phase (or start-only single sweep) ──
+                // For start-only words: effectiveOwnedEnd == effectiveGapEnd, so blank clusters
+                // in the gap range are included (isBlankCluster guard only covers offset < wordEnd).
+                // For explicit-end glyph phase: effectiveOwnedEnd == wordEnd, so the loop cannot
+                // reach gap clusters regardless of the blank cluster guard.
                 float total = 0f;
                 for (int i = 0; i < clusterCount; i++) {
                     final int offset = clusterStart[i];
                     if (offset < wordStart) continue;
-                    if (offset >= wordEnd) break;
-                    if (isBlankCluster(i) || !clusterHasRect[i]) continue;
+                    if (offset >= effectiveOwnedEnd) break;
+                    if (!clusterHasRect[i]) continue;
+                    // Within the word's own glyph range, skip blank clusters.
+                    // Beyond wordEnd (start-only gap range), include them.
+                    if (isBlankCluster(i) && offset < wordEnd) continue;
                     total += clusterRight[i] - clusterLeft[i];
                 }
                 if (total <= 0f) {
@@ -4791,8 +5419,9 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                     for (int i = 0; i < clusterCount; i++) {
                         final int offset = clusterStart[i];
                         if (offset < wordStart) continue;
-                        if (offset >= wordEnd) break;
-                        if (isBlankCluster(i) || !clusterHasRect[i]) continue;
+                        if (offset >= effectiveOwnedEnd) break;
+                        if (!clusterHasRect[i]) continue;
+                        if (isBlankCluster(i) && offset < wordEnd) continue;
                         final float width = clusterRight[i] - clusterLeft[i];
                         if (reveal < consumed + width) {
                             front = i;
@@ -4803,10 +5432,11 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                         consumed += width;
                     }
                     if (front < 0) {
-                        sungTo = wordTo = wordEnd;
+                        sungTo = wordTo = effectiveOwnedEnd;
                     } else {
                         sungTo = clusterStart[front];
-                        wordTo = clusterStart[front + 1];
+                        wordTo = (front + 1 < clusterCount)
+                                ? clusterStart[front + 1] : effectiveOwnedEnd;
                     }
                 }
             }
@@ -4860,6 +5490,10 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                         span.setSolid(mutedColor);
                     }
                 }
+                // Word-local glow disabled: visual runs span the whole line in single-run LTR
+                // text, so run-wide glow would cover non-active words. The canvas overlay in
+                // onDraw() draws the active-word brightness highlight at precise cluster bounds.
+                span.setGlow(0f, 0);
             }
         }
 
@@ -4937,9 +5571,26 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             if (stop > 1f) stop = 1f;
             final int leading = rtl ? mutedColor : sungColor;
             final int trailing = rtl ? sungColor : mutedColor;
+            // Soft physical feather: the boundary blends over ~7dp instead of snapping.
+            // For LTR the feather is in the already-sung region (lo..stop); for RTL it is
+            // in the unsung region (stop..hi), mirroring how the sung side is at the leading edge.
+            final float featherFrac = Math.min(0.35f, dp(KARAOKE_FEATHER_DP) / width);
+            final float lo, hi;
+            if (rtl) {
+                lo = stop;
+                hi = Math.min(1f, stop + featherFrac);
+            } else {
+                lo = Math.max(0f, stop - featherFrac);
+                hi = stop;
+            }
+            float safeLo = lo, safeHi = hi;
+            if (safeHi - safeLo < 0.001f) {
+                safeHi = safeLo + 0.001f;
+                if (safeHi > 1f) { safeHi = 1f; safeLo = Math.max(0f, safeHi - 0.001f); }
+            }
             return new LinearGradient(left, 0f, right, 0f,
                     new int[] {leading, leading, trailing, trailing},
-                    new float[] {0f, stop, stop, 1f}, Shader.TileMode.CLAMP);
+                    new float[] {0f, safeLo, safeHi, 1f}, Shader.TileMode.CLAMP);
         }
 
         @Override
@@ -4950,8 +5601,135 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             if (karaokeActive && resolveColourBoundaries()) invalidate();
         }
 
-        /** Returns the row to plain, uniformly coloured text. */
+        /**
+         * Post-draw brightness overlay for the active long-note word and any live previous-word
+         * return tails. Calls super.onDraw once for normal text, then for each active overlay
+         * region opens a {@code saveLayerAlpha} and re-draws only the target clusters via
+         * {@code drawTextRun} with full-line shaping context. The composited white layer is then
+         * blended at the requested alpha onto the normal draw.
+         *
+         * <p>Handles line-wrapping: each cluster resolves its baseline via
+         * {@code layout.getLineForOffset()}. All clusters for one overlay call share a single
+         * {@code saveLayerAlpha} pass; the layer is composited once at the end.
+         *
+         * <p>No spans, no setSpan, no per-frame re-layout. {@code drawTextRun} uses the
+         * pre-shaped layout paint with full-line context, so Arabic contextual forms, kerning
+         * pairs, and ligatures match the platform layout output.
+         */
+        @Override
+        protected void onDraw(Canvas canvas) {
+            super.onDraw(canvas);
+            // Current word glyph overlay
+            if (longNoteEligible && karaokeActive && wordEnd > wordStart && longNoteElapsedMs >= 0) {
+                final long animMs = Math.max(1L, Math.min(longNoteWordDurationMs,
+                        LONG_NOTE_MAX_ANIMATION_MS));
+                final float alpha = longNoteOverlayAlpha(longNoteElapsedMs, animMs);
+                if (alpha > 0f) drawGlyphOverlay(canvas, wordStart, wordEnd, alpha);
+            }
+            // Previous-word return tails — independent of current eligibility.
+            for (int pi = 0; pi < prevLongNoteCount; pi++) {
+                final long pAnimMs = Math.max(1L, Math.min(prevWordDurationMs[pi],
+                        LONG_NOTE_MAX_ANIMATION_MS));
+                final float alpha = longNoteOverlayAlpha(prevWordElapsedMs[pi], pAnimMs);
+                if (alpha > 0f) drawGlyphOverlay(canvas, prevWordTextStart[pi], prevWordTextEnd[pi], alpha);
+            }
+        }
+
+        /**
+         * Renders a white-alpha glyph overlay for [{@code textStart}, {@code textEnd}) using
+         * {@code canvas.drawTextRun()} with full-line shaping context.
+         *
+         * <p><b>Shaping fidelity:</b> each cluster is drawn with
+         * {@code contextStart = layout.getLineStart(line)},
+         * {@code contextEnd = layout.getLineEnd(line)}, matching the context range the platform
+         * itself uses. Arabic contextual forms, kerning pairs, and ligatures therefore match the
+         * Layout-rendered output. The {@code x} coordinate comes from
+         * {@code layout.getPrimaryHorizontal(offset)}: the leading edge in the run's direction
+         * (left for LTR, right for RTL), which is what {@code drawTextRun} expects.
+         *
+         * <p><b>Coordinate fidelity:</b> the translation replicates TextView's own
+         * {@code canvas.translate(compoundPaddingLeft - scrollX, extendedPaddingTop + voffset - scrollY)}
+         * before {@code layout.draw()}, including the {@code CENTER_VERTICAL} offset.
+         *
+         * <p><b>Isolation:</b> only target-cluster {@code drawTextRun} calls are made into the
+         * {@code saveLayerAlpha} layer. Non-target glyph ink is physically absent.
+         *
+         * <p><b>Glyph overhang:</b> the saveLayer uses full view dimensions so that overhang
+         * is never clipped.
+         *
+         * <p><b>No double-brightening:</b> {@code saveLayerAlpha} composites the layer at the
+         * desired overlay alpha; overlapping white ink from adjacent clusters is capped at that
+         * alpha.
+         *
+         * <p>No spans, no setSpan, no per-frame allocation. The plain-text snapshot
+         * ({@link #karaokeTextStr}) is cached in {@link #setLyricText}.
+         */
+        private void drawGlyphOverlay(Canvas canvas, int textStart, int textEnd, float alpha) {
+            if (clusterCount == 0 || textEnd <= textStart || karaokeText == null) return;
+            if (karaokeTextStr == null) return;
+            final Layout layout = getLayout();
+            if (layout == null) return;
+            if (alpha <= 0f) return;
+            // Replicate the coordinate transform TextView applies before Layout.draw():
+            //   canvas.translate(compoundPaddingLeft - scrollX, extendedPaddingTop + voffset - scrollY)
+            // where voffset = (boxHeight - layoutHeight) >> 1 for CENTER_VERTICAL, clamped to >= 0.
+            final int compTop = getCompoundPaddingTop();
+            final int compBottom = getCompoundPaddingBottom();
+            final int boxHeight = getMeasuredHeight() - compTop - compBottom;
+            final int layoutHeight = layout.getHeight();
+            final int voffset = layoutHeight < boxHeight ? (boxHeight - layoutHeight) >> 1 : 0;
+            final float txX = getCompoundPaddingLeft() - getScrollX();
+            final float txY = getExtendedPaddingTop() + voffset - getScrollY();
+            // Full view bounds: no saveLayer clip that would cut glyph overhang.
+            final int save = canvas.saveLayerAlpha(0, 0, getWidth(), getHeight(),
+                    Math.round(alpha * 255));
+            final TextPaint lp = layout.getPaint();
+            final int savedColor = lp.getColor();
+            lp.setColor(Color.WHITE);
+            for (int i = 0; i < clusterCount; i++) {
+                final int offset = clusterStart[i];
+                if (offset < textStart) continue;
+                if (offset >= textEnd) break;
+                if (!clusterHasRect[i]) continue;
+                final int nextOffset = (i + 1 < clusterCount)
+                        ? clusterStart[i + 1] : karaokeTextStr.length();
+                final int drawEnd = Math.min(nextOffset, textEnd);
+                final int lineNum = layout.getLineForOffset(offset);
+                final int contextStart = layout.getLineStart(lineNum);
+                final int contextEnd = layout.getLineEnd(lineNum);
+                // getPrimaryHorizontal gives the leading edge in the cluster's run direction:
+                // left edge for LTR, right edge for RTL — exactly what drawTextRun expects for x.
+                final float x = layout.getPrimaryHorizontal(offset) + txX;
+                final float y = layout.getLineBaseline(lineNum) + txY;
+                canvas.drawTextRun(karaokeTextStr, offset, drawEnd,
+                        contextStart, contextEnd, x, y, clusterRtl[i], lp);
+            }
+            lp.setColor(savedColor);
+            canvas.restoreToCount(save);
+        }
+
+        private static float longNoteOverlayAlpha(long elapsedMs, long animMs) {
+            if (animMs <= 0 || elapsedMs < 0) return 0f;
+            final float maxAlpha = 0.30f;
+            if (elapsedMs < animMs) return (elapsedMs / (float) animMs) * maxAlpha;
+            if (elapsedMs < 2L * animMs) return maxAlpha;
+            if (elapsedMs < 3L * animMs) return ((3L * animMs - elapsedMs) / (float) animMs) * maxAlpha;
+            return 0f;
+        }
+
+        /** Returns the row to plain, uniformly coloured text, clearing any long-note emphasis. */
         void clearKaraoke() {
+            final boolean emphasisChanged = longNoteEligible || longNoteElapsedMs >= 0;
+            if (emphasisChanged) {
+                longNoteEligible = false;
+                longNoteElapsedMs = -1L;
+                longNoteWordDurationMs = 0L;
+                if (glowLayerActive) {
+                    glowLayerActive = false;
+                    setLayerType(LAYER_TYPE_NONE, null);
+                }
+            }
+            prevLongNoteCount = 0;
             if (!karaokeActive && requestedStart < 0 && requestedEnd < 0) return;
             karaokeActive = false;
             detachSpans();
@@ -5143,6 +5921,9 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             wordStart = 0;
             wordEnd = 0;
             sweep = 0f;
+            wordOwnedEnd = 0;
+            wordHasExplicitEnd = false;
+            wordGapProgress = 0f;
             requestedStart = -1;
             requestedEnd = -1;
             spanSungTo = -1;
@@ -5167,8 +5948,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
      * <p>It extends {@link CharacterStyle} and implements {@link UpdateAppearance}, which is the
      * platform's own contract for "this changes how the text looks and nothing about where it is".
      * Android does not re-measure or re-layout for such a span. {@link #updateDrawState} touches
-     * exactly two properties of the paint - the colour and the shader - and NOTHING else: not the
-     * typeface, the text size, fake-bold, scaleX, letter spacing, the baseline shift or the flags.
+     * the colour, the shader, and the shadow layer (for glow), and NOTHING else: not the typeface,
+     * the text size, fake-bold, scaleX, letter spacing, the baseline shift or the flags.
      * That is why the sweep cannot change a glyph's shape, width, weight, spacing or position.
      *
      * <p>The shader is always set, to null when this run is a flat colour. A {@link TextPaint} is
@@ -5178,6 +5959,9 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
     private static final class KaraokeSpan extends CharacterStyle implements UpdateAppearance {
         private int color;
         private Shader shader;
+        /** Glow shadow: radius > 0 enables setShadowLayer on the span's TextPaint. */
+        private float shadowRadius;
+        private int shadowColor;
 
         /** A flat colour, with any shader from a previous frame explicitly dropped. */
         void setSolid(int value) {
@@ -5189,12 +5973,26 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             shader = paintShader;
         }
 
+        /** Sets the glow shadow. Use radius = 0 to clear. Requires a software rendering layer. */
+        void setGlow(float radius, int argbColor) {
+            shadowRadius = radius;
+            shadowColor = argbColor;
+        }
+
         @Override
         public void updateDrawState(TextPaint paint) {
             paint.setColor(color);
             // Unconditional, including the null: see the class comment. A shader left behind by
             // another run would repaint this run through that run's boundary.
             paint.setShader(shader);
+            // Long-note glow: white halo, rendered via software layer (TextPaint.setShadowLayer
+            // is ignored on hardware-accelerated layers). Unconditional clear when inactive so a
+            // recycled view cannot carry a previous line's glow forward.
+            if (shadowRadius > 0f) {
+                paint.setShadowLayer(shadowRadius, 0f, 0f, shadowColor);
+            } else {
+                paint.clearShadowLayer();
+            }
         }
     }
 
