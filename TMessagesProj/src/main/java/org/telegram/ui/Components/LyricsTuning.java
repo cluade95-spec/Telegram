@@ -59,12 +59,13 @@ public final class LyricsTuning {
     public static final float SCALE_DAMPING = 25f;
 
     // --- Line opacity (AMLL lyric-player.module.css, base/index.ts resolveOpacity) --------
-    /** Text alpha of every line that is not the active one. */
+    // Exactly three stages. The only other values ever drawn are the FOCUS_IN / FOCUS_OUT fades
+    // between them.
+    /** Text alpha of every line that is not the active one, sung or not. */
     public static final float ALPHA_INACTIVE = 0.2f;
-    /** Overall alpha of the active line; the two below are multiplied by it. */
-    public static final float ALPHA_ACTIVE_ROW = 0.85f;
-    /** Word-timed active line: text already sung, and text still to come. */
+    /** Active line: text already sung (a line without word timing is all "sung"). */
     public static final float ALPHA_SUNG = 1.0f;
+    /** Active word-timed line: text still to come. */
     public static final float ALPHA_UNSUNG = 0.4f;
     /** How long a line takes to brighten when it becomes active, and to dim when it stops. */
     public static final long FOCUS_IN_MS = 300;

@@ -1407,7 +1407,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         });
         lyricsListView.addOnChildAttachStateChangeListener(new RecyclerView.OnChildAttachStateChangeListener() {
             @Override public void onChildViewAttachedToWindow(@NonNull View view) {
-                applyLyricsDepth(view);
+                // The row was already painted by LyricsAdapter.onViewAttachedToWindow; this only
+                // wakes the frame loop so the springs carry on from it.
                 scheduleLyricsFrame();
             }
             @Override public void onChildViewDetachedFromWindow(@NonNull View view) { }
@@ -3604,7 +3605,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         final int sweepColor = karaokeSweepColor();
         boolean moving = false;
         for (int i = 0; i < lyricsListView.getChildCount(); i++) {
-            moving |= applyLyricsDepth(lyricsListView.getChildAt(i), inactiveColor, activeColor, sweepColor);
+            final View child = lyricsListView.getChildAt(i);
+            moving |= applyLyricsDepth(child, lyricsRowOf(child), inactiveColor, activeColor, sweepColor);
         }
         return moving;
     }
@@ -3801,9 +3803,22 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         karaokeSungSource = 0;
     }
 
-    private void applyLyricsDepth(View child) {
-        applyLyricsDepth(child, getThemedColor(Theme.key_player_time),
+    /**
+     * Paints one row synchronously, from the per-row state indexed by {@code row}, so a row that
+     * was just bound or attached never draws a frame in the adapter's default colour, scale or
+     * translation.
+     */
+    private void applyLyricsDepth(View child, int row) {
+        applyLyricsDepth(child, row, getThemedColor(Theme.key_player_time),
                 getThemedColor(Theme.key_player_actionBarTitle), karaokeSweepColor());
+    }
+
+    /** The adapter row a lyrics child shows: its adapter position, else its laid-out one. */
+    private int lyricsRowOf(View child) {
+        final RecyclerView.ViewHolder holder = lyricsListView.findContainingViewHolder(child);
+        if (holder == null) return RecyclerView.NO_POSITION;
+        final int row = holder.getAdapterPosition();
+        return row != RecyclerView.NO_POSITION ? row : holder.getLayoutPosition();
     }
 
     /**
@@ -3820,8 +3835,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
      *     and a line fading out keeps painting its real word state the whole way down.</li>
      * </ul>
      */
-    private boolean applyLyricsDepth(View child, int inactiveColor, int activeColor, int sweepColor) {
-        if (lyricsListView.getHeight() == 0) return false;
+    private boolean applyLyricsDepth(View child, int row, int inactiveColor, int activeColor, int sweepColor) {
         final LyricsTextView textView = child instanceof LyricsTextView ? (LyricsTextView) child : null;
         if (currentLyrics == null || !currentLyrics.isSynced()) {
             // Normal lyrics are read, not followed: no invented focus, no depth falloff, no word
@@ -3838,8 +3852,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             return false;
         }
         final long now = lyricsNow();
-        final RecyclerView.ViewHolder holder = lyricsListView.findContainingViewHolder(child);
-        final int row = holder == null ? RecyclerView.NO_POSITION : holder.getAdapterPosition();
+        // A row bound before the first frame of a new document still needs its springs and focus.
+        if (!visibleLyrics.isEmpty()) ensureLyricsMotionState(now);
         final SyncedLyricsController.Line lyricLine = lineForLyricsRow(row);
         final boolean wordFrame = lyricsWordTimed && lyricLine != null && textView != null
                 && rowKaraoke.resolveRow(lyricLine, visibleLyrics.get(row), karaokeLine,
@@ -3864,7 +3878,9 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         child.setAlpha(1f);
         // Interim depth for the Build 1 blur: smoothstep of the distance from the anchor.
         final float center = getLyricsAnchorY();
-        final float distance = Math.abs((child.getTop() + child.getBottom()) / 2f + translation - center) / Math.max(1f, center);
+        // A row painted from onBindViewHolder is not laid out yet: no depth until it is.
+        final float distance = child.getHeight() == 0 || center <= 0 ? 0f
+                : Math.abs((child.getTop() + child.getBottom()) / 2f + translation - center) / center;
         final float linear = Math.min(1f, distance);
         final float depth = linear * linear * (3f - 2f * linear);
         // Long-note word emphasis: eligible words (explicit end, duration >= 1000ms, 1..7 graphemes)
@@ -3936,10 +3952,12 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             // glyphs. A line already passed is wholly sung; a line the pre-roll is bringing in
             // early shows nothing lit until its own time.
             // Opacity lives in the colour, never in View alpha, so no row needs an offscreen layer.
-            final int sungColor = lyricsAlphaColor(sweepColor, lerp(LyricsTuning.ALPHA_INACTIVE,
-                    LyricsTuning.ALPHA_ACTIVE_ROW * LyricsTuning.ALPHA_SUNG, focus));
-            final int mutedColor = lyricsAlphaColor(sweepColor, lerp(LyricsTuning.ALPHA_INACTIVE,
-                    LyricsTuning.ALPHA_ACTIVE_ROW * LyricsTuning.ALPHA_UNSUNG, focus));
+            // Exactly three stages: every inactive line ALPHA_INACTIVE, and on the active line
+            // ALPHA_UNSUNG for what is still to come and ALPHA_SUNG for what has been sung.
+            final int sungColor = lyricsAlphaColor(sweepColor,
+                    lerp(LyricsTuning.ALPHA_INACTIVE, LyricsTuning.ALPHA_SUNG, focus));
+            final int mutedColor = lyricsAlphaColor(sweepColor,
+                    lerp(LyricsTuning.ALPHA_INACTIVE, LyricsTuning.ALPHA_UNSUNG, focus));
             textView.setLyricTextColor(mutedColor);
             textView.setKaraokeColors(mutedColor, sungColor);
             textView.setKaraokeFrame(rowKaraoke.wordStart, rowKaraoke.wordEnd, rowKaraoke.sweep,
@@ -3950,7 +3968,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             // hierarchy only: no sweep, no word motion, nothing invented.
             textView.clearKaraoke();
             textView.setLyricTextColor(lyricsAlphaColor(sweepColor,
-                    lerp(LyricsTuning.ALPHA_INACTIVE, LyricsTuning.ALPHA_ACTIVE_ROW, focus)));
+                    lerp(LyricsTuning.ALPHA_INACTIVE, LyricsTuning.ALPHA_SUNG, focus)));
         }
         return moving;
     }
@@ -5827,7 +5845,10 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
 
         @Override
         public void updateDrawState(TextPaint paint) {
-            paint.setColor(color);
+            // With a shader set, the paint's own alpha multiplies the shader's output. The
+            // gradient's stops already carry the sung and muted alphas, so the paint must be
+            // opaque here or the whole run is dimmed a second time by the muted alpha.
+            paint.setColor(shader != null ? (color | 0xFF000000) : color);
             // Unconditional, including the null: see the class comment. A shader left behind by
             // another run would repaint this run through that run's boundary.
             paint.setShader(shader);
@@ -5898,20 +5919,30 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             textView.setMinHeight(dp(stanzaSpace ? LYRICS_ROW_STANZA_HEIGHT_DP : LYRICS_ROW_MIN_HEIGHT_DP));
             textView.setPadding(dp(LYRICS_ROW_PADDING_H_DP), dp(stanzaSpace ? 0 : LYRICS_ROW_PADDING_V_DP),
                     dp(LYRICS_ROW_PADDING_H_DP), dp(stanzaSpace ? 0 : LYRICS_ROW_PADDING_V_DP));
-            // A recycled row must never arrive carrying the previous line's depth; the attach
-            // callback re-derives it from the row's real position immediately afterwards.
-            textView.setDepthBlur(0f);
-            // Timed rows get their emphasis from applyLyricsDepth(), which runs on attach and on
-            // every frame of the transition; binding it here as well would reintroduce the pop.
+            // A recycled or rebound row is painted here, from the state indexed by this position,
+            // so it never draws a frame with the previous line's or the adapter's default look.
+            // A rebind in place (notifyDataSetChanged) gets no attach callback, so this is the
+            // only paint it would get before it is drawn.
             if (synced) {
-                textView.setLyricTextColor(getThemedColor(Theme.key_player_time));
+                applyLyricsDepth(textView, position);
             } else {
+                textView.setDepthBlur(0f);
                 textView.setLyricTextColor(getThemedColor(Theme.key_player_actionBarTitle));
                 textView.setAlpha(1f);
                 textView.setScaleX(1f);
                 textView.setScaleY(1f);
             }
             textView.setBackground(stanzaSpace || !synced ? null : Theme.createSelectorDrawable(getThemedColor(Theme.key_listSelector), 2));
+        }
+
+        @Override
+        public void onViewAttachedToWindow(@NonNull RecyclerView.ViewHolder holder) {
+            // A row coming back from the view cache is attached without a rebind: paint it from
+            // its position now, before its first draw.
+            if (currentLyrics == null || !currentLyrics.isSynced()) return;
+            final int position = holder.getAdapterPosition();
+            applyLyricsDepth(holder.itemView,
+                    position != RecyclerView.NO_POSITION ? position : holder.getLayoutPosition());
         }
     }
 
