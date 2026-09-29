@@ -831,7 +831,8 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
         for (int i = 0; i < result.size(); i++) {
             final Line line = result.get(i);
             final long nextTimeMs = i + 1 < result.size() ? result.get(i + 1).timeMs : Long.MAX_VALUE;
-            final Segments segments = qualify(candidates.get(i), line.text, line.timeMs, nextTimeMs);
+            final long afterNextTimeMs = i + 2 < result.size() ? result.get(i + 2).timeMs : Long.MAX_VALUE;
+            final Segments segments = qualify(candidates.get(i), line.text, line.timeMs, nextTimeMs, afterNextTimeMs);
             if (segments != null) result.set(i, line.withSegments(segments));
         }
         return result;
@@ -1062,7 +1063,7 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
      * timing and nothing else - the line, its timestamp and its text are untouched, so a broken
      * karaoke extension can never damage otherwise valid line-synced lyrics.
      */
-    private static Segments qualify(Candidate candidate, String text, long lineTimeMs, long nextTimeMs) {
+    private static Segments qualify(Candidate candidate, String text, long lineTimeMs, long nextTimeMs, long afterNextTimeMs) {
         if (candidate == null || candidate.malformed || candidate.count == 0) return null;
         // A timed blank has no text to address, so it has nothing to time.
         if (text.isEmpty()) return null;
@@ -1070,7 +1071,12 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
         for (int a = 0; a < count; a++) {
             final long time = candidate.times[a];
             // Stated out of its own line's interval, or running backwards: not this line's timing.
-            if (time < lineTimeMs || time >= nextTimeMs) return null;
+            // Background vocals (text in parentheses) are the one exception: they are genuinely
+            // sung over the start of the next line, as in "know (back to let you know)" with
+            // the next line starting under the echo, so they may run on into the next line, but
+            // never past the one after it.
+            final long limit = isBackgroundVocalAt(text, candidate.offsets[a]) ? afterNextTimeMs : nextTimeMs;
+            if (time < lineTimeMs || time >= limit) return null;
             if (a > 0 && time < candidate.times[a - 1]) return null;
             if (a > 0 && candidate.offsets[a] < candidate.offsets[a - 1]) return null;
             if (splitsSurrogatePair(text, candidate.offsets[a])) return null;
@@ -1109,6 +1115,24 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
                 kept == count ? endOffsets : Arrays.copyOf(endOffsets, kept),
                 kept == count ? startTimes : Arrays.copyOf(startTimes, kept),
                 !anyEnd ? null : kept == count ? endTimes : Arrays.copyOf(endTimes, kept));
+    }
+
+    /**
+     * True when the text a tag at {@code offset} introduces is inside parentheses (ASCII or
+     * full-width), or opens them: background vocals, as {@link #splitBackgroundVocals} shows them.
+     */
+    private static boolean isBackgroundVocalAt(String text, int offset) {
+        int depth = 0;
+        for (int i = 0; i < offset && i < text.length(); i++) {
+            final char c = text.charAt(i);
+            if (c == '(' || c == '\uFF08') depth++;
+            else if ((c == ')' || c == '\uFF09') && depth > 0) depth--;
+        }
+        int i = offset;
+        while (i < text.length() && Character.isWhitespace(text.charAt(i))) i++;
+        if (i >= text.length()) return false;
+        final char first = text.charAt(i);
+        return depth > 0 ? first != ')' && first != '\uFF09' : first == '(' || first == '\uFF08';
     }
 
     /** An offset between a high and a low surrogate would cut one character in half. */

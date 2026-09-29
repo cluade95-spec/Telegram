@@ -47,8 +47,9 @@ public final class LyricsTuning {
     public static final float FAR_TARGET_ENTRY_FRACTION = 0.5f;
 
     // --- Scroll pre-roll ------------------------------------------------------------------
-    /** The list starts moving to the next line at most this long before its timestamp. The
-     *  brightness never moves early: it changes at the timestamp itself. */
+    /** The list starts moving to the next line at most this long before its timestamp. With word
+     *  timing the brightness changes at the timestamp itself; a line-synced line brightens with
+     *  the scroll, on the same spring and the same stagger delay as its own row. */
     public static final long PRE_ROLL_MAX_MS = 250;
     /** ...and never more than this fraction of the gap between the two lines. */
     public static final float PRE_ROLL_GAP_FRACTION = 0.5f;
@@ -62,8 +63,6 @@ public final class LyricsTuning {
     // --- Line scale (AMLL base/group.ts) --------------------------------------------------
     public static final float SCALE_ACTIVE = 1.0f;
     public static final float SCALE_INACTIVE = 0.97f;
-    /** Scale every line takes while playback is paused. */
-    public static final float SCALE_PAUSED = 1.0f;
     public static final float SCALE_MASS = 2f;
     public static final float SCALE_STIFFNESS = 100f;
     public static final float SCALE_DAMPING = 25f;
@@ -140,13 +139,21 @@ public final class LyricsTuning {
     public static final float FILL_FIRST_WORD_PAD = 1.5f;
     public static final float FILL_LAST_WORD_PAD = 0.5f;
 
-    // --- Per-word lift (AMLL dom/animation/float) ---------------------------------------------
+    // --- Per-word lift (AMLL dom/animation/float, YouLy+ lyrics.css) --------------------------
     /** Rise of a word once it starts, in em, times LIFT_MULTIPLIER. The full rise is rounded to
-     *  whole pixels so a word at rest is pixel-sharp; in between it moves sub-pixel. */
-    public static final float LIFT_EM = 0.05f;
+     *  whole pixels so a word at rest is pixel-sharp; in between it moves sub-pixel.
+     *  AMLL (0.05em) and YouLy+ (3.5% of the word box) both reproduce Apple at desktop text sizes
+     *  of 40px and more; at our 22dp that is 3 px, too little to read on a phone, so the rise is
+     *  doubled: about 2dp. */
+    public static final float LIFT_EM = 0.1f;
     public static final float LIFT_MULTIPLIER = 1.0f;
-    /** The rise takes max(this, the word's duration), ease-out. */
-    public static final long LIFT_MIN_DURATION_MS = 1000;
+    /** Background vocals rise this many times as far, relative to their own smaller size (AMLL
+     *  float: isBG doubles the rise). */
+    public static final float LIFT_BACKGROUND_MULTIPLIER = 2f;
+    /** The rise takes max(this, the word's duration), ease-out. AMLL and YouLy+ use 1000 ms, so a
+     *  normal 250-350 ms word had only risen 40% when the next one started and the line drifted
+     *  up as a whole; at 450 ms such a word is about 75% up when the next one starts. */
+    public static final long LIFT_MIN_DURATION_MS = 450;
     /** When the line stops being active, words sink back over max(this, the time they spent
      *  rising), starting at the speed they were rising with, so the turn has no kink. */
     public static final long LIFT_FALL_MIN_MS = 500;
@@ -196,29 +203,32 @@ public final class LyricsTuning {
     public static final float[] INTERLUDE_EXIT_PHASE2_EASE = {0.29f, 0.03f, 1f, 0.38f};
     public static final float[] INTERLUDE_EXIT_FADE_EASE = {0.43f, 0.08f, 0.83f, 0.31f};
 
-    // --- Long-word emphasis (AMLL dom/animation/emphasize, LyricLineBase.shouldEmphasize) ----
+    // --- Long-word emphasis (YouLy+ lyricsRenderer.js isGroupGrowable / applyGrowthStyles,
+    //     timing from AMLL dom/animation/emphasize) -------------------------------------------
+    /** A word qualifies when it lasts at least this long and has MIN..MAX graphemes (CJK: any
+     *  length); background vocals never do. YouLy+ and AMLL agree on 1000 ms and 7. */
     public static final long EMPHASIS_MIN_DURATION_MS = 1000;
-    /** Grapheme range for non-CJK words; CJK words qualify at any length. */
-    public static final int EMPHASIS_MIN_GRAPHEMES = 2;
+    public static final int EMPHASIS_MIN_GRAPHEMES = 1;
     public static final int EMPHASIS_MAX_GRAPHEMES = 7;
-    /** AMLL calculateEmphasizeParams: amount = f(du / AMOUNT_REF_MS) * AMOUNT_SCALE and
-     *  glow = f(du / GLOW_REF_MS) * GLOW_SCALE, where f(x) = sqrt(x) above 1 and x^3 below, and
-     *  du = max(EMPHASIS_MIN_DURATION_MS, word duration); capped at AMOUNT_MAX / GLOW_MAX. */
-    public static final float EMPHASIS_AMOUNT_REF_MS = 2000f;
-    public static final float EMPHASIS_GLOW_REF_MS = 3000f;
-    public static final float EMPHASIS_AMOUNT_SCALE = 0.6f;
-    public static final float EMPHASIS_GLOW_SCALE = 0.5f;
-    public static final float EMPHASIS_AMOUNT_MAX = 1.2f;
-    public static final float EMPHASIS_GLOW_MAX = 0.8f;
-    /** Grapheme swell: scale = 1 + ease * SWELL * amount, never above 1 + MAX_SWELL. */
-    public static final float EMPHASIS_SWELL = 0.1f;
-    public static final float EMPHASIS_MAX_SWELL = 0.10f;
-    /** Graphemes push apart by ease * SPREAD * amount * (count / 2 - index) em, and rise by
-     *  ease * RISE * amount em. */
-    public static final float EMPHASIS_SPREAD_EM = 0.03f;
-    public static final float EMPHASIS_RISE_EM = 0.025f;
-    /** Glow: white shadow of radius min(GLOW_MAX_EM, blur * GLOW_MAX_EM) em, alpha ease * blur. */
-    public static final float EMPHASIS_GLOW_MAX_EM = 0.3f;
+    /** Strength. A qualifying word always swells by at least BASE (SHORT_BASE for words of
+     *  SHORT_GRAPHEMES or fewer) and glows at GLOW_BASE; longer words add up to RAMP swell and
+     *  GLOW_RAMP glow along p^RAMP_POWER, p = (duration - MIN) / (FULL - MIN). (AMLL starts its
+     *  strength at zero on a cubic, which is why a one-second word showed almost nothing.) */
+    public static final float EMPHASIS_SWELL_BASE = 0.05f;
+    public static final float EMPHASIS_SWELL_SHORT_BASE = 0.07f;
+    public static final int EMPHASIS_SHORT_GRAPHEMES = 3;
+    public static final float EMPHASIS_SWELL_RAMP = 0.10f;
+    public static final float EMPHASIS_GLOW_BASE = 0.4f;
+    public static final float EMPHASIS_GLOW_RAMP = 0.4f;
+    public static final long EMPHASIS_FULL_DURATION_MS = 5000;
+    public static final float EMPHASIS_RAMP_POWER = 3f;
+    /** Graphemes spread from the word's middle by (position - 0.5) * 2 * swell * SPREAD em, and
+     *  rise by swell / RISE_REF_SWELL * RISE_BOX of the glyph box height, at the peak. */
+    public static final float EMPHASIS_SPREAD = 1f;
+    public static final float EMPHASIS_RISE_BOX = 0.06f;
+    public static final float EMPHASIS_RISE_REF_SWELL = 0.13f;
+    /** Glow: a white drop shadow of this blur radius in em (CSS drop-shadow 0.1em). */
+    public static final float EMPHASIS_GLOW_RADIUS_EM = 0.1f;
     /** Each grapheme starts duration / STAGGER_DIVISOR / count after the previous one. */
     public static final float EMPHASIS_STAGGER_DIVISOR = 2.5f;
     /** Extra float per grapheme: sin-shaped, FLOAT_EM high, FLOAT_STRETCH times the duration,
@@ -226,8 +236,10 @@ public final class LyricsTuning {
     public static final float EMPHASIS_FLOAT_EM = 0.05f;
     public static final float EMPHASIS_FLOAT_STRETCH = 1.4f;
     public static final long EMPHASIS_FLOAT_LEAD_MS = 400;
-    /** The line's last word gets more: amount, glow and duration multipliers. */
-    public static final float EMPHASIS_LAST_WORD_AMOUNT = 1.6f;
-    public static final float EMPHASIS_LAST_WORD_GLOW = 1.5f;
-    public static final float EMPHASIS_LAST_WORD_DURATION = 1.2f;
+
+    // --- Last word of a line without a stated end (Gramophone SemanticLyrics) -----------------
+    /** Enhanced LRC states when each word starts, never when the last one ends. Its fill, lift
+     *  and emphasis last as long as the line's other words take per letter, times its letters,
+     *  never past the next line; with no other word to learn from, this many ms per letter. */
+    public static final long LAST_WORD_FALLBACK_MS_PER_CHAR = 100;
 }
