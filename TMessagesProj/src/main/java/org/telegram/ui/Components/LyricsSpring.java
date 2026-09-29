@@ -53,6 +53,16 @@ public final class LyricsSpring {
         pendingTarget += delta;
     }
 
+    /**
+     * Moves the target (and any pending target) by {@code delta} from now on, keeping the
+     * current position and velocity: a correction to where the motion is heading, not a jump.
+     */
+    public void moveTarget(float delta, long nowNanos) {
+        resolvePending(nowNanos);
+        if (pending) pendingTarget += delta;
+        restart(nowNanos, target + delta, mass, stiffness, damping);
+    }
+
     public void setParams(float mass, float stiffness, float damping) {
         this.mass = mass;
         this.stiffness = stiffness;

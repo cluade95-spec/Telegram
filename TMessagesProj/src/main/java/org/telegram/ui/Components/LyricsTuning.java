@@ -216,11 +216,17 @@ public final class LyricsTuning {
 
     // --- Long-word emphasis (YouLy+ lyricsRenderer.js isGroupGrowable / applyGrowthStyles,
     //     timing from AMLL dom/animation/emphasize) -------------------------------------------
-    /** A word qualifies when it lasts at least this long and has MIN..MAX graphemes (CJK: any
-     *  length); background vocals never do. YouLy+ and AMLL agree on 1000 ms and 7. */
+    /** Which words glow and swell (AMLL core/src/lyric-player/base/line.ts shouldEmphasize,
+     *  whose comment credits Apple Music; YouLy+ lyricsRenderer.js isGroupGrowable agrees):
+     *  - lasts at least MIN_DURATION_MS (AMLL and YouLy+: 1000);
+     *  - MIN_LENGTH..MAX_LENGTH characters once trimmed, as UTF-16 units (AMLL: > 1 and <= 7;
+     *    YouLy+: <= 7); CJK text needs only the duration (AMLL);
+     *  - a word counts when the whole word or any one of its syllables qualifies (AMLL
+     *    dom/lyric-line.ts: chunk.some(shouldEmphasize) || shouldEmphasize(merged));
+     *  - background vocals never do (YouLy+: !isBg). */
     public static final long EMPHASIS_MIN_DURATION_MS = 1000;
-    public static final int EMPHASIS_MIN_GRAPHEMES = 1;
-    public static final int EMPHASIS_MAX_GRAPHEMES = 7;
+    public static final int EMPHASIS_MIN_LENGTH = 2;
+    public static final int EMPHASIS_MAX_LENGTH = 7;
     /** Strength. A qualifying word always swells by at least BASE (SHORT_BASE for words of
      *  SHORT_GRAPHEMES or fewer) and glows at GLOW_BASE; longer words add up to RAMP swell and
      *  GLOW_RAMP glow along p^RAMP_POWER, p = (duration - MIN) / (FULL - MIN). (AMLL starts its
@@ -248,12 +254,29 @@ public final class LyricsTuning {
     public static final float EMPHASIS_FLOAT_STRETCH = 1.4f;
     public static final long EMPHASIS_FLOAT_LEAD_MS = 400;
 
-    // --- Last word of a line without a stated end (Gramophone SemanticLyrics) -----------------
-    /** Enhanced LRC states when each word starts, never when the last one ends. The last word
-     *  lasts until the next line starts when that is at most LAST_WORD_HELD_MAX_MS away (a held
-     *  note). A longer gap is a pause, not a note: the word then lasts as long as the line's other
-     *  words take per letter, times its letters (at most LAST_WORD_HELD_MAX_MS); with no other
-     *  word to learn from, LAST_WORD_FALLBACK_MS_PER_CHAR per letter. */
-    public static final long LAST_WORD_HELD_MAX_MS = 3000;
-    public static final long LAST_WORD_FALLBACK_MS_PER_CHAR = 100;
+    // --- Online lyrics (Paxsenix Apple Music TTML, songs found with the iTunes Search API) -----
+    /** Waits before each retry of a passing failure (network, 5xx/429, "temporarily
+     *  unavailable"). One retry per entry, then the search gives up: never endless. */
+    public static final long[] ONLINE_RETRY_DELAYS_MS = {2000, 4000, 8000, 15000, 30000, 60000};
+    /** A server's Retry-After is honoured up to this long. */
+    public static final long ONLINE_RETRY_AFTER_MAX_MS = 120000;
+    /** A real "Track not found" is remembered this long, so a song is not asked for on every play. */
+    public static final long ONLINE_NOT_FOUND_TTL_MS = 7L * 24 * 60 * 60 * 1000;
+    /** iTunes results asked for, and how many of the best-matching ones Paxsenix is asked about
+     *  (a single and its album are separate tracks; lyrics may exist on one only). Only results
+     *  within SCORE_SPREAD of the best score are tried. */
+    public static final int ONLINE_SEARCH_RESULTS = 25;
+    public static final int ONLINE_CANDIDATES = 3;
+    public static final double ONLINE_CANDIDATE_SCORE_SPREAD = 0.1;
+    public static final int ONLINE_CONNECT_TIMEOUT_MS = 10000;
+    public static final int ONLINE_READ_TIMEOUT_MS = 20000;
+    /** Matching an iTunes result to the playing track: title and artist similarity (1 minus edit
+     *  distance over length) must reach these; a length more than MAX_DURATION_DIFF away rules
+     *  the result out, within DURATION_EXACT it counts as the same length. A version word
+     *  (remix, live...) the playing title does not have costs VERSION_PENALTY of the score. */
+    public static final double ONLINE_MIN_TITLE_SIMILARITY = 0.7;
+    public static final double ONLINE_MIN_ARTIST_SIMILARITY = 0.5;
+    public static final long ONLINE_MAX_DURATION_DIFF_MS = 15000;
+    public static final long ONLINE_DURATION_EXACT_MS = 3000;
+    public static final double ONLINE_VERSION_PENALTY = 0.3;
 }

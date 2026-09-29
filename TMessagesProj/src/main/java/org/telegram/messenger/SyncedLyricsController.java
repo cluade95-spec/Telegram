@@ -9,6 +9,8 @@ import android.util.Xml;
 
 import org.telegram.tgnet.TLRPC;
 import org.telegram.messenger.audioinfo.AudioInfo;
+import org.telegram.ui.Components.LyricsOnlineSearch;
+import org.telegram.ui.Components.LyricsTuning;
 
 import org.xmlpull.v1.XmlPullParser;
 
@@ -801,6 +803,200 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
         }
     }
 
+    /**
+     * Converts a TTML document (Apple Music's word-timed lyrics) into this app's own lyrics text,
+     * so it can be opened and edited as text like any other lyrics. Nothing the document states
+     * is lost:
+     *
+     * <ul>
+     *     <li>Every word or syllable keeps its begin as an inline tag before it, and its end as a
+     *     tag right after it. The end tag is left out only where it equals the next tag's time,
+     *     which the parser reads back as the same end.</li>
+     *     <li>Background vocals ({@code ttm:role="x-bg"}) follow the main words in parentheses,
+     *     with their own word timing, and are shown as their own small line.</li>
+     *     <li>A line is stamped with the earliest time it states, so a word is never before its
+     *     line. Its end is its last word's end, background vocals included, and may be after the
+     *     next line's start.</li>
+     * </ul>
+     *
+     * Translations and romanisations are skipped, and singer agents ({@code ttm:agent}) are
+     * ignored. Returns null when the document cannot be read or states no line.
+     */
+    public static String ttmlToText(String source) {
+        if (source == null) return null;
+        String ttml = source;
+        if (ttml.length() > 0 && ttml.charAt(0) == '\ufeff') ttml = ttml.substring(1);
+        if (!looksLikeTtml(ttml)) return null;
+        final StringBuilder out = new StringBuilder();
+        try {
+            final XmlPullParser parser = Xml.newPullParser();
+            parser.setFeature(XmlPullParser.FEATURE_PROCESS_NAMESPACES, true);
+            parser.setInput(new StringReader(ttml));
+            boolean inBody = false;
+            boolean inLine = false;
+            long lineBegin = -1;
+            final TtmlPart main = new TtmlPart();
+            final TtmlPart background = new TtmlPart();
+            int skipDepth = -1;
+            int backgroundDepth = -1;
+            int timedDepth = -1;
+            int lines = 0;
+            int event = parser.getEventType();
+            while (event != XmlPullParser.END_DOCUMENT) {
+                if (event == XmlPullParser.START_TAG) {
+                    final String name = parser.getName();
+                    if (skipDepth >= 0) {
+                        event = parser.next();
+                        continue;
+                    }
+                    if ("body".equals(name)) {
+                        inBody = true;
+                    } else if (inBody && "p".equals(name)) {
+                        inLine = true;
+                        lineBegin = parseTtmlTime(parser.getAttributeValue(null, "begin"));
+                        main.reset();
+                        background.reset();
+                        backgroundDepth = -1;
+                        timedDepth = -1;
+                    } else if (inLine && "span".equals(name)) {
+                        final String role = parser.getAttributeValue(TTML_METADATA_NS, "role");
+                        if ("x-translation".equals(role) || "x-roman".equals(role)) {
+                            skipDepth = parser.getDepth();
+                        } else if ("x-bg".equals(role)) {
+                            if (backgroundDepth < 0) backgroundDepth = parser.getDepth();
+                        } else if (timedDepth < 0) {
+                            final long begin = parseTtmlTime(parser.getAttributeValue(null, "begin"));
+                            if (begin >= 0) {
+                                timedDepth = parser.getDepth();
+                                final TtmlPart part = backgroundDepth >= 0 ? background : main;
+                                part.begin(begin, parseTtmlTime(parser.getAttributeValue(null, "end")));
+                            }
+                        }
+                    }
+                } else if (event == XmlPullParser.TEXT) {
+                    if (skipDepth < 0 && inLine) {
+                        final TtmlPart part = backgroundDepth >= 0 ? background : main;
+                        part.text(parser.getText(), backgroundDepth >= 0);
+                    }
+                } else if (event == XmlPullParser.END_TAG) {
+                    final String name = parser.getName();
+                    if (skipDepth >= 0) {
+                        if (parser.getDepth() <= skipDepth) skipDepth = -1;
+                    } else if (inLine && "span".equals(name)) {
+                        if (timedDepth >= 0 && parser.getDepth() <= timedDepth) timedDepth = -1;
+                        if (backgroundDepth >= 0 && parser.getDepth() <= backgroundDepth) backgroundDepth = -1;
+                    } else if (inLine && "p".equals(name)) {
+                        inLine = false;
+                        long time = lineBegin;
+                        if (main.first >= 0 && (time < 0 || main.first < time)) time = main.first;
+                        if (background.first >= 0 && (time < 0 || background.first < time)) time = background.first;
+                        final String mainText = main.finish();
+                        final String backgroundText = background.finish();
+                        if (time >= 0 && (mainText.length() > 0 || backgroundText.length() > 0)) {
+                            out.append('[').append(formatTextTime(time)).append(']').append(mainText);
+                            if (backgroundText.length() > 0) {
+                                if (mainText.length() > 0) out.append(' ');
+                                out.append('(').append(backgroundText).append(')');
+                            }
+                            out.append('\n');
+                            lines++;
+                        }
+                    } else if ("body".equals(name)) {
+                        inBody = false;
+                    }
+                }
+                event = parser.next();
+            }
+            if (lines == 0) return null;
+        } catch (Throwable e) {
+            return null;
+        }
+        return out.toString();
+    }
+
+    /** One part of a TTML line (the main words, or the background vocals) being written as text. */
+    private static final class TtmlPart {
+        final StringBuilder text = new StringBuilder();
+        long first;
+        long pendingEnd;
+        boolean pendingSpace;
+
+        void reset() {
+            text.setLength(0);
+            first = -1;
+            pendingEnd = -1;
+            pendingSpace = false;
+        }
+
+        void begin(long begin, long end) {
+            if (first < 0) first = begin;
+            // The previous word's end, unless it is exactly this word's start (read back as such).
+            if (pendingEnd >= 0 && pendingEnd != begin) text.append('<').append(formatTextTime(pendingEnd)).append('>');
+            if (pendingSpace && text.length() > 0) text.append(' ');
+            pendingSpace = false;
+            text.append('<').append(formatTextTime(begin)).append('>');
+            pendingEnd = end > begin ? end : -1;
+        }
+
+        void text(String chunk, boolean background) {
+            if (chunk == null) return;
+            for (int a = 0; a < chunk.length(); a++) {
+                char c = chunk.charAt(a);
+                // The background part is written inside one pair of parentheses of its own.
+                if (background && (c == '(' || c == ')' || c == '\uFF08' || c == '\uFF09')) continue;
+                // Characters the lyrics text reads as markup would change the timing if kept.
+                if (c == '<' || c == '>' || c == '[' || c == ']') continue;
+                if (Character.isWhitespace(c)) {
+                    pendingSpace = text.length() > 0;
+                    continue;
+                }
+                if (pendingSpace) {
+                    text.append(' ');
+                    pendingSpace = false;
+                }
+                text.append(c);
+            }
+        }
+
+        String finish() {
+            if (pendingEnd >= 0) text.append('<').append(formatTextTime(pendingEnd)).append('>');
+            pendingEnd = -1;
+            return text.toString().trim();
+        }
+    }
+
+    /** mm:ss.xxx, the millisecond precision TTML states. */
+    private static String formatTextTime(long ms) {
+        final long minutes = ms / 60000;
+        final long seconds = (ms / 1000) % 60;
+        final long millis = ms % 1000;
+        return String.format(java.util.Locale.US, "%02d:%02d.%03d", minutes, seconds, millis);
+    }
+
+    private static final Pattern SINGER_LABEL = Pattern.compile(
+            "(?m)^((?:[ \\t]*(?:\\[\\d{1,3}:\\d{1,2}(?:[.:]\\d{1,3})?]|<\\d{1,3}:\\d{1,2}(?:[.:]\\d{1,3})?>))*[ \\t]*)v\\d+:[ \\t]?");
+
+    /**
+     * Removes singer labels ("v1:", "v2:", "v1000:") from the start of each line, including
+     * right after the line's time tags, and nothing else.
+     */
+    public static String stripSingerLabels(String text) {
+        if (text == null || text.indexOf(':') < 0) return text;
+        return SINGER_LABEL.matcher(text).replaceAll("$1");
+    }
+
+    /**
+     * What an imported file becomes in the editor: a TTML document converted into the app's own
+     * lyrics text (so it can be edited), and in every format the singer labels removed.
+     */
+    public static String prepareImportedLyrics(String source) {
+        if (source == null) return null;
+        String text = source;
+        final String converted = ttmlToText(source);
+        if (converted != null) text = converted;
+        return stripSingerLabels(text);
+    }
+
     // endregion
 
     private static ArrayList<Line> assemble(ArrayList<ParsedLine> parsed) {
@@ -1068,53 +1264,101 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
         // A timed blank has no text to address, so it has nothing to time.
         if (text.isEmpty()) return null;
         final int count = candidate.count;
+        final int length = text.length();
+        // A tag that introduces no text of its own (only spaces or parentheses before the next
+        // tag or the end of the line) is an END tag: it states when the word before it ends.
+        // Lyrics written without end tags parse exactly as before; a trailing tag used to be
+        // dropped, and is now the stated end of the line's last word.
+        final boolean[] endTag = new boolean[count];
         for (int a = 0; a < count; a++) {
+            final int start = candidate.offsets[a];
+            final int end = a + 1 < count ? candidate.offsets[a + 1] : length;
+            endTag[a] = countLyricChars(text, start, end) == 0;
+        }
+        long lastMain = Long.MIN_VALUE, lastBackground = Long.MIN_VALUE;
+        for (int a = 0; a < count; a++) {
+            if (endTag[a]) continue;
             final long time = candidate.times[a];
             // Stated out of its own line's interval, or running backwards: not this line's timing.
-            // Background vocals (text in parentheses) are the one exception: they are genuinely
-            // sung over the start of the next line, as in "know (back to let you know)" with
-            // the next line starting under the echo, so they may run on into the next line, but
-            // never past the one after it.
-            final long limit = isBackgroundVocalAt(text, candidate.offsets[a]) ? afterNextTimeMs : nextTimeMs;
-            if (time < lineTimeMs || time >= limit) return null;
-            if (a > 0 && time < candidate.times[a - 1]) return null;
+            // Lines may overlap (Apple Music's lyrics often do: an echo in parentheses, or the
+            // end of a line, sung over the start of the next one), so a word may start after the
+            // next line has started, but never after the one after it. Main words and background
+            // words are each in time order on their own; a background part may start before the
+            // main words written ahead of it have.
+            final boolean background = isBackgroundVocalAt(text, candidate.offsets[a]);
+            if (time < lineTimeMs || time >= afterNextTimeMs) return null;
+            if (background ? time < lastBackground : time < lastMain) return null;
+            if (background) lastBackground = time;
+            else lastMain = time;
             if (a > 0 && candidate.offsets[a] < candidate.offsets[a - 1]) return null;
             if (splitsSurrogatePair(text, candidate.offsets[a])) return null;
         }
-        final int length = text.length();
         int[] startOffsets = new int[count];
         int[] endOffsets = new int[count];
         long[] startTimes = new long[count];
-        long[] endTimes = candidate.ends == null ? null : new long[count];
+        long[] endTimes = new long[count];
         int kept = 0;
         boolean anyEnd = false;
         for (int a = 0; a < count; a++) {
+            if (endTag[a]) continue;
             final int start = candidate.offsets[a];
             final int end = a + 1 < count ? candidate.offsets[a + 1] : length;
             // A tag that introduces no visible text - two tags in a row, or one trailing the line -
             // cannot be highlighted, so it is dropped rather than kept as an empty range.
-            final int visible = countNonWhitespace(text, start, end);
-            if (visible == 0) continue;
+            if (countNonWhitespace(text, start, end) == 0) continue;
             startOffsets[kept] = start;
             endOffsets[kept] = end;
             startTimes[kept] = candidate.times[a];
-            if (endTimes != null) {
-                // Only a stated end survives, and only when it is actually after its own start and
-                // still inside this line. Anything else is recorded as "not stated" rather than
-                // repaired, because a repaired end would be an invented one.
-                final long stated = candidate.ends[a];
-                final boolean usable = stated > candidate.times[a] && stated <= nextTimeMs;
-                endTimes[kept] = usable ? stated : -1;
-                anyEnd |= usable;
-            }
+            // Only a stated end survives: TTML's own end attribute, or an end tag right after
+            // the word. It must be after the word's start and no later than the line after next
+            // (a line may run on over the start of the next one). Anything else is "not stated"
+            // rather than repaired, because a repaired end would be an invented one.
+            long stated = candidate.ends != null ? candidate.ends[a] : -1;
+            if (a + 1 < count && endTag[a + 1]) stated = candidate.times[a + 1];
+            final boolean usable = stated > candidate.times[a] && stated <= afterNextTimeMs;
+            endTimes[kept] = usable ? stated : -1;
+            anyEnd |= usable;
             kept++;
         }
         if (kept == 0) return null;
-        return new Segments(
-                kept == count ? startOffsets : Arrays.copyOf(startOffsets, kept),
-                kept == count ? endOffsets : Arrays.copyOf(endOffsets, kept),
-                kept == count ? startTimes : Arrays.copyOf(startTimes, kept),
-                !anyEnd ? null : kept == count ? endTimes : Arrays.copyOf(endTimes, kept));
+        startOffsets = Arrays.copyOf(startOffsets, kept);
+        endOffsets = Arrays.copyOf(endOffsets, kept);
+        startTimes = Arrays.copyOf(startTimes, kept);
+        endTimes = anyEnd ? Arrays.copyOf(endTimes, kept) : null;
+        // Consumers find the current segment by time (a binary search), so segments are kept in
+        // time order. That differs from text order only where a background part starts before
+        // the main words written ahead of it have; a stable sort keeps everything else as is.
+        boolean sorted = true;
+        for (int a = 1; a < kept && sorted; a++) sorted = startTimes[a] >= startTimes[a - 1];
+        if (!sorted) {
+            final Integer[] order = new Integer[kept];
+            for (int a = 0; a < kept; a++) order[a] = a;
+            final long[] times = startTimes;
+            Arrays.sort(order, (x, y) -> Long.compare(times[x], times[y]));
+            final int[] so = new int[kept], eo = new int[kept];
+            final long[] st = new long[kept], et = endTimes == null ? null : new long[kept];
+            for (int a = 0; a < kept; a++) {
+                so[a] = startOffsets[order[a]];
+                eo[a] = endOffsets[order[a]];
+                st[a] = startTimes[order[a]];
+                if (et != null) et[a] = endTimes[order[a]];
+            }
+            startOffsets = so;
+            endOffsets = eo;
+            startTimes = st;
+            endTimes = et;
+        }
+        return new Segments(startOffsets, endOffsets, startTimes, endTimes);
+    }
+
+    /** Characters that make a tag's range a word: anything but whitespace and parentheses. */
+    private static int countLyricChars(String text, int start, int end) {
+        int count = 0;
+        for (int a = start; a < end; a++) {
+            final char c = text.charAt(a);
+            if (!Character.isWhitespace(c) && c != '(' && c != ')' && c != '\uFF08' && c != '\uFF09') count++;
+        }
+        return count;
     }
 
     /**
@@ -1197,10 +1441,14 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
             Lyrics embeddedLyrics = EMPTY;
             boolean embeddedChecked = false;
             boolean suppressed = false;
+            boolean notFoundOnline = false;
             State state = State.MISSING;
             try {
                 File local = file(key);
                 suppressed = suppressionFile(key).exists();
+                final File notFound = notFoundFile(key);
+                notFoundOnline = notFound.exists()
+                        && System.currentTimeMillis() - notFound.lastModified() < LyricsTuning.ONLINE_NOT_FOUND_TTL_MS;
                 if (local.exists()) {
                     lyrics = read(local).withOrigin(Source.LOCAL);
                     state = lyrics.kind == Kind.MALFORMED ? State.MALFORMED : lyrics.lines.isEmpty() ? State.MISSING : State.LOADED;
@@ -1232,6 +1480,7 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
             final Lyrics loadedEmbeddedLyrics = embeddedLyrics;
             final boolean didCheckEmbedded = embeddedChecked;
             final boolean isSuppressed = suppressed;
+            final boolean skipOnline = notFoundOnline;
             final State loadedState = state;
             AndroidUtilities.runOnUIThread(() -> {
                 synchronized (cache) {
@@ -1244,6 +1493,11 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
                     current.state = loadedState;
                 }
                 notifyChanged(key);
+                // No lyrics on the device and none in the file (and the user did not delete
+                // them): ask Apple Music, unless it said "not found" for this song recently.
+                if (loadedState == State.MISSING && !isSuppressed && didCheckEmbedded && !skipOnline) {
+                    fetchOnline(key, message);
+                }
             });
         });
     }
@@ -1553,6 +1807,60 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
 
     private File file(String key) {
         return new File(ApplicationLoader.applicationContext.getFilesDir(), "lyrics/" + account + "/" + key + ".lrc");
+    }
+
+    /** Marks a song Apple Music has no lyrics for; its age is how long ago that was learned. */
+    private File notFoundFile(String key) {
+        return new File(ApplicationLoader.applicationContext.getFilesDir(), "lyrics/" + account + "/" + key + ".notfound");
+    }
+
+    private final java.util.HashSet<String> onlineFetching = new java.util.HashSet<>();
+    private static final Pattern AUDIO_EXTENSION = Pattern.compile("(?i)\\.(mp3|m4a|mp4|aac|flac|ogg|oga|opus|wav|wma|alac|aiff?)$");
+
+    /**
+     * Fetches the playing song's lyrics from Apple Music (Paxsenix; see LyricsOnlineSearch) and
+     * keeps them on the device as the song's own lyrics file, so they open in the editor like any
+     * other and are never fetched again. A real "not found" is remembered for
+     * ONLINE_NOT_FOUND_TTL_MS; a passing failure is retried inside the search and otherwise simply
+     * tried again the next time the song's lyrics are loaded.
+     */
+    private void fetchOnline(String key, MessageObject message) {
+        if (message == null || onlineFetching.contains(key)) return;
+        final MessageObject playing = MediaController.getInstance().getPlayingMessageObject();
+        if (playing == null || !key.equals(key(playing))) return;
+        String title = message.getMusicTitle(false);
+        String artist = message.getMusicAuthor(false);
+        title = title == null ? "" : title.trim();
+        artist = artist == null ? "" : artist.trim();
+        if (title.equals(LocaleController.getString(R.string.AudioUnknownTitle))) title = "";
+        if (artist.equals(LocaleController.getString(R.string.AudioUnknownArtist))) artist = "";
+        title = AUDIO_EXTENSION.matcher(title).replaceFirst("").trim();
+        if (title.isEmpty()) return;
+        onlineFetching.add(key);
+        LyricsOnlineSearch.search(artist, title, message.getDuration(), (lyrics, error) -> {
+            onlineFetching.remove(key);
+            final boolean stillMissing;
+            synchronized (cache) {
+                final Entry entry = cache.get(key);
+                stillMissing = entry != null && entry.state == State.MISSING && !entry.suppressed
+                        && entry.lyrics.lines.isEmpty();
+            }
+            if (lyrics != null) {
+                if (stillMissing) save(message, lyrics, null);
+            } else if (error == LyricsOnlineSearch.Error.NOT_FOUND) {
+                Utilities.globalQueue.postRunnable(() -> {
+                    try {
+                        final File marker = notFoundFile(key);
+                        final File parent = marker.getParentFile();
+                        if (parent != null && !parent.exists()) parent.mkdirs();
+                        new FileOutputStream(marker).close();
+                        marker.setLastModified(System.currentTimeMillis());
+                    } catch (Exception e) {
+                        FileLog.e(e);
+                    }
+                });
+            }
+        });
     }
 
     private File suppressionFile(String key) {
