@@ -84,6 +84,14 @@ public final class LyricsTuning {
     public static final float FOCUS_IN_DAMPING = 38.9f;
     public static final float FOCUS_OUT_STIFFNESS = 168f;
     public static final float FOCUS_OUT_DAMPING = 26f;
+    /** Lyrics without word timing: brightness eases (smoothstep, slow at both ends) instead of
+     *  springing. With a scroll it starts with the row's own scroll delay and lasts until that
+     *  scroll has settled (98%): LINE_FADE_SETTLE_OMEGA_T / omega, omega = sqrt(stiffness /
+     *  SCROLL_MASS), about 390 ms at the usual stiffness. Without one (a seek, a timed blank) it
+     *  takes AMLL's line opacity transition: 300 ms in, 450 ms out. */
+    public static final float LINE_FADE_SETTLE_OMEGA_T = 5.83f;
+    public static final long LINE_FADE_IN_MS = 300;
+    public static final long LINE_FADE_OUT_MS = 450;
 
     // --- Manual scroll and seek (AMLL base/scroll.ts, base/seek-detector.ts) --------------
     /** After the user's own scroll stops, following resumes this much later. */
@@ -122,6 +130,14 @@ public final class LyricsTuning {
      *  one into the other with sigma = radius * SCALE + BIAS. */
     public static final float BLUR_SIGMA_SCALE = 0.57735f;
     public static final float BLUR_SIGMA_BIAS = 0.5f;
+    /** AMLL's levels are CSS px against its phone lyric size of 8vw (32 px on a 400 px wide
+     *  phone). Our text is LYRICS_TEXT_SIZE_DP (22 dp), so a level taken 1:1 in dp blurred our
+     *  lines about 1.45x as hard relative to the letters. The sigma is scaled by
+     *  LYRICS_TEXT_SIZE_DP / BLUR_TEXT_REFERENCE_DP so the blur looks as AMLL's does at its size. */
+    public static final float BLUR_TEXT_REFERENCE_DP = 32f;
+    /** Top and bottom of the lyrics area fade to transparent (a real alpha fade, the list's own
+     *  fading edge) over this height, in dp. */
+    public static final int EDGE_FADE_DP = 72;
     /** Blur changes ride a critically damped spring (mass 1) that settles in about AMLL's
      *  0.4 s CSS transition, so an interrupted change keeps its speed. */
     public static final float BLUR_STIFFNESS = 212f;
@@ -141,19 +157,14 @@ public final class LyricsTuning {
 
     // --- Per-word lift (AMLL dom/animation/float, YouLy+ lyrics.css) --------------------------
     /** Rise of a word once it starts, in em, times LIFT_MULTIPLIER. The full rise is rounded to
-     *  whole pixels so a word at rest is pixel-sharp; in between it moves sub-pixel.
-     *  AMLL (0.05em) and YouLy+ (3.5% of the word box) both reproduce Apple at desktop text sizes
-     *  of 40px and more; at our 22dp that is 3 px, too little to read on a phone, so the rise is
-     *  doubled: about 2dp. */
-    public static final float LIFT_EM = 0.1f;
+     *  whole pixels so a word at rest is pixel-sharp; in between it moves sub-pixel. AMLL float. */
+    public static final float LIFT_EM = 0.05f;
     public static final float LIFT_MULTIPLIER = 1.0f;
     /** Background vocals rise this many times as far, relative to their own smaller size (AMLL
      *  float: isBG doubles the rise). */
     public static final float LIFT_BACKGROUND_MULTIPLIER = 2f;
-    /** The rise takes max(this, the word's duration), ease-out. AMLL and YouLy+ use 1000 ms, so a
-     *  normal 250-350 ms word had only risen 40% when the next one started and the line drifted
-     *  up as a whole; at 450 ms such a word is about 75% up when the next one starts. */
-    public static final long LIFT_MIN_DURATION_MS = 450;
+    /** The rise takes max(this, the word's duration), ease-out (AMLL float). */
+    public static final long LIFT_MIN_DURATION_MS = 1000;
     /** When the line stops being active, words sink back over max(this, the time they spent
      *  rising), starting at the speed they were rising with, so the turn has no kink. */
     public static final long LIFT_FALL_MIN_MS = 500;
@@ -238,8 +249,11 @@ public final class LyricsTuning {
     public static final long EMPHASIS_FLOAT_LEAD_MS = 400;
 
     // --- Last word of a line without a stated end (Gramophone SemanticLyrics) -----------------
-    /** Enhanced LRC states when each word starts, never when the last one ends. Its fill, lift
-     *  and emphasis last as long as the line's other words take per letter, times its letters,
-     *  never past the next line; with no other word to learn from, this many ms per letter. */
+    /** Enhanced LRC states when each word starts, never when the last one ends. The last word
+     *  lasts until the next line starts when that is at most LAST_WORD_HELD_MAX_MS away (a held
+     *  note). A longer gap is a pause, not a note: the word then lasts as long as the line's other
+     *  words take per letter, times its letters (at most LAST_WORD_HELD_MAX_MS); with no other
+     *  word to learn from, LAST_WORD_FALLBACK_MS_PER_CHAR per letter. */
+    public static final long LAST_WORD_HELD_MAX_MS = 3000;
     public static final long LAST_WORD_FALLBACK_MS_PER_CHAR = 100;
 }
