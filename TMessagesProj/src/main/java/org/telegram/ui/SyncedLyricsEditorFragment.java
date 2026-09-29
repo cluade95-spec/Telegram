@@ -18,6 +18,7 @@ import android.text.InputType;
 import android.text.Layout;
 import android.text.Spanned;
 import android.text.TextPaint;
+import android.text.TextUtils;
 import android.text.TextWatcher;
 import android.text.style.CharacterStyle;
 import android.text.style.UpdateAppearance;
@@ -51,6 +52,7 @@ import org.telegram.ui.ActionBar.AlertDialog;
 import org.telegram.ui.ActionBar.BaseFragment;
 import org.telegram.ui.ActionBar.Theme;
 import org.telegram.ui.ActionBar.ThemeDescription;
+import org.telegram.ui.Components.Bulletin;
 import org.telegram.ui.Components.BulletinFactory;
 import org.telegram.ui.Components.EditTextBoldCursor;
 import org.telegram.ui.Components.AudioPlayerAlert;
@@ -886,7 +888,7 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
         onlineProgressDialog = progress;
 
         final LyricsOnlineSearch.Request[] started = new LyricsOnlineSearch.Request[1];
-        started[0] = LyricsOnlineSearch.search(searchArtist, searchTitle, messageObject.getDuration(), (lyrics, error) -> {
+        started[0] = LyricsOnlineSearch.search(searchArtist, searchTitle, messageObject.getDuration(), (lyrics, error, detail) -> {
             // Only the search that still owns the editor may act. A cancelled request never calls
             // back at all; this also rejects a result whose search has been superseded.
             if (started[0] == null || onlineRequest != started[0]) return;
@@ -904,8 +906,13 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
             } else {
                 // A compact bottom message: a search that found nothing is information, not a
                 // decision to confirm.
-                BulletinFactory.of(this).createSimpleBulletin(R.raw.error,
-                        LocaleController.getString(onlineSearchErrorMessage(error)), 3).show();
+                // What actually failed goes with the message (and in the log, tag LyricsOnline),
+                // so a failure can be told apart from "no lyrics".
+                String message = LocaleController.getString(onlineSearchErrorMessage(error));
+                if (!TextUtils.isEmpty(detail) && error != LyricsOnlineSearch.Error.NOT_FOUND) {
+                    message += "\n" + (detail.length() > 140 ? detail.substring(0, 140) + "..." : detail);
+                }
+                BulletinFactory.of(this).createSimpleBulletin(R.raw.error, message, 4, Bulletin.DURATION_PROLONG).show();
             }
         });
         onlineRequest = started[0];

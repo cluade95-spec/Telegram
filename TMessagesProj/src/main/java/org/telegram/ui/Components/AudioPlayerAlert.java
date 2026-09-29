@@ -3313,6 +3313,15 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
      */
     private long[] lyricsLineHoldEnd = new long[0];
     /**
+     * Scroll groups. A line whose background vocals are still sung when the next line starts
+     * forms a group with that line (and on, while the last line's background vocals overlap the
+     * one after it). The list stays on the group's first line for the whole group and moves once,
+     * to the line after the group. Per document line: its group's first line, or -1.
+     */
+    private int[] lyricsGroupStart = new int[0];
+    /** Per group's first line: the group's last line. */
+    private int[] lyricsGroupLast = new int[0];
+    /**
      * Instrumental gaps that show the dots: each has a row of its own (LYRICS_ROW_INTERLUDE in
      * visibleLyrics) just before the line that ends it, and spans [start, end) of the song.
      */
@@ -3761,25 +3770,20 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         int targetRow = line < 0 ? 0 : rowForLyricsLine(line);
         // During an instrumental gap the dots sit on the anchor.
         if (lyricsInterludeRow != RecyclerView.NO_POSITION) targetRow = lyricsInterludeRow;
-        // Background vocals of the previous line still being sung over this one: like Apple
-        // Music (and AMLL, which scrolls to the first of its active lines), both lines are lit
-        // and the list stays on the earlier one until its singing ends, then moves on, with the
-        // same pre-roll as a line change.
-        final int held = lyricsHeldRowAt(line, position);
-        if (held != RecyclerView.NO_POSITION) {
-            final long holdEnd = lyricsLineHoldEnd[line - 1];
-            final long lineStart = currentLyrics.lines.get(line).timeMs;
-            final long lead = Math.min(LyricsTuning.PRE_ROLL_MAX_MS,
-                    (long) (Math.max(1L, holdEnd - lineStart) * LyricsTuning.PRE_ROLL_GAP_FRACTION));
-            return holdEnd - position <= lead ? targetRow : held;
+        // A line whose background vocals run over the next line: like Apple Music, both lines
+        // stay active and the list does not move until the new line ends; then it moves once,
+        // to the line after them (with the usual pre-roll). It never moves when the background
+        // vocals end. Chains of such lines are one group.
+        final int group = line >= 0 && line < lyricsGroupStart.length ? lyricsGroupStart[line] : -1;
+        if (group >= 0 && lyricsInterludeRow == RecyclerView.NO_POSITION) {
+            final int last = lyricsGroupLast[group];
+            final int preRolled = lyricsPreRollLine(last, position);
+            final int groupRow = rowForLyricsLine(group);
+            if (preRolled != last) return rowForLyricsLine(preRolled);
+            return groupRow != RecyclerView.NO_POSITION ? groupRow : targetRow;
         }
-        // A line whose background vocals will run on past the next line's start keeps the list
-        // until they end, so it does not pre-roll away from it either.
-        final boolean willHold = line >= 0 && line < lyricsLineHoldEnd.length && lyricsLineHoldEnd[line] != Long.MIN_VALUE;
-        if (!willHold) {
-            final int preRolled = lyricsPreRollLine(line, position);
-            if (preRolled != line) targetRow = rowForLyricsLine(preRolled);
-        }
+        final int preRolled = lyricsPreRollLine(line, position);
+        if (preRolled != line) targetRow = rowForLyricsLine(preRolled);
         return targetRow;
     }
 
@@ -3941,6 +3945,41 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             }
             if (next != Long.MAX_VALUE && end > next) lyricsLineHoldEnd[i] = end;
         }
+        // Scroll groups: only background vocals running over the next line join two lines.
+        lyricsGroupStart = new int[lines];
+        lyricsGroupLast = new int[lines];
+        java.util.Arrays.fill(lyricsGroupStart, -1);
+        for (int i = 0; i < lines; i++) {
+            final SyncedLyricsController.Line display = lyricsDisplayLines[i];
+            if (display == null || !display.timed || display.segments == null || display.segments.size() == 0) continue;
+            final int lineBreak = display.text.indexOf('\n');
+            if (lineBreak < 0) continue;
+            final int next = nextTimedLyricsLine(i);
+            if (next < 0 || TextUtils.isEmpty(currentLyrics.lines.get(next).text)) continue;
+            final long nextStart = currentLyrics.lines.get(next).timeMs;
+            final long nextStartOfNext = nextLyricsLineTimeMs(i);
+            long backgroundEnd = Long.MIN_VALUE;
+            final SyncedLyricsController.Segments segments = display.segments;
+            for (int k = 0; k < segments.size(); k++) {
+                if (segments.startOffset(k) <= lineBreak) continue;
+                backgroundEnd = Math.max(backgroundEnd, segments.startTimeMs(k)
+                        + KaraokeFrame.sweepWindowMs(display.text, segments, k, nextStartOfNext));
+            }
+            if (backgroundEnd <= nextStart) continue;
+            final int group = lyricsGroupStart[i] >= 0 ? lyricsGroupStart[i] : i;
+            lyricsGroupStart[i] = group;
+            lyricsGroupStart[next] = group;
+            lyricsGroupLast[group] = next;
+        }
+    }
+
+    /** The next document line with a time, or -1. */
+    private int nextTimedLyricsLine(int line) {
+        if (currentLyrics == null) return -1;
+        for (int i = line + 1; i < currentLyrics.lines.size(); i++) {
+            if (currentLyrics.lines.get(i).timed) return i;
+        }
+        return -1;
     }
 
     /** The row of the line before {@code line} while its singing still runs on, or NO_POSITION. */
@@ -5438,6 +5477,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         private float[] wordAmount = new float[8];
         private float[] wordGlow = new float[8];
         private long[] wordEmphasisMs = new long[8];
+        /** Where the word's emphasis is measured to (emphasisWindowMs), which may be later than its fill end. */
+        private long[] wordEmphasisEndMs = new long[8];
         /** When the line stops being active; lifts reverse from there. */
         private long lineActiveEndMs = Long.MAX_VALUE;
         private long wordClockMs;
@@ -5588,17 +5629,35 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             final String text = karaokeTextStr;
             final int n = segments.size();
             ensureWordCapacity(n);
+            // Words are read in text order. Segments are kept in time order, and where a
+            // background part starts inside a main word the two interleave; walking them in
+            // time order would cut that word in two.
+            if (textOrder.length < n) textOrder = new int[Math.max(n, textOrder.length * 2)];
+            final int[] order = textOrder;
+            for (int k = 0; k < n; k++) {
+                int at = k;
+                while (at > 0 && segments.startOffset(order[at - 1]) > segments.startOffset(k)) {
+                    order[at] = order[at - 1];
+                    at--;
+                }
+                order[at] = k;
+            }
             int i = 0;
             while (i < n) {
                 int last = i;
-                while (last + 1 < n && KaraokeFrame.isWordContinuation(text, segments, last + 1)) last++;
-                int start = Math.max(0, Math.min(text.length(), segments.startOffset(i)));
-                int end = Math.max(start, Math.min(text.length(), segments.endOffset(last)));
+                while (last + 1 < n && continuesWord(text, segments, order[last], order[last + 1])) last++;
+                int start = Math.max(0, Math.min(text.length(), segments.startOffset(order[i])));
+                int end = Math.max(start, Math.min(text.length(), segments.endOffset(order[last])));
                 while (start < end && Character.isWhitespace(text.charAt(start))) start++;
                 while (end > start && Character.isWhitespace(text.charAt(end - 1))) end--;
                 if (end > start) {
-                    final long startMs = segments.startTimeMs(i);
-                    final long endMs = segments.startTimeMs(last) + KaraokeFrame.sweepWindowMs(text, segments, last, nextLineTimeMs);
+                    long startMs = Long.MAX_VALUE;
+                    long endMs = Long.MIN_VALUE;
+                    for (int k = i; k <= last; k++) {
+                        final int seg = order[k];
+                        startMs = Math.min(startMs, segments.startTimeMs(seg));
+                        endMs = Math.max(endMs, segments.startTimeMs(seg) + KaraokeFrame.sweepWindowMs(text, segments, seg, nextLineTimeMs));
+                    }
                     wordTextStart[wordCount] = start;
                     wordTextEnd[wordCount] = end;
                     wordStartMs[wordCount] = startMs;
@@ -5606,17 +5665,23 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                     wordLiftPx[wordCount] = 0;
                     wordEmphasis[wordCount] = false;
                     wordEmphasisLive[wordCount] = false;
+                    // How long the emphasis lasts: measured as in Build 5 (see emphasisWindowMs).
+                    final int lastSeg = order[last];
+                    final long emphasisEnd = segments.startTimeMs(lastSeg)
+                            + emphasisWindowMs(text, segments, order, last, n, nextLineTimeMs);
+                    wordEmphasisEndMs[wordCount] = Math.max(startMs, emphasisEnd);
                     // AMLL lyric-line.ts: a word split into syllables is emphasised when any one
                     // syllable qualifies by itself, as well as when the whole word does.
                     boolean syllable = false;
                     if (last > i) {
                         for (int k = i; k <= last && !syllable; k++) {
-                            int from = Math.max(0, Math.min(text.length(), segments.startOffset(k)));
-                            int to = Math.max(from, Math.min(text.length(), segments.endOffset(k)));
+                            final int seg = order[k];
+                            int from = Math.max(0, Math.min(text.length(), segments.startOffset(seg)));
+                            int to = Math.max(from, Math.min(text.length(), segments.endOffset(seg)));
                             while (from < to && Character.isWhitespace(text.charAt(from))) from++;
                             while (to > from && Character.isWhitespace(text.charAt(to - 1))) to--;
                             syllable = qualifiesForEmphasis(text, from, to,
-                                    KaraokeFrame.sweepWindowMs(text, segments, k, nextLineTimeMs));
+                                    emphasisWindowMs(text, segments, order, k, n, nextLineTimeMs));
                         }
                     }
                     wordSyllableEmphasis[wordCount] = syllable;
@@ -5624,6 +5689,57 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 }
                 i = last + 1;
             }
+        }
+
+        private int[] textOrder = new int[16];
+
+        /** Segment {@code next} continues the word of segment {@code previous} (text order): no whitespace between them. */
+        private static boolean continuesWord(String text, SyncedLyricsController.Segments segments, int previous, int next) {
+            final int from = Math.max(0, segments.startOffset(previous));
+            final int to = Math.min(text.length(), segments.startOffset(next));
+            if (to <= from) return false;
+            for (int k = from; k < to; k++) {
+                if (Character.isWhitespace(text.charAt(k))) return false;
+            }
+            return true;
+        }
+
+        /**
+         * How long a syllable counts as sung for the emphasis (which words qualify, how strong,
+         * how long): exactly what Build 5 used, so every word that glowed then glows the same way
+         * now. That is the time until the next word of its own part starts (the next line for the
+         * line's last word), at most SWEEP_DERIVED_MAX_MS, and never shorter than a stated end.
+         * Build 5 read Enhanced LRC, which states no ends: its words owned the whole interval up
+         * to the next word. Apple Music's TTML ends a word where the voice stops, often well
+         * before the next word, and measuring the glow by that alone left most words short of
+         * a second (Build 6). The fill still follows the stated end exactly.
+         *
+         * <p>The line's last word before a pause of more than SWEEP_DERIVED_MAX_MS keeps its
+         * stated end: a short word before a break is not a held note.
+         */
+        private static long emphasisWindowMs(String text, SyncedLyricsController.Segments segments, int[] order, int position, int n, long nextLineTimeMs) {
+            final int seg = order[position];
+            final long start = segments.startTimeMs(seg);
+            final long stated = segments.hasEndTime(seg) ? segments.endTimeMs(seg) - start : -1;
+            final int lineBreak = text.indexOf('\n');
+            final boolean background = lineBreak >= 0 && segments.startOffset(seg) > lineBreak;
+            long next = Long.MAX_VALUE;
+            boolean lastOfPart = true;
+            for (int k = position + 1; k < n; k++) {
+                final boolean otherBackground = lineBreak >= 0 && segments.startOffset(order[k]) > lineBreak;
+                if (otherBackground != background) continue;
+                next = segments.startTimeMs(order[k]);
+                lastOfPart = false;
+                break;
+            }
+            if (lastOfPart) next = nextLineTimeMs;
+            final long own = next != Long.MAX_VALUE ? next - start : -1;
+            if (lastOfPart && (own <= 0 || own > KaraokeFrame.SWEEP_DERIVED_MAX_MS)) {
+                if (stated > 0) return stated;
+                return own > 0 ? KaraokeFrame.SWEEP_DERIVED_MAX_MS : KaraokeFrame.SWEEP_DERIVED_FALLBACK_MS;
+            }
+            final long owned = own > 0 ? Math.min(own, KaraokeFrame.SWEEP_DERIVED_MAX_MS) : KaraokeFrame.SWEEP_DERIVED_FALLBACK_MS;
+            return Math.max(owned, stated);
         }
 
         private void ensureWordCapacity(int size) {
@@ -5641,6 +5757,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             wordAmount = java.util.Arrays.copyOf(wordAmount, grown);
             wordGlow = java.util.Arrays.copyOf(wordGlow, grown);
             wordEmphasisMs = java.util.Arrays.copyOf(wordEmphasisMs, grown);
+            wordEmphasisEndMs = java.util.Arrays.copyOf(wordEmphasisEndMs, grown);
         }
 
         /**
@@ -5672,8 +5789,14 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 if (clusterWord[c] >= 0) wordGraphemes[w]++;
             }
             for (int i = 0; i < wordCount; i++) {
-                final long duration = wordEndMs[i] - wordStartMs[i];
+                final long duration = wordEmphasisEndMs[i] - wordStartMs[i];
                 final int graphemes = wordGraphemes[i];
+                final boolean cjk = isCjk(karaokeTextStr, wordTextStart[i], wordTextEnd[i]);
+                // Build 5's rule, kept so no word that glowed then loses it: long enough, 1 to 7
+                // graphemes (CJK: any length), not background vocals.
+                final boolean build5 = duration >= LyricsTuning.EMPHASIS_MIN_DURATION_MS && (cjk
+                        ? graphemes >= 1
+                        : graphemes >= LyricsTuning.EMPHASIS_MIN_GRAPHEMES && graphemes <= LyricsTuning.EMPHASIS_MAX_GRAPHEMES);
                 // AMLL shouldEmphasize (which it attributes to Apple): the whole word or one of
                 // its syllables qualifies (for CJK, only a syllable on its own). YouLy+
                 // isGroupGrowable: background vocals never do.
@@ -5682,7 +5805,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 final boolean single = wordSyllableEmphasis[i] || wordTextStart[i] < wordTextEnd[i]
                         && isCjk(karaokeTextStr, wordTextStart[i], wordTextEnd[i])
                         && qualifiesForEmphasis(karaokeTextStr, wordTextStart[i], wordTextEnd[i], duration);
-                wordEmphasis[i] = wordTextStart[i] < backgroundStart && (whole || single);
+                wordEmphasis[i] = wordTextStart[i] < backgroundStart && (build5 || whole || single);
                 if (!wordEmphasis[i]) continue;
                 // YouLy+ calculateEmphasisMetrics / applyGrowthStyles: every qualifying word gets
                 // a clearly visible base swell and glow, and longer ones add more on a cubic.

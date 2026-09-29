@@ -1837,7 +1837,7 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
         title = AUDIO_EXTENSION.matcher(title).replaceFirst("").trim();
         if (title.isEmpty()) return;
         onlineFetching.add(key);
-        LyricsOnlineSearch.search(artist, title, message.getDuration(), (lyrics, error) -> {
+        LyricsOnlineSearch.search(artist, title, message.getDuration(), (lyrics, error, detail) -> {
             onlineFetching.remove(key);
             final boolean stillMissing;
             synchronized (cache) {

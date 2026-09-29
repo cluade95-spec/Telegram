@@ -227,6 +227,11 @@ public final class LyricsTuning {
     public static final long EMPHASIS_MIN_DURATION_MS = 1000;
     public static final int EMPHASIS_MIN_LENGTH = 2;
     public static final int EMPHASIS_MAX_LENGTH = 7;
+    /** Build 5's length rule, kept alongside so no word that glowed in Build 5 stops glowing:
+     *  MIN..MAX graphemes (whitespace excluded, punctuation included). A word qualifies by
+     *  either rule. The duration is measured as in Build 5 (AudioPlayerAlert emphasisWindowMs). */
+    public static final int EMPHASIS_MIN_GRAPHEMES = 1;
+    public static final int EMPHASIS_MAX_GRAPHEMES = 7;
     /** Strength. A qualifying word always swells by at least BASE (SHORT_BASE for words of
      *  SHORT_GRAPHEMES or fewer) and glows at GLOW_BASE; longer words add up to RAMP swell and
      *  GLOW_RAMP glow along p^RAMP_POWER, p = (duration - MIN) / (FULL - MIN). (AMLL starts its

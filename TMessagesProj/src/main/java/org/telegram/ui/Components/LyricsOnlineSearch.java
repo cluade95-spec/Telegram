@@ -63,13 +63,19 @@ public final class LyricsOnlineSearch {
     }
 
     public interface Callback {
-        /** Exactly one of {@code lyrics} (the app's lyrics text) and {@code error} is non-null. */
-        void onResult(String lyrics, Error error);
+        /**
+         * Exactly one of {@code lyrics} (the app's lyrics text) and {@code error} is non-null.
+         * {@code detail} says what actually failed on the last try (for example "iTunes HTTP
+         * 403"), or null.
+         */
+        void onResult(String lyrics, Error error, String detail);
     }
 
     private static final String ITUNES_SEARCH = "https://itunes.apple.com/search";
     private static final String PAXSENIX_LYRICS = "https://lyrics.paxsenix.org/apple-music/lyrics";
-    private static final String USER_AGENT = "Telegram-Android-Lyrics";
+    /** A plain browser user agent: services behind bot protection often refuse unknown ones. */
+    private static final String USER_AGENT = "Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Mobile Safari/537.36";
+    private static final String LOG_TAG = "LyricsOnline";
     private static final int MAX_BODY_BYTES = 4 * 1024 * 1024;
     private static final int MAX_QUERY_LENGTH = 200;
 
@@ -104,6 +110,12 @@ public final class LyricsOnlineSearch {
         Error error;
         boolean temporary;
         long retryAfterMs;
+        String detail;
+
+        Outcome detail(String value) {
+            detail = value;
+            return this;
+        }
 
         static Outcome lyrics(String text) {
             final Outcome o = new Outcome();
@@ -142,44 +154,78 @@ public final class LyricsOnlineSearch {
 
     private static void attempt(Request request, String artist, String title, double durationSeconds, Callback callback, int tries) {
         if (request.cancelled) return;
+        log("try " + (tries + 1) + "/" + (LyricsTuning.ONLINE_RETRY_DELAYS_MS.length + 1) + ": \"" + artist + "\" / \"" + title + "\", " + Math.round(durationSeconds) + " s");
         Outcome outcome;
         try {
             outcome = lookUp(request, artist, title, durationSeconds);
         } catch (Throwable e) {
-            FileLog.e(e);
-            outcome = Outcome.error(Error.SERVER);
+            logError("unexpected failure", e);
+            // Not a statement that the lyrics do not exist: tried again like any passing failure.
+            outcome = Outcome.temporary(Error.SERVER, 0).detail(e.getClass().getSimpleName() + ": " + e.getMessage());
         }
         if (request.cancelled) return;
-        if (outcome.temporary && tries < LyricsTuning.ONLINE_RETRY_DELAYS_MS.length) {
+        if (outcome.lyrics != null) {
+            log("lyrics found (" + outcome.lyrics.length() + " characters)");
+        } else {
+            log("try " + (tries + 1) + " failed: " + outcome.error + (outcome.temporary ? " (passing)" : " (final)") + ", " + outcome.detail);
+        }
+        // Only a real "not found" ends the search at once. Everything else is tried again,
+        // with waits, until the retries run out; the user is told only then.
+        if (outcome.lyrics == null && outcome.temporary && tries < LyricsTuning.ONLINE_RETRY_DELAYS_MS.length) {
             final long delay = Math.max(LyricsTuning.ONLINE_RETRY_DELAYS_MS[tries],
                     Math.min(outcome.retryAfterMs, LyricsTuning.ONLINE_RETRY_AFTER_MAX_MS));
+            log("waiting " + delay + " ms before try " + (tries + 2));
             Utilities.externalNetworkQueue.postRunnable(() -> attempt(request, artist, title, durationSeconds, callback, tries + 1), delay);
             return;
         }
         final String lyrics = outcome.lyrics;
         final Error error = lyrics != null ? null : outcome.error != null ? outcome.error : Error.SERVER;
+        final String detail = outcome.detail;
+        if (lyrics == null) log("giving up after " + (tries + 1) + " tries: " + error + ", " + detail);
         AndroidUtilities.runOnUIThread(() -> {
-            if (!request.cancelled) callback.onResult(lyrics, error);
+            if (!request.cancelled) callback.onResult(lyrics, error, detail);
         });
     }
 
+    /** Always in logcat (tag LyricsOnline), and in Telegram's own log file when logs are enabled. */
+    private static void log(String message) {
+        android.util.Log.i(LOG_TAG, message);
+        if (org.telegram.messenger.BuildVars.LOGS_ENABLED) FileLog.d(LOG_TAG + ": " + message);
+    }
+
+    private static void logError(String message, Throwable e) {
+        android.util.Log.w(LOG_TAG, message, e);
+        if (org.telegram.messenger.BuildVars.LOGS_ENABLED) FileLog.e(LOG_TAG + ": " + message + ": " + e);
+    }
+
+    private static String snippet(String body) {
+        if (body == null) return "no body";
+        final String flat = body.replaceAll("\\s+", " ").trim();
+        return flat.length() > 200 ? flat.substring(0, 200) + "..." : flat;
+    }
+
     private static Outcome lookUp(Request request, String artist, String title, double durationSeconds) {
-        if (title.isEmpty()) return Outcome.error(Error.NOT_FOUND);
+        if (title.isEmpty()) return Outcome.error(Error.NOT_FOUND).detail("no title to search for");
         final String term = (artist.isEmpty() ? "" : artist + " ") + stripDecorations(title);
         final String url = ITUNES_SEARCH + "?term=" + Uri.encode(term) + "&entity=song&limit=" + LyricsTuning.ONLINE_SEARCH_RESULTS;
         final Response search = get(request, url);
-        if (search.temporary) return Outcome.temporary(Error.NETWORK, search.retryAfterMs);
+        if (search.failure != null) return Outcome.temporary(Error.NETWORK, 0).detail("iTunes: " + search.failure);
         if (search.status != 200 || search.body == null) {
-            return search.status == 429 || search.status >= 500
-                    ? Outcome.temporary(Error.RATE_LIMITED, search.retryAfterMs) : Outcome.error(Error.SERVER);
+            return Outcome.temporary(search.status == 429 ? Error.RATE_LIMITED : Error.SERVER, search.retryAfterMs)
+                    .detail("iTunes HTTP " + search.status + ": " + snippet(search.body));
         }
         final ArrayList<Candidate> candidates;
+        final int results;
         try {
-            candidates = rank(readCandidates(search.body), artist, title, durationSeconds);
+            final ArrayList<Candidate> all = readCandidates(search.body);
+            results = all.size();
+            candidates = rank(all, artist, title, durationSeconds);
         } catch (Exception e) {
-            return Outcome.error(Error.MALFORMED);
+            logError("iTunes answer could not be read", e);
+            return Outcome.temporary(Error.MALFORMED, 0).detail("iTunes answer unreadable: " + snippet(search.body));
         }
-        if (candidates.isEmpty()) return Outcome.error(Error.NOT_FOUND);
+        log("iTunes: " + results + " results, " + candidates.size() + " match the track");
+        if (candidates.isEmpty()) return Outcome.error(Error.NOT_FOUND).detail("no iTunes result matches the title and artist");
         // Close runners-up are the same song on another release (a single and its album), and
         // Apple Music may have lyrics on one of them only.
         final double best = candidates.get(0).score;
@@ -187,27 +233,32 @@ public final class LyricsOnlineSearch {
         for (Candidate candidate : candidates) {
             if (asked >= LyricsTuning.ONLINE_CANDIDATES || candidate.score < best - LyricsTuning.ONLINE_CANDIDATE_SCORE_SPREAD) break;
             asked++;
+            log("asking Paxsenix for trackId " + candidate.trackId + " (\"" + candidate.title + "\" by " + candidate.artist
+                    + ", " + candidate.durationMs + " ms, score " + String.format(Locale.US, "%.2f", candidate.score) + ")");
             final Outcome outcome = fetchLyrics(request, candidate.trackId);
-            if (outcome.lyrics != null || outcome.temporary || outcome.error != Error.NOT_FOUND) return outcome;
-            if (request.cancelled) return Outcome.error(Error.SERVER);
+            if (outcome.lyrics != null || outcome.error != Error.NOT_FOUND) return outcome;
+            if (request.cancelled) return Outcome.error(Error.SERVER).detail("cancelled");
         }
-        return Outcome.error(Error.NOT_FOUND);
+        return Outcome.error(Error.NOT_FOUND).detail("Apple Music has no lyrics for this track");
     }
 
     private static Outcome fetchLyrics(Request request, long trackId) {
         final Response response = get(request, PAXSENIX_LYRICS + "?id=" + trackId + "&ttml=true");
-        if (response.temporary) return Outcome.temporary(Error.NETWORK, response.retryAfterMs);
+        if (response.failure != null) return Outcome.temporary(Error.NETWORK, 0).detail("Paxsenix: " + response.failure);
         final String body = response.body == null ? "" : response.body.trim();
+        final String where = "Paxsenix HTTP " + response.status;
         String ttml = null;
         if (body.startsWith("{")) {
             try {
                 final JSONObject json = new JSONObject(new JSONTokener(body));
                 if (json.optBoolean("error", false)) {
-                    final String message = json.optString("message", json.optString("error_message", "")).toLowerCase(Locale.ROOT);
-                    if (message.contains("not found")) return Outcome.error(Error.NOT_FOUND);
-                    // "Apple Music temporarily unavailable", and anything else the service
-                    // reports as an error without saying the lyrics do not exist.
-                    return Outcome.temporary(Error.RATE_LIMITED, response.retryAfterMs);
+                    final String message = json.optString("message", json.optString("error_message", ""));
+                    // "Track not found": Apple Music has no lyrics for this track. Anything else
+                    // ("Apple Music temporarily unavailable", ...) is passing and tried again.
+                    if (message.toLowerCase(Locale.ROOT).contains("not found")) {
+                        return Outcome.error(Error.NOT_FOUND).detail(where + ": " + message);
+                    }
+                    return Outcome.temporary(Error.RATE_LIMITED, response.retryAfterMs).detail(where + ": " + message);
                 }
                 for (String key : new String[]{"content", "ttml", "lyrics", "data"}) {
                     final Object value = json.opt(key);
@@ -217,18 +268,21 @@ public final class LyricsOnlineSearch {
                     }
                 }
             } catch (Exception e) {
-                return Outcome.error(Error.MALFORMED);
+                logError("Paxsenix answer could not be read", e);
+                return Outcome.temporary(Error.MALFORMED, 0).detail(where + ", unreadable JSON: " + snippet(body));
             }
-        } else if (body.startsWith("<") || body.startsWith("﻿<")) {
+        } else if (response.status == 200 && (body.startsWith("<") || body.startsWith("\uFEFF<"))) {
             ttml = body;
         }
         if (ttml == null) {
-            if (response.status == 404) return Outcome.error(Error.NOT_FOUND);
-            if (response.status == 429 || response.status >= 500) return Outcome.temporary(Error.RATE_LIMITED, response.retryAfterMs);
-            return Outcome.error(response.status == 200 ? Error.MALFORMED : Error.SERVER);
+            if (response.status == 404) return Outcome.error(Error.NOT_FOUND).detail(where + ": " + snippet(body));
+            return Outcome.temporary(response.status == 429 ? Error.RATE_LIMITED : response.status == 200 ? Error.MALFORMED : Error.SERVER,
+                    response.retryAfterMs).detail(where + ": " + snippet(body));
         }
         final String text = SyncedLyricsController.ttmlToText(ttml);
-        if (text == null) return Outcome.error(Error.MALFORMED);
+        if (text == null) {
+            return Outcome.temporary(Error.MALFORMED, 0).detail(where + ", TTML could not be converted: " + snippet(ttml));
+        }
         return Outcome.lyrics(SyncedLyricsController.stripSingerLabels(text));
     }
 
@@ -237,33 +291,39 @@ public final class LyricsOnlineSearch {
     private static final class Response {
         int status;
         String body;
-        boolean temporary;
         long retryAfterMs;
+        /** Set when no HTTP answer arrived at all (DNS, connect, TLS, timeout, ...). */
+        String failure;
     }
 
     private static Response get(Request request, String url) {
         final Response response = new Response();
         HttpURLConnection connection = null;
+        final long started = android.os.SystemClock.elapsedRealtime();
+        log("GET " + url);
         try {
             connection = (HttpURLConnection) new URL(url).openConnection();
             request.connection = connection;
             if (request.cancelled) {
-                response.status = -1;
+                response.failure = "cancelled";
                 return response;
             }
             connection.setInstanceFollowRedirects(true);
             connection.setConnectTimeout(LyricsTuning.ONLINE_CONNECT_TIMEOUT_MS);
             connection.setReadTimeout(LyricsTuning.ONLINE_READ_TIMEOUT_MS);
             connection.setRequestProperty("User-Agent", USER_AGENT);
-            connection.setRequestProperty("Accept", "application/json");
+            connection.setRequestProperty("Accept", "application/json, text/javascript, */*");
             response.status = connection.getResponseCode();
             response.retryAfterMs = parseRetryAfterMs(connection.getHeaderField("Retry-After"));
             final InputStream stream = response.status >= 400 ? connection.getErrorStream() : connection.getInputStream();
             response.body = stream == null ? null : readBounded(stream);
-            if (response.status == 429 || response.status >= 500) response.temporary = response.body == null || !response.body.trim().startsWith("{");
-        } catch (IOException e) {
-            // DNS, connect, TLS, a timeout or a dropped stream: all passing.
-            response.temporary = true;
+            log("HTTP " + response.status + " in " + (android.os.SystemClock.elapsedRealtime() - started) + " ms, "
+                    + connection.getContentType() + ": " + snippet(response.body));
+        } catch (Throwable e) {
+            // DNS, connect, TLS, a timeout, a dropped stream, or anything else on the way:
+            // all passing, and reported with what actually happened.
+            response.failure = e.getClass().getSimpleName() + (e.getMessage() != null ? ": " + e.getMessage() : "");
+            logError("GET failed after " + (android.os.SystemClock.elapsedRealtime() - started) + " ms: " + url, e);
         } finally {
             request.connection = null;
             if (connection != null) {
@@ -383,7 +443,7 @@ public final class LyricsOnlineSearch {
     };
 
     private static final Pattern ARTIST_SEPARATOR = Pattern.compile("\\s*(?:,|&|\\band\\b|\\bx\\b|\\bfeat\\b|\\bft\\b|\\bwith\\b|/)\\s*");
-    private static final Pattern DECORATION = Pattern.compile("\\s*(?:\\([^)]*\\)|\\[[^]]*]|\\s-\\s.*$)");
+    private static final Pattern DECORATION = Pattern.compile("\\s*(?:\\([^)]*\\)|\\[[^\\]]*\\]|\\s-\\s.*$)");
     private static final Pattern FEATURING = Pattern.compile("(?i)\\s*\\b(?:feat|ft)\\b\\.?.*$");
 
     /** The title without bracketed parts, " - Remastered..." tails and "feat." credits. */
