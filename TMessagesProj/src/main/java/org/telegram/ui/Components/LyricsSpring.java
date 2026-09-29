@@ -42,6 +42,17 @@ public final class LyricsSpring {
         pending = false;
     }
 
+    /**
+     * Moves the whole motion by {@code delta}: value, target and any pending target alike, with
+     * the velocity unchanged. Used when the list is scrolled underneath the springs (the user's
+     * finger), so a row's lead or lag against the list carries on settling instead of jumping.
+     */
+    public void shift(float delta) {
+        from += delta;
+        target += delta;
+        pendingTarget += delta;
+    }
+
     public void setParams(float mass, float stiffness, float damping) {
         this.mass = mass;
         this.stiffness = stiffness;

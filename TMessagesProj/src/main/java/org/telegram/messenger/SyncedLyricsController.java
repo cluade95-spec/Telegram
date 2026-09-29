@@ -423,6 +423,120 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
      * lines that share a timestamp, and every timing-integrity rule in {@link #qualify} apply
      * identically whichever format the source was written in.
      */
+    // region background vocals
+    /**
+     * The same line laid out for display with its background vocals - the text inside
+     * parentheses - moved onto a second line: "main\nbackground". Returns {@code line} itself
+     * when there is nothing to move (no parentheses, or nothing left outside them).
+     *
+     * <p>Inline timing moves with the text: every segment keeps its own time and covers the same
+     * characters at their new offsets, so a consumer that reads the display line sees exactly what
+     * the source stated. Segments stay in time order, which may now differ from text order.
+     * Parentheses are dropped, the space they leave in the main line is collapsed, and several
+     * parenthesised parts are joined with one space.
+     */
+    public static Line splitBackgroundVocals(Line line) {
+        if (line == null || TextUtils.isEmpty(line.text)) return line;
+        final String text = line.text;
+        if (text.indexOf('(') < 0 && text.indexOf('\uFF08') < 0) return line;
+        final int length = text.length();
+        // Which characters are background (inside the outermost parentheses), and which are the
+        // parentheses themselves.
+        final boolean[] inside = new boolean[length];
+        final boolean[] paren = new boolean[length];
+        int depth = 0;
+        for (int i = 0; i < length; i++) {
+            final char c = text.charAt(i);
+            if (c == '(' || c == '\uFF08') {
+                paren[i] = true;
+                depth++;
+            } else if ((c == ')' || c == '\uFF09') && depth > 0) {
+                paren[i] = true;
+                depth--;
+            } else {
+                inside[i] = depth > 0;
+            }
+        }
+        if (depth != 0) return line; // unbalanced: leave the line as the source wrote it
+        final int[] map = new int[length];
+        final StringBuilder main = new StringBuilder(length);
+        for (int i = 0; i < length; i++) {
+            map[i] = -1;
+            if (paren[i] || inside[i]) continue;
+            final char c = text.charAt(i);
+            if (Character.isWhitespace(c) && (main.length() == 0 || Character.isWhitespace(main.charAt(main.length() - 1)))) continue;
+            map[i] = main.length();
+            main.append(c);
+        }
+        while (main.length() > 0 && Character.isWhitespace(main.charAt(main.length() - 1))) main.setLength(main.length() - 1);
+        final StringBuilder background = new StringBuilder();
+        final int[] bgMap = new int[length];
+        boolean inGroup = false;
+        for (int i = 0; i < length; i++) {
+            bgMap[i] = -1;
+            if (!inside[i]) {
+                inGroup = false;
+                continue;
+            }
+            if (!inGroup && background.length() > 0 && !Character.isWhitespace(background.charAt(background.length() - 1))) {
+                background.append(' '); // between two parenthesised parts
+            }
+            inGroup = true;
+            final char c = text.charAt(i);
+            if (Character.isWhitespace(c) && (background.length() == 0 || Character.isWhitespace(background.charAt(background.length() - 1)))) continue;
+            bgMap[i] = background.length();
+            background.append(c);
+        }
+        while (background.length() > 0 && Character.isWhitespace(background.charAt(background.length() - 1))) background.setLength(background.length() - 1);
+        if (main.length() == 0 || background.length() == 0) return line;
+        final int bgOffset = main.length() + 1;
+        for (int i = 0; i < length; i++) {
+            if (map[i] >= main.length()) map[i] = -1; // trimmed away
+            if (bgMap[i] >= 0) map[i] = bgMap[i] < background.length() ? bgOffset + bgMap[i] : -1;
+        }
+        final String display = main + "\n" + background;
+        Segments segments = null;
+        if (line.segments != null) {
+            final Segments source = line.segments;
+            final int n = source.size();
+            final int[] starts = new int[n];
+            final int[] ends = new int[n];
+            final long[] times = new long[n];
+            final long[] endTimes = source.endTimes != null ? new long[n] : null;
+            int count = 0;
+            for (int k = 0; k < n; k++) {
+                final int from = Math.max(0, Math.min(length, source.startOffset(k)));
+                final int to = Math.max(from, Math.min(length, source.endOffset(k)));
+                // The segment moves to where its first kept character went, and covers its kept
+                // characters on that same side of the break.
+                int first = -1;
+                for (int i = from; i < to; i++) {
+                    if (map[i] >= 0) {
+                        first = i;
+                        break;
+                    }
+                }
+                if (first < 0) continue; // only parentheses or spaces: nothing left to fill
+                final boolean firstBackground = map[first] >= bgOffset;
+                int last = first;
+                for (int i = first; i < to; i++) {
+                    if (map[i] >= 0 && (map[i] >= bgOffset) == firstBackground) last = i;
+                }
+                starts[count] = map[first];
+                ends[count] = map[last] + 1;
+                times[count] = source.startTimeMs(k);
+                if (endTimes != null) endTimes[count] = source.endTimes[k];
+                count++;
+            }
+            if (count > 0) {
+                segments = new Segments(java.util.Arrays.copyOf(starts, count), java.util.Arrays.copyOf(ends, count),
+                        java.util.Arrays.copyOf(times, count), endTimes != null ? java.util.Arrays.copyOf(endTimes, count) : null);
+            }
+        }
+        return new Line(line.timeMs, display, line.timed, segments);
+    }
+    // endregion
+
     // region ttml
 
     /**

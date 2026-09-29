@@ -77,9 +77,14 @@ public final class LyricsTuning {
     public static final float ALPHA_SUNG = 1.0f;
     /** Active word-timed line: text still to come. */
     public static final float ALPHA_UNSUNG = 0.4f;
-    /** How long a line takes to brighten when it becomes active, and to dim when it stops. */
-    public static final long FOCUS_IN_MS = 300;
-    public static final long FOCUS_OUT_MS = 450;
+    /** Brightening when a line becomes active, and dimming when it stops, ride critically
+     *  damped springs (mass 1) so an interrupted fade keeps its speed instead of restarting.
+     *  These settle (98%) in about AMLL's 300 ms in and 450 ms out: omega = 5.83 / duration,
+     *  stiffness = omega^2, damping = 2 * omega. */
+    public static final float FOCUS_IN_STIFFNESS = 377f;
+    public static final float FOCUS_IN_DAMPING = 38.9f;
+    public static final float FOCUS_OUT_STIFFNESS = 168f;
+    public static final float FOCUS_OUT_DAMPING = 26f;
 
     // --- Manual scroll and seek (AMLL base/scroll.ts, base/seek-detector.ts) --------------
     /** After the user's own scroll stops, following resumes this much later. */
@@ -95,6 +100,19 @@ public final class LyricsTuning {
     // --- Frame clock ----------------------------------------------------------------------
     /** Longest stretch the position is extrapolated past the player's last reported value. */
     public static final long CLOCK_MAX_EXTRAPOLATION_MS = 200;
+    /** The drawn clock follows the player's position through a critically damped filter with
+     *  this time constant (1 / omega). It removes the player's 10 ms position steps, makes a
+     *  pause decelerate into its stop and a resume accelerate out of it, and still lands exactly
+     *  on the player's position at rest. Larger is softer; the lag while playing is zero. */
+    public static final float CLOCK_SMOOTHING_MS = 40f;
+    /** A frame gap longer than this (the loop was idle while paused) is treated as this long. */
+    public static final long CLOCK_MAX_FRAME_MS = 100;
+
+    // --- Seek crossfade ---------------------------------------------------------------------
+    /** After a jump of the clock (a seek, including while paused), word lift and emphasis blend
+     *  from where they were to where the new position puts them over about this long, instead
+     *  of popping. At rest they are exactly the pure function of the position again. */
+    public static final long SEEK_BLEND_MS = 350;
 
     // --- Blur by line distance (AMLL LyricPlayerBase.resolveBlurLevel, lyric-player CSS) -----
     /** level = min(BLUR_LEVEL_MAX, (1 + distance) * BLUR_LEVEL_STEP); a line already passed
@@ -105,8 +123,13 @@ public final class LyricsTuning {
      *  one into the other with sigma = radius * SCALE + BIAS. */
     public static final float BLUR_SIGMA_SCALE = 0.57735f;
     public static final float BLUR_SIGMA_BIAS = 0.5f;
-    /** CSS "filter 0.4s ease". */
-    public static final long BLUR_TRANSITION_MS = 400;
+    /** Blur changes ride a critically damped spring (mass 1) that settles in about AMLL's
+     *  0.4 s CSS transition, so an interrupted change keeps its speed. */
+    public static final float BLUR_STIFFNESS = 212f;
+    public static final float BLUR_DAMPING = 29.2f;
+    /** Blur radius step, in px, for the shared RenderEffect cache. Small enough to read as
+     *  continuous while a blur eases. */
+    public static final float BLUR_RADIUS_STEP_PX = 0.1f;
 
     // --- Word fill edge (AMLL mask: generateFadeGradient, WebMaskAnimator) -------------------
     /** Width of the soft edge, as a fraction of the text's line height (ascent to descent). It
@@ -118,12 +141,60 @@ public final class LyricsTuning {
     public static final float FILL_LAST_WORD_PAD = 0.5f;
 
     // --- Per-word lift (AMLL dom/animation/float) ---------------------------------------------
-    /** Rise of a word once it starts, in em, times LIFT_MULTIPLIER. Rounded to whole pixels. */
+    /** Rise of a word once it starts, in em, times LIFT_MULTIPLIER. The full rise is rounded to
+     *  whole pixels so a word at rest is pixel-sharp; in between it moves sub-pixel. */
     public static final float LIFT_EM = 0.05f;
     public static final float LIFT_MULTIPLIER = 1.0f;
-    /** The rise takes max(this, the word's duration), ease-out; it reverses when the line stops
-     *  being active. */
+    /** The rise takes max(this, the word's duration), ease-out. */
     public static final long LIFT_MIN_DURATION_MS = 1000;
+    /** When the line stops being active, words sink back over max(this, the time they spent
+     *  rising), starting at the speed they were rising with, so the turn has no kink. */
+    public static final long LIFT_FALL_MIN_MS = 500;
+
+    // --- Background vocals (AMLL .lyricBgLine) ------------------------------------------------
+    /** Text in parentheses is shown as a second, smaller line under the main one: this size
+     *  relative to the main text (set once when the row is bound, never per frame)... */
+    public static final float BACKGROUND_VOCALS_SCALE = 0.7f;
+    /** ...and this opacity on top of the line's own brightness stage. */
+    public static final float BACKGROUND_VOCALS_ALPHA = 0.4f;
+
+    // --- Instrumental gap dots (AMLL base/interlude-dots.ts, base/timeline.ts) ----------------
+    /** A gap between the end of one line's singing and the next line of at least this long gets
+     *  the three dots. The end of singing is a timed blank line, or the last word's stated end. */
+    public static final long INTERLUDE_MIN_GAP_MS = 7000;
+    /** Height of the row that holds the dots; it is also the space the dots leave behind. */
+    public static final int INTERLUDE_ROW_HEIGHT_DP = 44;
+    /** Dot diameter and the gap between dots, in em of the lyric text. */
+    public static final float INTERLUDE_DOT_EM = 0.3f;
+    public static final float INTERLUDE_DOT_GAP_EM = 0.18f;
+    /** After the singing stops the dots wait this long (not before the first line), fade in over
+     *  ENTER_FADE_MS, and each dot fades in over DOT_ENTER_FADE_MS, DOT_STAGGER_MS apart. */
+    public static final long INTERLUDE_ENTER_HOLD_MS = 500;
+    public static final long INTERLUDE_ENTER_FADE_MS = 180;
+    public static final long INTERLUDE_DOT_ENTER_FADE_MS = 750;
+    public static final long INTERLUDE_DOT_STAGGER_MS = 80;
+    /** The group breathes between 1 and BREATHE_MAX_SCALE, in whole cycles of about this long. */
+    public static final long INTERLUDE_BREATHE_PERIOD_MS = 4000;
+    public static final float INTERLUDE_BREATHE_MAX_SCALE = 1.25f;
+    /** A gap whose body is shorter than this just holds the dots lit instead of breathing. */
+    public static final long INTERLUDE_FALLBACK_HOLD_MS = 3000;
+    /** Exit, ending exactly when the next line starts: swell to BREATHE_MAX_SCALE over PHASE1,
+     *  shrink to EXIT_MIN_SCALE over PHASE2, fading over the last EXIT_FADE_MS. */
+    public static final long INTERLUDE_EXIT_PHASE1_MS = 750;
+    public static final long INTERLUDE_EXIT_PHASE2_MS = 250;
+    public static final long INTERLUDE_EXIT_FADE_MS = 250;
+    public static final float INTERLUDE_EXIT_MIN_SCALE = 0.4f;
+    /** The third dot finishes lighting over this long, during the exit. */
+    public static final long INTERLUDE_DOT3_TRAILING_MS = 750;
+    /** Dot opacity unlit and lit. */
+    public static final float INTERLUDE_DOT_UNLIT = 0.2f;
+    public static final float INTERLUDE_DOT_LIT = 0.9f;
+    /** Easing curves, cubic-bezier control points. */
+    public static final float[] INTERLUDE_LIGHTING_EASE = {0.56f, 0.01f, 0.45f, 1f};
+    public static final float[] INTERLUDE_ENTER_EASE = {0.59f, 0.02f, 0.07f, 1f};
+    public static final float[] INTERLUDE_EXIT_PHASE1_EASE = {0.14f, 0.06f, 0.25f, 1f};
+    public static final float[] INTERLUDE_EXIT_PHASE2_EASE = {0.29f, 0.03f, 1f, 0.38f};
+    public static final float[] INTERLUDE_EXIT_FADE_EASE = {0.43f, 0.08f, 0.83f, 0.31f};
 
     // --- Long-word emphasis (AMLL dom/animation/emphasize, LyricLineBase.shouldEmphasize) ----
     public static final long EMPHASIS_MIN_DURATION_MS = 1000;
