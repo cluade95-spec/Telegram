@@ -11,7 +11,6 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 import org.json.JSONTokener;
 import org.telegram.messenger.AndroidUtilities;
-import org.telegram.messenger.FileLog;
 import org.telegram.messenger.SyncedLyricsController;
 import org.telegram.messenger.Utilities;
 
@@ -75,7 +74,6 @@ public final class LyricsOnlineSearch {
     private static final String PAXSENIX_LYRICS = "https://lyrics.paxsenix.org/apple-music/lyrics";
     /** A plain browser user agent: services behind bot protection often refuse unknown ones. */
     private static final String USER_AGENT = "Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Mobile Safari/537.36";
-    private static final String LOG_TAG = "LyricsOnline";
     private static final int MAX_BODY_BYTES = 4 * 1024 * 1024;
     private static final int MAX_QUERY_LENGTH = 200;
 
@@ -154,48 +152,28 @@ public final class LyricsOnlineSearch {
 
     private static void attempt(Request request, String artist, String title, double durationSeconds, Callback callback, int tries) {
         if (request.cancelled) return;
-        log("try " + (tries + 1) + "/" + (LyricsTuning.ONLINE_RETRY_DELAYS_MS.length + 1) + ": \"" + artist + "\" / \"" + title + "\", " + Math.round(durationSeconds) + " s");
         Outcome outcome;
         try {
             outcome = lookUp(request, artist, title, durationSeconds);
         } catch (Throwable e) {
-            logError("unexpected failure", e);
             // Not a statement that the lyrics do not exist: tried again like any passing failure.
             outcome = Outcome.temporary(Error.SERVER, 0).detail(e.getClass().getSimpleName() + ": " + e.getMessage());
         }
         if (request.cancelled) return;
-        if (outcome.lyrics != null) {
-            log("lyrics found (" + outcome.lyrics.length() + " characters)");
-        } else {
-            log("try " + (tries + 1) + " failed: " + outcome.error + (outcome.temporary ? " (passing)" : " (final)") + ", " + outcome.detail);
-        }
         // Only a real "not found" ends the search at once. Everything else is tried again,
         // with waits, until the retries run out; the user is told only then.
         if (outcome.lyrics == null && outcome.temporary && tries < LyricsTuning.ONLINE_RETRY_DELAYS_MS.length) {
             final long delay = Math.max(LyricsTuning.ONLINE_RETRY_DELAYS_MS[tries],
                     Math.min(outcome.retryAfterMs, LyricsTuning.ONLINE_RETRY_AFTER_MAX_MS));
-            log("waiting " + delay + " ms before try " + (tries + 2));
             Utilities.externalNetworkQueue.postRunnable(() -> attempt(request, artist, title, durationSeconds, callback, tries + 1), delay);
             return;
         }
         final String lyrics = outcome.lyrics;
         final Error error = lyrics != null ? null : outcome.error != null ? outcome.error : Error.SERVER;
         final String detail = outcome.detail;
-        if (lyrics == null) log("giving up after " + (tries + 1) + " tries: " + error + ", " + detail);
         AndroidUtilities.runOnUIThread(() -> {
             if (!request.cancelled) callback.onResult(lyrics, error, detail);
         });
-    }
-
-    /** Always in logcat (tag LyricsOnline), and in Telegram's own log file when logs are enabled. */
-    private static void log(String message) {
-        android.util.Log.i(LOG_TAG, message);
-        if (org.telegram.messenger.BuildVars.LOGS_ENABLED) FileLog.d(LOG_TAG + ": " + message);
-    }
-
-    private static void logError(String message, Throwable e) {
-        android.util.Log.w(LOG_TAG, message, e);
-        if (org.telegram.messenger.BuildVars.LOGS_ENABLED) FileLog.e(LOG_TAG + ": " + message + ": " + e);
     }
 
     private static String snippet(String body) {
@@ -215,16 +193,11 @@ public final class LyricsOnlineSearch {
                     .detail("iTunes HTTP " + search.status + ": " + snippet(search.body));
         }
         final ArrayList<Candidate> candidates;
-        final int results;
         try {
-            final ArrayList<Candidate> all = readCandidates(search.body);
-            results = all.size();
-            candidates = rank(all, artist, title, durationSeconds);
+            candidates = rank(readCandidates(search.body), artist, title, durationSeconds);
         } catch (Exception e) {
-            logError("iTunes answer could not be read", e);
             return Outcome.temporary(Error.MALFORMED, 0).detail("iTunes answer unreadable: " + snippet(search.body));
         }
-        log("iTunes: " + results + " results, " + candidates.size() + " match the track");
         if (candidates.isEmpty()) return Outcome.error(Error.NOT_FOUND).detail("no iTunes result matches the title and artist");
         // Close runners-up are the same song on another release (a single and its album), and
         // Apple Music may have lyrics on one of them only.
@@ -233,8 +206,6 @@ public final class LyricsOnlineSearch {
         for (Candidate candidate : candidates) {
             if (asked >= LyricsTuning.ONLINE_CANDIDATES || candidate.score < best - LyricsTuning.ONLINE_CANDIDATE_SCORE_SPREAD) break;
             asked++;
-            log("asking Paxsenix for trackId " + candidate.trackId + " (\"" + candidate.title + "\" by " + candidate.artist
-                    + ", " + candidate.durationMs + " ms, score " + String.format(Locale.US, "%.2f", candidate.score) + ")");
             final Outcome outcome = fetchLyrics(request, candidate.trackId);
             if (outcome.lyrics != null || outcome.error != Error.NOT_FOUND) return outcome;
             if (request.cancelled) return Outcome.error(Error.SERVER).detail("cancelled");
@@ -268,7 +239,6 @@ public final class LyricsOnlineSearch {
                     }
                 }
             } catch (Exception e) {
-                logError("Paxsenix answer could not be read", e);
                 return Outcome.temporary(Error.MALFORMED, 0).detail(where + ", unreadable JSON: " + snippet(body));
             }
         } else if (response.status == 200 && (body.startsWith("<") || body.startsWith("\uFEFF<"))) {
@@ -299,8 +269,6 @@ public final class LyricsOnlineSearch {
     private static Response get(Request request, String url) {
         final Response response = new Response();
         HttpURLConnection connection = null;
-        final long started = android.os.SystemClock.elapsedRealtime();
-        log("GET " + url);
         try {
             connection = (HttpURLConnection) new URL(url).openConnection();
             request.connection = connection;
@@ -317,13 +285,10 @@ public final class LyricsOnlineSearch {
             response.retryAfterMs = parseRetryAfterMs(connection.getHeaderField("Retry-After"));
             final InputStream stream = response.status >= 400 ? connection.getErrorStream() : connection.getInputStream();
             response.body = stream == null ? null : readBounded(stream);
-            log("HTTP " + response.status + " in " + (android.os.SystemClock.elapsedRealtime() - started) + " ms, "
-                    + connection.getContentType() + ": " + snippet(response.body));
         } catch (Throwable e) {
             // DNS, connect, TLS, a timeout, a dropped stream, or anything else on the way:
             // all passing, and reported with what actually happened.
             response.failure = e.getClass().getSimpleName() + (e.getMessage() != null ? ": " + e.getMessage() : "");
-            logError("GET failed after " + (android.os.SystemClock.elapsedRealtime() - started) + " ms: " + url, e);
         } finally {
             request.connection = null;
             if (connection != null) {
@@ -369,7 +334,9 @@ public final class LyricsOnlineSearch {
     }
 
     private static ArrayList<Candidate> readCandidates(String body) throws Exception {
-        final JSONObject root = new JSONObject(new JSONTokener(body));
+        // iTunes labels its JSON text/javascript and starts it with blank lines: the body is read
+        // as JSON whatever the content type says.
+        final JSONObject root = new JSONObject(new JSONTokener(body.trim()));
         final JSONArray results = root.optJSONArray("results");
         final ArrayList<Candidate> list = new ArrayList<>();
         if (results == null) return list;

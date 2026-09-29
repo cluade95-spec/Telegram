@@ -1855,8 +1855,8 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
                         if (parent != null && !parent.exists()) parent.mkdirs();
                         new FileOutputStream(marker).close();
                         marker.setLastModified(System.currentTimeMillis());
-                    } catch (Exception e) {
-                        FileLog.e(e);
+                    } catch (Exception ignored) {
+                        // Without the marker the song is simply asked for again next time.
                     }
                 });
             }
