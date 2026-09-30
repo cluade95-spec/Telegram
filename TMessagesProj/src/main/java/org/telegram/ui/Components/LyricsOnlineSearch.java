@@ -146,15 +146,80 @@ public final class LyricsOnlineSearch {
         final Request request = new Request();
         final String cleanArtist = clean(artist);
         final String cleanTitle = clean(title);
-        Utilities.externalNetworkQueue.postRunnable(() -> attempt(request, cleanArtist, cleanTitle, durationSeconds, callback, 0));
+        final Lookup lookup = () -> lookUp(request, cleanArtist, cleanTitle, durationSeconds);
+        Utilities.externalNetworkQueue.postRunnable(() -> attempt(request, lookup, callback, 0));
         return request;
     }
 
-    private static void attempt(Request request, String artist, String title, double durationSeconds, Callback callback, int tries) {
+    /**
+     * Fetches the lyrics of one Apple Music track by its id, with no search. Retries and errors
+     * are exactly those of {@link #search}.
+     */
+    public static Request fetchTrack(long trackId, Callback callback) {
+        final Request request = new Request();
+        final Lookup lookup = () -> fetchLyrics(request, trackId);
+        Utilities.externalNetworkQueue.postRunnable(() -> attempt(request, lookup, callback, 0));
+        return request;
+    }
+
+    /** What the Title field holds: an ordinary title, or a reference to one Apple Music track. */
+    public static final long TITLE_IS_TEXT = -1;
+    /** A link that is not a supported song link: nothing may be searched for it. */
+    public static final long TITLE_IS_UNSUPPORTED_LINK = 0;
+
+    /**
+     * Reads the Title field. Anything starting with http is a link: an Apple Music link that
+     * carries a track id (a song link, .../song/name/ID, or an album link with the track in
+     * {@code ?i=ID}) gives that id, any other link is unsupported. A plain number of at least
+     * ONLINE_TRACK_ID_MIN_DIGITS digits is a track id (shorter numbers are titles, like "1999").
+     * Everything else is text.
+     */
+    public static long parseTitleReference(String title) {
+        final String value = title == null ? "" : title.trim();
+        if (value.regionMatches(true, 0, "http", 0, 4)) {
+            try {
+                final Uri uri = Uri.parse(value);
+                final String host = uri.getHost() == null ? "" : uri.getHost().toLowerCase(Locale.ROOT);
+                if (!host.equals("apple.com") && !host.endsWith(".apple.com")) return TITLE_IS_UNSUPPORTED_LINK;
+                final long fromQuery = parseTrackId(uri.getQueryParameter("i"));
+                if (fromQuery > 0) return fromQuery;
+                final java.util.List<String> segments = uri.getPathSegments();
+                if (segments.contains("song")) {
+                    for (int i = segments.size() - 1; i >= 0; i--) {
+                        final long id = parseTrackId(segments.get(i));
+                        if (id > 0) return id;
+                    }
+                }
+            } catch (Exception ignored) {
+            }
+            return TITLE_IS_UNSUPPORTED_LINK;
+        }
+        if (value.length() >= LyricsTuning.ONLINE_TRACK_ID_MIN_DIGITS) {
+            final long id = parseTrackId(value);
+            if (id > 0) return id;
+        }
+        return TITLE_IS_TEXT;
+    }
+
+    /** A positive run of digits only, or -1. */
+    private static long parseTrackId(String value) {
+        if (value == null || value.isEmpty() || value.length() > 18) return -1;
+        for (int i = 0; i < value.length(); i++) {
+            if (value.charAt(i) < '0' || value.charAt(i) > '9') return -1;
+        }
+        final long id = Long.parseLong(value);
+        return id > 0 ? id : -1;
+    }
+
+    private interface Lookup {
+        Outcome run() throws Exception;
+    }
+
+    private static void attempt(Request request, Lookup lookup, Callback callback, int tries) {
         if (request.cancelled) return;
         Outcome outcome;
         try {
-            outcome = lookUp(request, artist, title, durationSeconds);
+            outcome = lookup.run();
         } catch (Throwable e) {
             // Not a statement that the lyrics do not exist: tried again like any passing failure.
             outcome = Outcome.temporary(Error.SERVER, 0).detail(e.getClass().getSimpleName() + ": " + e.getMessage());
@@ -165,7 +230,7 @@ public final class LyricsOnlineSearch {
         if (outcome.lyrics == null && outcome.temporary && tries < LyricsTuning.ONLINE_RETRY_DELAYS_MS.length) {
             final long delay = Math.max(LyricsTuning.ONLINE_RETRY_DELAYS_MS[tries],
                     Math.min(outcome.retryAfterMs, LyricsTuning.ONLINE_RETRY_AFTER_MAX_MS));
-            Utilities.externalNetworkQueue.postRunnable(() -> attempt(request, artist, title, durationSeconds, callback, tries + 1), delay);
+            Utilities.externalNetworkQueue.postRunnable(() -> attempt(request, lookup, callback, tries + 1), delay);
             return;
         }
         final String lyrics = outcome.lyrics;

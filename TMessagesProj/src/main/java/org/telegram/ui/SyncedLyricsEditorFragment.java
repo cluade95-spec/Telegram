@@ -876,6 +876,15 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
         AndroidUtilities.hideKeyboard(artistField);
         AndroidUtilities.hideKeyboard(titleField);
 
+        // The Title field may also hold an Apple Music song link or a track id: that track is
+        // fetched directly. A link that is not a song link runs no search at all.
+        final long trackId = LyricsOnlineSearch.parseTitleReference(searchTitle);
+        if (trackId == LyricsOnlineSearch.TITLE_IS_UNSUPPORTED_LINK) {
+            BulletinFactory.of(this).createSimpleBulletin(R.raw.error,
+                    LocaleController.getString(R.string.LyricsOnlineSearchUnsupportedLink)).show();
+            return;
+        }
+
         searching = true;
         // The spinner is deliberately delayed, so the lock - not the dialog - is what keeps Save,
         // Import, Delete, Undo/Redo and a second search out during the window before it appears.
@@ -888,7 +897,7 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
         onlineProgressDialog = progress;
 
         final LyricsOnlineSearch.Request[] started = new LyricsOnlineSearch.Request[1];
-        started[0] = LyricsOnlineSearch.search(searchArtist, searchTitle, messageObject.getDuration(), (lyrics, error, detail) -> {
+        final LyricsOnlineSearch.Callback onResult = (lyrics, error, detail) -> {
             // Only the search that still owns the editor may act. A cancelled request never calls
             // back at all; this also rejects a result whose search has been superseded.
             if (started[0] == null || onlineRequest != started[0]) return;
@@ -914,7 +923,10 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
                 }
                 BulletinFactory.of(this).createSimpleBulletin(R.raw.error, message, 4, Bulletin.DURATION_PROLONG).show();
             }
-        });
+        };
+        started[0] = trackId > 0
+                ? LyricsOnlineSearch.fetchTrack(trackId, onResult)
+                : LyricsOnlineSearch.search(searchArtist, searchTitle, messageObject.getDuration(), onResult);
         onlineRequest = started[0];
     }
 

@@ -251,6 +251,9 @@ public final class LyricsTuning {
     public static final float EMPHASIS_RISE_REF_SWELL = 0.13f;
     /** Glow: a white drop shadow of this blur radius in em (CSS drop-shadow 0.1em). */
     public static final float EMPHASIS_GLOW_RADIUS_EM = 0.1f;
+    /** Glow strength multiplier over Build 7 (which was 1). Above 1 the same blurred shape is
+     *  drawn again on top, so only the brightness changes. */
+    public static final float EMPHASIS_GLOW_GAIN = 2f;
     /** Each grapheme starts duration / STAGGER_DIVISOR / count after the previous one. */
     public static final float EMPHASIS_STAGGER_DIVISOR = 2.5f;
     /** Extra float per grapheme: sin-shaped, FLOAT_EM high, FLOAT_STRETCH times the duration,
@@ -271,6 +274,9 @@ public final class LyricsTuning {
      *  (a single and its album are separate tracks; lyrics may exist on one only). Only results
      *  within SCORE_SPREAD of the best score are tried. */
     public static final int ONLINE_SEARCH_RESULTS = 25;
+    /** A plain number in the Title field is an Apple Music track id from this many digits up
+     *  (track ids are 9 to 10 digits); a shorter one is a title such as "1999". */
+    public static final int ONLINE_TRACK_ID_MIN_DIGITS = 6;
     public static final int ONLINE_CANDIDATES = 3;
     public static final double ONLINE_CANDIDATE_SCORE_SPREAD = 0.1;
     public static final int ONLINE_CONNECT_TIMEOUT_MS = 10000;

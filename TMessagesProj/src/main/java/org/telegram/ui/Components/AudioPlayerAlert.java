@@ -3321,6 +3321,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
     private int[] lyricsGroupStart = new int[0];
     /** Per group's first line: the group's last line. */
     private int[] lyricsGroupLast = new int[0];
+    /** Per group's first line: when its last sound ends, background vocals included. */
+    private long[] lyricsGroupEnd = new long[0];
     /**
      * Instrumental gaps that show the dots: each has a row of its own (LYRICS_ROW_INTERLUDE in
      * visibleLyrics) just before the line that ends it, and spans [start, end) of the song.
@@ -3358,6 +3360,13 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
      * they finish, alongside the new line.
      */
     private int lyricsHeldRow = RecyclerView.NO_POSITION;
+    /**
+     * The lit lines, first to last (document lines; -1 when none): the current line and every
+     * line of its chain that has started, or the next line once the list has moved on to it.
+     * Every timed line in the range is lit, background vocals included.
+     */
+    private int lyricsLitFirst = -1;
+    private int lyricsLitLast = -1;
     /**
      * The row the list is bringing to the anchor (the pre-roll included), or NO_POSITION. Size
      * and blur follow it rather than the timestamp, so they change on the scroll's own spring
@@ -3450,14 +3459,32 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             final int preRolled = lyricsPreRollLine(index, position);
             if (preRolled != index) activeLine = preRolled;
         }
-        final int heldRow = idle ? RecyclerView.NO_POSITION : lyricsHeldRowAt(index, position);
+        // The lit lines: the current one, every line of its chain that has started (and so their
+        // background vocals), or, once the chain has ended and the list has moved on, the next
+        // line on its own.
+        int litFirst = activeLine;
+        int litLast = activeLine;
+        if (!idle && activeLine >= 0 && lyricsWordTimed) {
+            final int group = lyricsGroupOf(index);
+            if (group >= 0) {
+                final int after = lyricsGroupAfter(group, position);
+                if (after >= 0) {
+                    litFirst = litLast = after;
+                } else {
+                    litFirst = group;
+                }
+            } else {
+                final int heldRow = lyricsHeldRowAt(index, position);
+                if (heldRow != RecyclerView.NO_POSITION) litFirst = index - 1;
+            }
+        }
         // Size and blur follow the row the list is bringing in; the dots and the wait before
         // the first line (until its pre-roll) have none.
         int stageRow = lyricsEndOfSong ? RecyclerView.NO_POSITION : lyricsFollowTargetRow(index, position);
         if (stageRow == lyricsInterludeRow || index < 0 && lyricsPreRollLine(index, position) < 0) {
             stageRow = RecyclerView.NO_POSITION;
         }
-        updateActiveLyricsLine(activeLine, heldRow, stageRow, now);
+        updateActiveLyricsLine(activeLine, litFirst, litLast, stageRow, now);
         // Word state is resolved from the same position, so pause and seek land exactly where the
         // timestamps say. A line change repaints every row; otherwise only the singing row.
         updateKaraoke(index, position);
@@ -3565,6 +3592,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         }
         lyricsFocusRow = RecyclerView.NO_POSITION;
         lyricsHeldRow = RecyclerView.NO_POSITION;
+        lyricsLitFirst = -1;
+        lyricsLitLast = -1;
         lyricsStageRow = RecyclerView.NO_POSITION;
         lyricsFollowRow = RecyclerView.NO_POSITION;
         lyricsAim = LYRICS_AIM_SNAP;
@@ -3645,8 +3674,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
     private boolean isLyricsRowStaged(int row) {
         if (row == RecyclerView.NO_POSITION) return false;
         if (row == lyricsStageRow) return true;
-        return (row == lyricsFocusRow || row == lyricsHeldRow)
-                && (lyricsStageRow == RecyclerView.NO_POSITION || row > lyricsStageRow);
+        return (isLyricsRowLit(row) || !lyricsWordTimed && row == lyricsFocusRow)
+                && (lyricsStageRow == RecyclerView.NO_POSITION || row >= lyricsStageRow);
     }
 
     private void retargetLyricsScale(int row, long now) {
@@ -3669,31 +3698,44 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
      * scale follow it from there. A timed blank, or the time before the first line, has no active
      * row, so everything dims.
      */
-    private void updateActiveLyricsLine(int index, int heldRow, int stageRow, long now) {
+    private void updateActiveLyricsLine(int index, int litFirst, int litLast, int stageRow, long now) {
         if (index != activeLyricsLine) {
             activeLyricsLine = index;
             activeLyricsRow = rowForLyricsLine(index);
         }
         final int row = activeLyricsRow;
         final int oldFocus = lyricsFocusRow;
-        final int oldHeld = lyricsHeldRow;
+        final int oldFirst = lyricsLitFirst;
+        final int oldLast = lyricsLitLast;
         final int oldStage = lyricsStageRow;
-        if (row == oldFocus && heldRow == oldHeld && stageRow == oldStage) return;
+        if (row == oldFocus && litFirst == oldFirst && litLast == oldLast && stageRow == oldStage) return;
         lyricsFocusRow = row;
-        lyricsHeldRow = heldRow;
+        lyricsLitFirst = litFirst;
+        lyricsLitLast = litLast;
         lyricsStageRow = stageRow;
-        // A row that stays lit in its other role (the line just left, held on by its background
-        // vocals) keeps its target rather than being turned down and up again.
-        if (oldFocus != row && oldFocus != heldRow) setLyricsFocusTarget(oldFocus, 0f, now);
-        if (oldHeld != heldRow && oldHeld != row) setLyricsFocusTarget(oldHeld, 0f, now);
-        setLyricsFocusTarget(row, 1f, now);
-        setLyricsFocusTarget(heldRow, 1f, now);
+        // Rows lit before and after keep their target rather than being turned down and up again.
+        for (int line = Math.max(0, oldFirst); oldFirst >= 0 && line <= oldLast; line++) {
+            final int r = rowForLyricsLine(line);
+            if (!isLyricsRowLit(r)) setLyricsFocusTarget(r, 0f, now);
+            retargetLyricsScale(r, now);
+        }
+        for (int line = Math.max(0, litFirst); litFirst >= 0 && line <= litLast; line++) {
+            final int r = rowForLyricsLine(line);
+            if (isLyricsRowLit(r)) setLyricsFocusTarget(r, 1f, now);
+            retargetLyricsScale(r, now);
+        }
         retargetLyricsScale(oldFocus, now);
-        retargetLyricsScale(oldHeld, now);
         retargetLyricsScale(oldStage, now);
         retargetLyricsScale(row, now);
-        retargetLyricsScale(heldRow, now);
         retargetLyricsScale(stageRow, now);
+    }
+
+    /** Whether {@code row} shows a timed line inside the lit range. */
+    private boolean isLyricsRowLit(int row) {
+        if (row == RecyclerView.NO_POSITION || lyricsLitFirst < 0 || row < 0 || row >= visibleLyrics.size()) return false;
+        final int line = visibleLyrics.get(row);
+        return line >= lyricsLitFirst && line <= lyricsLitLast && line >= 0
+                && currentLyrics != null && line < currentLyrics.lines.size() && currentLyrics.lines.get(line).timed;
     }
 
     // --- Follow ------------------------------------------------------------------------------
@@ -3770,16 +3812,14 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         int targetRow = line < 0 ? 0 : rowForLyricsLine(line);
         // During an instrumental gap the dots sit on the anchor.
         if (lyricsInterludeRow != RecyclerView.NO_POSITION) targetRow = lyricsInterludeRow;
-        // A line whose background vocals run over the next line: like Apple Music, both lines
-        // stay active and the list does not move until the new line ends; then it moves once,
-        // to the line after them (with the usual pre-roll). It never moves when the background
-        // vocals end. Chains of such lines are one group.
-        final int group = line >= 0 && line < lyricsGroupStart.length ? lyricsGroupStart[line] : -1;
+        // Apple Music: the list stays on a line (and on the first line of a chain, where each
+        // line starts before the one before it has ended) until that line or the whole chain has
+        // ended, background vocals included, and then moves once, to the line after it.
+        final int group = lyricsWordTimed ? lyricsGroupOf(line) : -1;
         if (group >= 0 && lyricsInterludeRow == RecyclerView.NO_POSITION) {
-            final int last = lyricsGroupLast[group];
-            final int preRolled = lyricsPreRollLine(last, position);
+            final int after = lyricsGroupAfter(group, position);
+            if (after >= 0) return rowForLyricsLine(after);
             final int groupRow = rowForLyricsLine(group);
-            if (preRolled != last) return rowForLyricsLine(preRolled);
             return groupRow != RecyclerView.NO_POSITION ? groupRow : targetRow;
         }
         final int preRolled = lyricsPreRollLine(line, position);
@@ -3945,32 +3985,64 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             }
             if (next != Long.MAX_VALUE && end > next) lyricsLineHoldEnd[i] = end;
         }
-        // Scroll groups: only background vocals running over the next line join two lines.
+        // Scroll groups (chains): a line joins the one before it when it starts before that
+        // line, or any earlier line of its chain, has ended, background vocals included. A line
+        // whose end is not known forms no group and keeps the pre-roll.
         lyricsGroupStart = new int[lines];
         lyricsGroupLast = new int[lines];
+        lyricsGroupEnd = new long[lines];
         java.util.Arrays.fill(lyricsGroupStart, -1);
+        java.util.Arrays.fill(lyricsGroupEnd, Long.MIN_VALUE);
+        int group = -1;
         for (int i = 0; i < lines; i++) {
+            final SyncedLyricsController.Line source = currentLyrics.lines.get(i);
+            if (!source.timed) continue;
             final SyncedLyricsController.Line display = lyricsDisplayLines[i];
-            if (display == null || !display.timed || display.segments == null || display.segments.size() == 0) continue;
-            final int lineBreak = display.text.indexOf('\n');
-            if (lineBreak < 0) continue;
-            final int next = nextTimedLyricsLine(i);
-            if (next < 0 || TextUtils.isEmpty(currentLyrics.lines.get(next).text)) continue;
-            final long nextStart = currentLyrics.lines.get(next).timeMs;
-            final long nextStartOfNext = nextLyricsLineTimeMs(i);
-            long backgroundEnd = Long.MIN_VALUE;
+            final boolean known = display != null && display.timed && display.segments != null
+                    && display.segments.size() > 0 && !TextUtils.isEmpty(source.text);
+            if (!known) {
+                group = -1;
+                continue;
+            }
+            final long next = nextLyricsLineTimeMs(i);
+            long end = Long.MIN_VALUE;
             final SyncedLyricsController.Segments segments = display.segments;
             for (int k = 0; k < segments.size(); k++) {
-                if (segments.startOffset(k) <= lineBreak) continue;
-                backgroundEnd = Math.max(backgroundEnd, segments.startTimeMs(k)
-                        + KaraokeFrame.sweepWindowMs(display.text, segments, k, nextStartOfNext));
+                end = Math.max(end, segments.startTimeMs(k) + KaraokeFrame.sweepWindowMs(display.text, segments, k, next));
             }
-            if (backgroundEnd <= nextStart) continue;
-            final int group = lyricsGroupStart[i] >= 0 ? lyricsGroupStart[i] : i;
-            lyricsGroupStart[i] = group;
-            lyricsGroupStart[next] = group;
-            lyricsGroupLast[group] = next;
+            if (group >= 0 && source.timeMs < lyricsGroupEnd[group]) {
+                lyricsGroupStart[i] = group;
+                lyricsGroupLast[group] = i;
+                lyricsGroupEnd[group] = Math.max(lyricsGroupEnd[group], end);
+            } else {
+                group = i;
+                lyricsGroupStart[i] = i;
+                lyricsGroupLast[i] = i;
+                lyricsGroupEnd[i] = end;
+            }
         }
+    }
+
+    /** The first line of {@code line}'s group, or -1 when it has none. */
+    private int lyricsGroupOf(int line) {
+        return line >= 0 && line < lyricsGroupStart.length ? lyricsGroupStart[line] : -1;
+    }
+
+    /**
+     * The line the list moves to once {@code group} (a line, or a chain) has ended, background
+     * vocals included; -1 while it has not, when nothing follows, or when an instrumental gap
+     * follows (its dots take the anchor instead).
+     */
+    private int lyricsGroupAfter(int group, long position) {
+        if (group < 0 || lyricsGroupEnd[group] == Long.MIN_VALUE || position < lyricsGroupEnd[group]) return -1;
+        final int next = nextTimedLyricsLine(lyricsGroupLast[group]);
+        if (next < 0 || TextUtils.isEmpty(currentLyrics.lines.get(next).text)) return -1;
+        if (rowForLyricsLine(next) == RecyclerView.NO_POSITION) return -1;
+        final long nextStart = currentLyrics.lines.get(next).timeMs;
+        for (int i = 0; i < lyricsInterludeEnd.length; i++) {
+            if (lyricsInterludeEnd[i] == nextStart) return -1;
+        }
+        return next;
     }
 
     /** The next document line with a time, or -1. */
@@ -4272,6 +4344,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         lyricsRowFocus = new LyricsSpring[0];
         lyricsFocusRow = RecyclerView.NO_POSITION;
         lyricsHeldRow = RecyclerView.NO_POSITION;
+        lyricsLitFirst = -1;
+        lyricsLitLast = -1;
         lyricsStageRow = RecyclerView.NO_POSITION;
         lyricsFadeFrom = new float[0];
         lyricsFadeTo = new float[0];
@@ -4352,8 +4426,9 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         final SyncedLyricsController.Line lyricLine = lineForLyricsRow(row);
         // The held row (background vocals still being sung over the next line) is resolved
         // against the clock like the current line, with its own next-line time.
-        final boolean held = row == lyricsHeldRow && hasLyricsRow(row);
         final int lineIndex = row >= 0 && row < visibleLyrics.size() ? visibleLyrics.get(row) : -1;
+        // A lit line before the current one (its chain still singing) keeps its own word state.
+        final boolean held = hasLyricsRow(row) && lineIndex >= 0 && lineIndex < karaokeLine && isLyricsRowLit(row);
         final boolean wordFrame = lyricsWordTimed && lyricLine != null && textView != null
                 && rowKaraoke.resolveRow(lyricLine, lineIndex, held ? lineIndex : karaokeLine,
                         karaokePositionMs, held ? nextLyricsLineTimeMs(lineIndex) : karaokeNextLineTimeMs);
@@ -6512,7 +6587,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 // Logical order: in an RTL word the first grapheme is on the right.
                 final float spread = rtl ? -emphasisA[1] : emphasisA[1];
                 final float rise = emphasisA[2] + lift;
-                glowAlpha = emphasisA[3] > 0.004f ? Math.min(1f, emphasisA[3]) : 0f;
+                glowAlpha = emphasisA[3] > 0.004f ? emphasisA[3] * LyricsTuning.EMPHASIS_GLOW_GAIN : 0f;
                 final float pivotX = (clusterLeft[c] + clusterRight[c]) / 2f;
                 if (layers) {
                     drawInNode(canvas, clusterNode(c), start, end, contextStart, contextEnd,
@@ -6550,9 +6625,13 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             final Shader shader = drawPaint.getShader();
             final int color = drawPaint.getColor();
             drawPaint.setShader(null);
-            drawPaint.setColor(Color.argb(Math.round(glowAlpha * 255), 255, 255, 255));
             drawPaint.setMaskFilter(glowFilter);
-            canvas.drawTextRun(karaokeTextStr, start, end, contextStart, contextEnd, x, baseline, rtl, drawPaint);
+            // Strength above 1 is the same blurred shape drawn again on top, so the glow gets
+            // brighter without changing its shape, size or timing.
+            for (float remaining = glowAlpha; remaining > 0.004f; remaining -= 1f) {
+                drawPaint.setColor(Color.argb(Math.round(Math.min(1f, remaining) * 255), 255, 255, 255));
+                canvas.drawTextRun(karaokeTextStr, start, end, contextStart, contextEnd, x, baseline, rtl, drawPaint);
+            }
             drawPaint.setMaskFilter(null);
             drawPaint.setColor(color);
             drawPaint.setShader(shader);
@@ -7037,6 +7116,11 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 long activeEnd = Math.min(Math.min(nextLineMs, lyricsEndMs), singingEnd);
                 // Background vocals sung over the next line keep the line active until they end.
                 if (line < lyricsLineHoldEnd.length && lyricsLineHoldEnd[line] > activeEnd) activeEnd = lyricsLineHoldEnd[line];
+                // A line in a chain stays active until the whole chain has ended.
+                final int group = lyricsGroupOf(line);
+                if (group >= 0 && lyricsGroupLast[group] != group && lyricsGroupEnd[group] > activeEnd) {
+                    activeEnd = lyricsGroupEnd[group];
+                }
                 textView.setWordTiming(lyricLine, activeEnd, nextLineMs);
             }
             boolean stanzaSpace = !synced && TextUtils.isEmpty(lyricLine.text);
