@@ -18,14 +18,16 @@ import android.text.InputType;
 import android.text.Layout;
 import android.text.Spanned;
 import android.text.TextPaint;
+import android.text.TextUtils;
 import android.text.TextWatcher;
 import android.text.style.CharacterStyle;
 import android.text.style.UpdateAppearance;
 import android.util.TypedValue;
-import android.view.GestureDetector;
 import android.view.Gravity;
 import android.view.MotionEvent;
+import android.view.VelocityTracker;
 import android.view.View;
+import android.view.ViewConfiguration;
 import android.view.inputmethod.EditorInfo;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
@@ -50,7 +52,7 @@ import org.telegram.ui.ActionBar.AlertDialog;
 import org.telegram.ui.ActionBar.BaseFragment;
 import org.telegram.ui.ActionBar.Theme;
 import org.telegram.ui.ActionBar.ThemeDescription;
-import org.telegram.ui.Cells.RadioColorCell;
+import org.telegram.ui.Components.Bulletin;
 import org.telegram.ui.Components.BulletinFactory;
 import org.telegram.ui.Components.EditTextBoldCursor;
 import org.telegram.ui.Components.AudioPlayerAlert;
@@ -118,8 +120,6 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
     private boolean pendingControllerRefresh;
     private String searchArtist;
     private String searchTitle;
-    /** The flavour the row list opens marked. Remembered like the fields, and never applied on its own. */
-    private LyricsOnlineSearch.Type searchType = LyricsOnlineSearch.Type.SYNCED;
 
     public SyncedLyricsEditorFragment(MessageObject messageObject) {
         super(new Bundle());
@@ -158,29 +158,24 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
      */
     private static class LyricsEditText extends EditTextBoldCursor {
         private final OverScroller flingScroller;
-        private final GestureDetector flingDetector;
+        private final int touchSlop;
+        private final int minFlingVelocity;
+        private final int maxFlingVelocity;
+        private VelocityTracker velocityTracker;
+        private float downX;
+        private float downY;
+        private float lastY;
+        private boolean dragging;
 
         LyricsEditText(Context context) {
             super(context);
             drawAnimatedEmojiDrawables = false;
             setShouldRevealSpoilersByTouch(false);
-            // A TextView scrolls through Touch.onTouchEvent, which drags but never flings - that is
-            // why the editor felt dry and stopped dead. Add momentum without changing the layout,
-            // the movement method, IME behaviour or the single-EditText structure.
             flingScroller = new OverScroller(context);
-            flingDetector = new GestureDetector(context, new GestureDetector.SimpleOnGestureListener() {
-                @Override
-                public boolean onFling(MotionEvent e1, MotionEvent e2, float velocityX, float velocityY) {
-                    if (hasSelection()) return false;
-                    final int max = getMaxEditorScroll();
-                    if (max <= 0) return false;
-                    flingScroller.forceFinished(true);
-                    flingScroller.fling(0, getScrollY(), 0, -Math.round(velocityY), 0, 0, 0, max);
-                    postInvalidateOnAnimation();
-                    return true;
-                }
-            });
-            flingDetector.setIsLongpressEnabled(false);
+            final ViewConfiguration configuration = ViewConfiguration.get(context);
+            touchSlop = configuration.getScaledTouchSlop();
+            minFlingVelocity = configuration.getScaledMinimumFlingVelocity();
+            maxFlingVelocity = configuration.getScaledMaximumFlingVelocity();
         }
 
         private int getMaxEditorScroll() {
@@ -189,16 +184,65 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
             return Math.max(0, layout.getHeight() + getPaddingTop() + getPaddingBottom() - getHeight());
         }
 
+        /**
+         * A vertical swipe scrolls the document straight away, focused or not, like a list: once
+         * the finger has moved past the touch slop, mostly vertically and with no text selected,
+         * the swipe is ours and the text field's own handling (cursor, selection, focus on
+         * release) is cancelled. A tap or a long press never gets that far, so it still places
+         * the cursor or starts a selection exactly as before; with text selected, drags still
+         * move the selection handles.
+         */
         @Override
         public boolean onTouchEvent(MotionEvent event) {
-            if (event.getActionMasked() == MotionEvent.ACTION_DOWN) {
+            final int action = event.getActionMasked();
+            if (action == MotionEvent.ACTION_DOWN) {
                 flingScroller.forceFinished(true);
+                dragging = false;
+                downX = event.getX();
+                downY = lastY = event.getY();
+                if (velocityTracker == null) velocityTracker = VelocityTracker.obtain();
+                velocityTracker.clear();
             }
-            // Selection, handles, cursor placement and the IME keep first claim on the event; the
-            // detector only ever reacts to a fling.
-            final boolean handled = super.onTouchEvent(event);
-            flingDetector.onTouchEvent(event);
-            return handled;
+            if (velocityTracker != null) velocityTracker.addMovement(event);
+            if (!dragging && action == MotionEvent.ACTION_MOVE && !hasSelection() && getMaxEditorScroll() > 0) {
+                final float dx = Math.abs(event.getX() - downX);
+                final float dy = Math.abs(event.getY() - downY);
+                if (dy > touchSlop && dy > dx) {
+                    dragging = true;
+                    lastY = event.getY();
+                    cancelLongPress();
+                    final MotionEvent cancel = MotionEvent.obtain(event);
+                    cancel.setAction(MotionEvent.ACTION_CANCEL);
+                    super.onTouchEvent(cancel);
+                    cancel.recycle();
+                    if (getParent() != null) getParent().requestDisallowInterceptTouchEvent(true);
+                }
+            }
+            if (!dragging) return super.onTouchEvent(event);
+            switch (action) {
+                case MotionEvent.ACTION_MOVE: {
+                    final float y = event.getY();
+                    final int target = Math.max(0, Math.min(getScrollY() + Math.round(lastY - y), getMaxEditorScroll()));
+                    lastY = y;
+                    if (target != getScrollY()) scrollTo(getScrollX(), target);
+                    break;
+                }
+                case MotionEvent.ACTION_UP: {
+                    velocityTracker.computeCurrentVelocity(1000, maxFlingVelocity);
+                    final float velocity = velocityTracker.getYVelocity();
+                    final int max = getMaxEditorScroll();
+                    if (Math.abs(velocity) >= minFlingVelocity && max > 0) {
+                        flingScroller.fling(0, getScrollY(), 0, -Math.round(velocity), 0, 0, 0, max);
+                        postInvalidateOnAnimation();
+                    }
+                    dragging = false;
+                    break;
+                }
+                case MotionEvent.ACTION_CANCEL:
+                    dragging = false;
+                    break;
+            }
+            return true;
         }
 
         @Override
@@ -342,8 +386,21 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
     public View createView(Context context) {
         SyncedLyricsController controller = SyncedLyricsController.getInstance(currentAccount);
         controller.retryIfFailed(messageObject);
+        // The header is part of the page: the page's own background and text colours, no drop
+        // shadow (a hairline appears once the text scrolls under it), the song as a subtitle, and
+        // every button the same 48dp touch target.
         actionBar.setBackButtonImage(R.drawable.ic_ab_back);
+        actionBar.setBackgroundColor(getThemedColor(Theme.key_windowBackgroundWhite));
+        actionBar.setItemsColor(getThemedColor(Theme.key_windowBackgroundWhiteBlackText), false);
+        actionBar.setItemsBackgroundColor(getThemedColor(Theme.key_actionBarWhiteSelector), false);
+        actionBar.setTitleColor(getThemedColor(Theme.key_windowBackgroundWhiteBlackText));
+        actionBar.setSubtitleColor(getThemedColor(Theme.key_windowBackgroundWhiteGrayText));
+        actionBar.setCastShadows(false);
         actionBar.setTitle(LocaleController.getString(R.string.Lyrics));
+        final String songTitle = defaultSearchTitle();
+        final String songArtist = defaultSearchArtist();
+        final String song = songTitle.isEmpty() ? songArtist : songArtist.isEmpty() ? songTitle : songTitle + " \u2013 " + songArtist;
+        if (!song.isEmpty()) actionBar.setSubtitle(song);
         actionBar.setAllowOverlayTitle(true);
         actionBar.setActionBarMenuOnItemClick(new ActionBar.ActionBarMenuOnItemClick() {
             @Override
@@ -373,7 +430,8 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
         redoButton.setContentDescription(LocaleController.getString(R.string.Redo));
         otherButton = menu.addItem(OTHER, R.drawable.ic_ab_other);
         otherButton.setContentDescription(LocaleController.getString(R.string.AccDescrMoreOptions));
-        doneButton = menu.addItemWithWidth(DONE, R.drawable.ic_ab_done, AndroidUtilities.dp(56));
+        doneButton = menu.addItem(DONE, R.drawable.ic_ab_done);
+        doneButton.setIconColor(getThemedColor(Theme.key_windowBackgroundWhiteBlueText));
         doneButton.setContentDescription(LocaleController.getString(R.string.Save));
 
         editText = new LyricsEditText(context);
@@ -440,6 +498,17 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
         FrameLayout content = new FrameLayout(context);
         content.setBackgroundColor(getThemedColor(Theme.key_windowBackgroundWhite));
         content.addView(editText, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.MATCH_PARENT));
+        final View headerDivider = new View(context);
+        headerDivider.setBackgroundColor(getThemedColor(Theme.key_divider));
+        headerDivider.setAlpha(0f);
+        content.addView(headerDivider, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, 1f / AndroidUtilities.density, Gravity.TOP));
+        editText.setOnScrollChangeListener((view, scrollX, scrollY, oldScrollX, oldScrollY) -> {
+            final boolean scrolled = scrollY > 0;
+            if (scrolled != headerDivider.getAlpha() > 0f) {
+                headerDivider.animate().cancel();
+                headerDivider.animate().alpha(scrolled ? 1f : 0f).setDuration(150).start();
+            }
+        });
         progressView = new RadialProgressView(context, getResourceProvider());
         progressView.setSize(AndroidUtilities.dp(24));
         content.addView(progressView, LayoutHelper.createFrame(32, 32, Gravity.CENTER));
@@ -459,7 +528,9 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
     /** Single source of truth for Done, so no path can re-enable it while something else owns the editor. */
     private void updateDoneButton() {
         if (doneButton == null) return;
-        doneButton.setEnabled(editorReady && !saving && !searching);
+        final boolean enabled = editorReady && !saving && !searching;
+        doneButton.setEnabled(enabled);
+        doneButton.setAlpha(enabled ? 1f : 0.35f);
     }
 
     /**
@@ -690,7 +761,7 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
                     .onUnmappableCharacter(CodingErrorAction.REPORT)
                     .decode(ByteBuffer.wrap(output.toByteArray())).toString();
             if (source.length() > 0 && source.charAt(0) == '\ufeff') source = source.substring(1);
-            imported = source;
+            imported = SyncedLyricsController.prepareImportedLyrics(source);
         } catch (Exception e) {
             FileLog.e(e);
         }
@@ -739,45 +810,20 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
         container.addView(createSearchLabel(activity, R.string.LyricsOnlineSearchTitle), LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
         container.addView(titleField, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 36, Gravity.TOP | Gravity.START, 24, 2, 24, 0));
 
-        // The three flavours are rows rather than dialog buttons: a dialog has three button slots
-        // and one of them has to stay Cancel, and this is the same pick-one-and-act row Telegram
-        // uses for its own single-choice dialogs. Tapping a row is still one explicit action, and
-        // the row that is marked is the one last used - there is no automatic flavour.
-        final AlertDialog[] dialogRef = new AlertDialog[1];
-        container.addView(createSearchLabel(activity, R.string.LyricsOnlineSearchType), LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
-        final LyricsOnlineSearch.Type[] types = {
-                LyricsOnlineSearch.Type.KARAOKE,
-                LyricsOnlineSearch.Type.SYNCED,
-                LyricsOnlineSearch.Type.PLAIN
-        };
-        final int[] labels = {
-                R.string.LyricsOnlineSearchKaraoke,
-                R.string.LyricsOnlineSearchSynced,
-                R.string.LyricsOnlineSearchPlain
-        };
-        for (int a = 0; a < types.length; a++) {
-            final LyricsOnlineSearch.Type type = types[a];
-            final RadioColorCell cell = new RadioColorCell(activity, getResourceProvider());
-            cell.setPadding(AndroidUtilities.dp(4), 0, AndroidUtilities.dp(4), 0);
-            cell.setCheckColor(getThemedColor(Theme.key_radioBackground), getThemedColor(Theme.key_dialogRadioBackgroundChecked));
-            cell.setTextAndValue(LocaleController.getString(labels[a]), type == searchType);
-            cell.setBackground(Theme.createSelectorDrawable(getThemedColor(Theme.key_listSelector), Theme.RIPPLE_MASK_ALL));
-            cell.setOnClickListener(ignored -> {
-                searchType = type;
-                // Started before the dialog goes away, as the buttons this replaced did: the
-                // fields are still attached, so hiding the keyboard still has a window to act on.
-                startOnlineSearch(type, artistField, titleField);
-                if (dialogRef[0] != null) dialogRef[0].dismiss();
-            });
-            container.addView(cell, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 50));
-        }
-
-        AlertDialog dialog = new AlertDialog.Builder(activity, getResourceProvider())
+        // Only the song's title and artist: the source (Apple Music word timing through
+        // Paxsenix) and the lyrics type are fixed, so there is nothing else to choose.
+        final AlertDialog dialog = new AlertDialog.Builder(activity, getResourceProvider())
                 .setTitle(LocaleController.getString(R.string.LyricsOnlineSearch))
                 .setView(container)
+                .setPositiveButton(LocaleController.getString(R.string.Search), (ignored, which) -> startOnlineSearch(artistField, titleField))
                 .setNegativeButton(LocaleController.getString(R.string.Cancel), null)
                 .create();
-        dialogRef[0] = dialog;
+        titleField.setOnEditorActionListener((view, actionId, event) -> {
+            if (actionId != EditorInfo.IME_ACTION_DONE) return false;
+            startOnlineSearch(artistField, titleField);
+            dialog.dismiss();
+            return true;
+        });
         // Remembering what was typed is what keeps the fields alive across a cancelled or failed
         // search. It has to be handed to showDialog(): BaseFragment installs its own dismiss
         // listener on whatever it shows, which would replace one set through the builder.
@@ -822,13 +868,22 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
         if (titleField != null) searchTitle = titleField.getText().toString();
     }
 
-    private void startOnlineSearch(LyricsOnlineSearch.Type type, EditTextBoldCursor artistField, EditTextBoldCursor titleField) {
+    private void startOnlineSearch(EditTextBoldCursor artistField, EditTextBoldCursor titleField) {
         rememberSearchFields(artistField, titleField);
         if (searching || saving || importing || !editorReady) return;
         final Activity activity = getParentActivity();
         if (activity == null) return;
         AndroidUtilities.hideKeyboard(artistField);
         AndroidUtilities.hideKeyboard(titleField);
+
+        // The Title field may also hold an Apple Music song link or a track id: that track is
+        // fetched directly. A link that is not a song link runs no search at all.
+        final long trackId = LyricsOnlineSearch.parseTitleReference(searchTitle);
+        if (trackId == LyricsOnlineSearch.TITLE_IS_UNSUPPORTED_LINK) {
+            BulletinFactory.of(this).createSimpleBulletin(R.raw.error,
+                    LocaleController.getString(R.string.LyricsOnlineSearchUnsupportedLink)).show();
+            return;
+        }
 
         searching = true;
         // The spinner is deliberately delayed, so the lock - not the dialog - is what keeps Save,
@@ -842,7 +897,7 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
         onlineProgressDialog = progress;
 
         final LyricsOnlineSearch.Request[] started = new LyricsOnlineSearch.Request[1];
-        started[0] = LyricsOnlineSearch.search(searchArtist, searchTitle, messageObject.getDuration(), type, (lyrics, resolved, error) -> {
+        final LyricsOnlineSearch.Callback onResult = (lyrics, error, detail) -> {
             // Only the search that still owns the editor may act. A cancelled request never calls
             // back at all; this also rejects a result whose search has been superseded.
             if (started[0] == null || onlineRequest != started[0]) return;
@@ -857,22 +912,21 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
             consumePendingControllerRefresh();
             if (lyrics != null) {
                 applyOnlineLyrics(lyrics);
-                // A karaoke search that no word-timing source could answer still returns something
-                // useful, but it is line timing and the user is told so rather than left to
-                // discover it when nothing lights up word by word.
-                if (resolved != type) {
-                    BulletinFactory.of(this).createSimpleBulletin(R.raw.info,
-                            LocaleController.getString(R.string.LyricsOnlineSearchLineSyncOnly), 3).show();
-                }
             } else {
-                // The same compact bottom message the line-sync notice above uses, and for the
-                // same reason: a search that found nothing is information, not a decision to
-                // confirm, and a centred dialog with an OK button interrupts the editor to say so.
-                // All three flavours fail through here, so all three fail the same way.
-                BulletinFactory.of(this).createSimpleBulletin(R.raw.error,
-                        LocaleController.getString(onlineSearchErrorMessage(error)), 3).show();
+                // A compact bottom message: a search that found nothing is information, not a
+                // decision to confirm.
+                // What actually failed goes with the message (and in the log, tag LyricsOnline),
+                // so a failure can be told apart from "no lyrics".
+                String message = LocaleController.getString(onlineSearchErrorMessage(error));
+                if (!TextUtils.isEmpty(detail) && error != LyricsOnlineSearch.Error.NOT_FOUND) {
+                    message += "\n" + (detail.length() > 140 ? detail.substring(0, 140) + "..." : detail);
+                }
+                BulletinFactory.of(this).createSimpleBulletin(R.raw.error, message, 4, Bulletin.DURATION_PROLONG).show();
             }
-        });
+        };
+        started[0] = trackId > 0
+                ? LyricsOnlineSearch.fetchTrack(trackId, onResult)
+                : LyricsOnlineSearch.search(searchArtist, searchTitle, messageObject.getDuration(), onResult);
         onlineRequest = started[0];
     }
 
@@ -927,8 +981,6 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
         switch (error) {
             case NOT_FOUND:
                 return R.string.LyricsOnlineSearchNotFound;
-            case TYPE_UNAVAILABLE:
-                return R.string.LyricsOnlineSearchTypeUnavailable;
             case NETWORK:
                 return R.string.LyricsOnlineSearchNetworkError;
             case RATE_LIMITED:
@@ -1084,8 +1136,18 @@ public class SyncedLyricsEditorFragment extends BaseFragment implements Notifica
     }
 
     @Override
+    public boolean isLightStatusBar() {
+        return androidx.core.graphics.ColorUtils.calculateLuminance(getThemedColor(Theme.key_windowBackgroundWhite)) > 0.7f;
+    }
+
+    @Override
     public ArrayList<ThemeDescription> getThemeDescriptions() {
         ArrayList<ThemeDescription> descriptions = new ArrayList<>();
+        descriptions.add(new ThemeDescription(actionBar, ThemeDescription.FLAG_BACKGROUND, null, null, null, null, Theme.key_windowBackgroundWhite));
+        descriptions.add(new ThemeDescription(actionBar, ThemeDescription.FLAG_AB_ITEMSCOLOR, null, null, null, null, Theme.key_windowBackgroundWhiteBlackText));
+        descriptions.add(new ThemeDescription(actionBar, ThemeDescription.FLAG_AB_TITLECOLOR, null, null, null, null, Theme.key_windowBackgroundWhiteBlackText));
+        descriptions.add(new ThemeDescription(actionBar, ThemeDescription.FLAG_AB_SUBTITLECOLOR, null, null, null, null, Theme.key_windowBackgroundWhiteGrayText));
+        descriptions.add(new ThemeDescription(actionBar, ThemeDescription.FLAG_AB_SELECTORCOLOR, null, null, null, null, Theme.key_actionBarWhiteSelector));
         descriptions.add(new ThemeDescription(fragmentView, ThemeDescription.FLAG_BACKGROUND, null, null, null, null, Theme.key_windowBackgroundWhite));
         descriptions.add(new ThemeDescription(editText, ThemeDescription.FLAG_TEXTCOLOR, null, null, null, null, Theme.key_windowBackgroundWhiteBlackText));
         descriptions.add(new ThemeDescription(editText, ThemeDescription.FLAG_HINTTEXTCOLOR, null, null, null, null, Theme.key_windowBackgroundWhiteHintText));
