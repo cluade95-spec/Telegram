@@ -232,10 +232,13 @@ public final class LyricsTuning {
      *  either rule. The duration is measured as in Build 5 (AudioPlayerAlert emphasisWindowMs). */
     public static final int EMPHASIS_MIN_GRAPHEMES = 1;
     public static final int EMPHASIS_MAX_GRAPHEMES = 7;
-    /** Strength. A qualifying word always swells by at least BASE (SHORT_BASE for words of
-     *  SHORT_GRAPHEMES or fewer) and glows at GLOW_BASE; longer words add up to RAMP swell and
-     *  GLOW_RAMP glow along p^RAMP_POWER, p = (duration - MIN) / (FULL - MIN). (AMLL starts its
-     *  strength at zero on a cubic, which is why a one-second word showed almost nothing.) */
+    /** Strength, per grapheme (YouLy+ lyricsRenderer.js calculateEmphasisMetrics and
+     *  applyGrowthStyles). progress = p^RAMP_POWER, p = (duration - MIN) / (FULL - MIN)
+     *  (YouLy+: minDuration 1000, maxDuration 5000, easingPower 3). Each grapheme's progress is
+     *  progress * penalty * (1 - position * decay), see the PENALTY and DECAY values below. Then:
+     *  swell = BASE (SHORT_BASE for words of SHORT_GRAPHEMES or fewer) + progress * RAMP
+     *  (YouLy+ charMaxScale = 1 + (numChars <= 3 ? 0.07 : 0.05) + charProgress * 0.1), and
+     *  glow = GLOW_BASE + progress * GLOW_RAMP (YouLy+ charShadowIntensity = 0.4 + charProgress * 0.4). */
     public static final float EMPHASIS_SWELL_BASE = 0.05f;
     public static final float EMPHASIS_SWELL_SHORT_BASE = 0.07f;
     public static final int EMPHASIS_SHORT_GRAPHEMES = 3;
@@ -244,20 +247,57 @@ public final class LyricsTuning {
     public static final float EMPHASIS_GLOW_RAMP = 0.4f;
     public static final long EMPHASIS_FULL_DURATION_MS = 5000;
     public static final float EMPHASIS_RAMP_POWER = 3f;
-    /** Graphemes spread from the word's middle by (position - 0.5) * 2 * swell * SPREAD em, and
-     *  rise by swell / RISE_REF_SWELL * RISE_BOX of the glyph box height, at the peak. */
+    /** YouLy+ calculateEmphasisMetrics: a word of several syllables whose first syllable takes
+     *  less than PENALTY_THRESHOLD of the word is weakened, down to PENALTY_MIN at zero. */
+    public static final float EMPHASIS_PENALTY_THRESHOLD = 0.25f;
+    public static final float EMPHASIS_PENALTY_MIN = 0.5f;
+    /** YouLy+ applyGrowthStyles: later graphemes grow less, by up to DECAY_MAX at the last one.
+     *  The decay adds up from: words over DECAY_LONG_GRAPHEMES graphemes,
+     *  min((graphemes - LONG) / DECAY_LONG_SPAN, 1) * DECAY_LONG; words under
+     *  DECAY_SHORT_MS, max(0, 1 - (duration - MIN_DURATION) / DECAY_SHORT_SPAN_MS) * DECAY_SHORT;
+     *  and a penalty below DECAY_PENALTY_LIMIT, (1 - penalty)^DECAY_PENALTY_POWER * DECAY_PENALTY. */
+    public static final int EMPHASIS_DECAY_LONG_GRAPHEMES = 5;
+    public static final float EMPHASIS_DECAY_LONG_SPAN = 3f;
+    public static final float EMPHASIS_DECAY_LONG = 0.4f;
+    public static final long EMPHASIS_DECAY_SHORT_MS = 1500;
+    public static final float EMPHASIS_DECAY_SHORT_SPAN_MS = 500f;
+    public static final float EMPHASIS_DECAY_SHORT = 0.4f;
+    public static final float EMPHASIS_DECAY_PENALTY_LIMIT = 0.95f;
+    public static final float EMPHASIS_DECAY_PENALTY_POWER = 0.7f;
+    public static final float EMPHASIS_DECAY_PENALTY = 1.2f;
+    public static final float EMPHASIS_DECAY_MAX = 0.85f;
+    /** Graphemes spread from the word's middle by (position - 0.5) * 2 * swell * SPREAD em at the
+     *  peak (YouLy+ horizontalOffset = (position - 0.5) * 2 * ((charMaxScale - 1) * 25) px at its
+     *  25 px base font). */
     public static final float EMPHASIS_SPREAD = 1f;
-    public static final float EMPHASIS_RISE_BOX = 0.06f;
+    /** Rise at the peak: swell / RISE_REF_SWELL * RISE_PEAK_EM em (YouLy+ normalizedGrowth =
+     *  (charMaxScale - 1) / 0.13, --translate-y-peak = -normalizedGrowth * 6, which the
+     *  grow-dynamic matrix3d reads as px: 6 px at its 25 px base font, lyrics.css
+     *  --lyplus-font-size-base). After the peak the grapheme settles on the ordinary word lift
+     *  (LIFT_EM), as YouLy+ settles it on the same translateY(-3.5%) as every other sung word. */
     public static final float EMPHASIS_RISE_REF_SWELL = 0.13f;
-    /** Glow: a white drop shadow of this blur radius in em (CSS drop-shadow 0.1em). */
+    public static final float EMPHASIS_RISE_PEAK_EM = 6f / 25f;
+    /** Glow: a white drop shadow of this blur radius in em at the peak (YouLy+ grow-dynamic
+     *  drop-shadow(0 0 0.1em ...)). Its radius and opacity both grow from 0 and fade back to 0
+     *  with the swell (the 0% keyframe is drop-shadow(0 0 0 transparent), the 100% has none). Its
+     *  opacity is the glyph's own, so ahead of the fill it glows as dimly as the glyph is lit (a
+     *  CSS drop-shadow takes the element's alpha; AMLL's text-shadow sits inside the word's fill
+     *  mask). The radius steps by GLOW_RADIUS_STEP_PX. */
     public static final float EMPHASIS_GLOW_RADIUS_EM = 0.1f;
-    /** Each grapheme starts duration / STAGGER_DIVISOR / count after the previous one. */
-    public static final float EMPHASIS_STAGGER_DIVISOR = 2.5f;
-    /** Extra float per grapheme: sin-shaped, FLOAT_EM high, FLOAT_STRETCH times the duration,
-     *  starting FLOAT_LEAD_MS early. */
-    public static final float EMPHASIS_FLOAT_EM = 0.05f;
-    public static final float EMPHASIS_FLOAT_STRETCH = 1.4f;
-    public static final long EMPHASIS_FLOAT_LEAD_MS = 400;
+    public static final float EMPHASIS_GLOW_RADIUS_STEP_PX = 0.5f;
+    /** Timing, one curve for swell, spread, rise and glow together (YouLy+ _updateSyllableAnimation
+     *  and @keyframes grow-dynamic): each grapheme starts CHAR_DELAY * duration * its index after
+     *  the word starts, and runs GROW_STRETCH * duration: from rest to the peak at PEAK_START,
+     *  held to PEAK_END, and back by the end, each part along EASE (CSS ease-in-out). */
+    public static final float EMPHASIS_CHAR_DELAY = 0.09f;
+    public static final float EMPHASIS_GROW_STRETCH = 1.5f;
+    public static final float EMPHASIS_PEAK_START = 0.25f;
+    public static final float EMPHASIS_PEAK_END = 0.30f;
+    public static final float[] EMPHASIS_EASE = {0.42f, 0f, 0.58f, 1f};
+    /** The lyrics are added onto what is behind them (AMLL styles/index.css .amll-lyric-player
+     *  and YouLy+ applemusic/style.css #lyplus-patch-container: mix-blend-mode: plus-lighter), so
+     *  the white glow brightens the colour behind it. Used only while the lyrics are white. */
+    public static final boolean LYRICS_PLUS_LIGHTER = true;
 
     // --- Online lyrics (Paxsenix Apple Music TTML, songs found with the iTunes Search API) -----
     /** Waits before each retry of a passing failure (network, 5xx/429, "temporarily

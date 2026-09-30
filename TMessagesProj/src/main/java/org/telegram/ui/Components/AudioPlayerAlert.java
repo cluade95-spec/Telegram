@@ -25,7 +25,9 @@ import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.BlurMaskFilter;
 import android.graphics.Canvas;
+import android.graphics.BlendMode;
 import android.graphics.Color;
+import android.graphics.ColorMatrixColorFilter;
 import android.graphics.LinearGradient;
 import android.graphics.Matrix;
 import android.graphics.Paint;
@@ -4143,6 +4145,28 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         return moving;
     }
 
+    private boolean lyricsPlusLighter;
+
+    /**
+     * AMLL styles/index.css (.amll-lyric-player) and YouLy+ applemusic/style.css
+     * (#lyplus-patch-container) add the lyrics onto what is behind them: mix-blend-mode:
+     * plus-lighter, the platform's BlendMode.PLUS on the list's layer. That is where the glow's
+     * colour comes from: white added to the colour behind. Only while the lyrics are white, on a
+     * dark player; dark lyrics on a light player would add nothing and vanish.
+     */
+    private void updateLyricsBlend(int sweepColor) {
+        final boolean plus = LyricsTuning.LYRICS_PLUS_LIGHTER && sweepColor == Color.WHITE;
+        if (plus == lyricsPlusLighter) return;
+        lyricsPlusLighter = plus;
+        if (plus) {
+            final Paint layerPaint = new Paint();
+            layerPaint.setBlendMode(BlendMode.PLUS);
+            lyricsListView.setLayerType(View.LAYER_TYPE_HARDWARE, layerPaint);
+        } else {
+            lyricsListView.setLayerType(View.LAYER_TYPE_NONE, null);
+        }
+    }
+
     /** Paints every attached row; returns whether any of them is still animating. */
     private boolean updateLyricsDepth() {
         if (lyricsListView == null || lyricsListView.getHeight() == 0) return false;
@@ -4150,6 +4174,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         final int inactiveColor = getThemedColor(Theme.key_player_time);
         final int activeColor = getThemedColor(Theme.key_player_actionBarTitle);
         final int sweepColor = karaokeSweepColor();
+        updateLyricsBlend(sweepColor);
         boolean moving = false;
         for (int i = 0; i < lyricsListView.getChildCount(); i++) {
             final View child = lyricsListView.getChildAt(i);
@@ -5474,8 +5499,14 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         /** A syllable of the word qualifies for emphasis on its own (AMLL lyric-line.ts chunk.some). */
         private boolean[] wordSyllableEmphasis = new boolean[8];
         private int[] wordGraphemes = new int[8];
-        private float[] wordAmount = new float[8];
-        private float[] wordGlow = new float[8];
+        /** YouLy+ calculateEmphasisMetrics: easedProgress and penaltyFactor, and applyGrowthStyles
+         *  maxDecayRate, per word. */
+        private float[] wordProgress = new float[8];
+        private float[] wordPenalty = new float[8];
+        private float[] wordDecay = new float[8];
+        /** Syllables in the word, and how long its first one counts as sung (emphasisWindowMs). */
+        private int[] wordSyllables = new int[8];
+        private long[] wordFirstSyllableMs = new long[8];
         private long[] wordEmphasisMs = new long[8];
         /** Where the word's emphasis is measured to (emphasisWindowMs), which may be later than its fill end. */
         private long[] wordEmphasisEndMs = new long[8];
@@ -5504,10 +5535,12 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         private int[] runLine = new int[4];
         private boolean[] runRtl = new boolean[4];
         private final TextPaint drawPaint = new TextPaint();
-        /** The emphasis glow's blur, made once per radius (the radius only follows the text size). */
-        private BlurMaskFilter glowFilter;
-        private float glowFilterRadius;
         private float glowAlpha;
+        /** Share of the full glow radius (it grows and fades with the glow). */
+        private float glowShare;
+        /** Glow blurs by radius step, for this text size. */
+        private BlurMaskFilter[] glowFilters = new BlurMaskFilter[0];
+        private float glowFiltersTextSize;
         /** Offset where the background vocals line starts, or MAX_VALUE when there is none. */
         private int backgroundStart = Integer.MAX_VALUE;
         /** How much of the background vocals line shows: the row's focus (hidden while inactive). */
@@ -5526,8 +5559,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         private RenderNode[] clusterNodes = new RenderNode[0];
         /** Room around a node's glyphs for overhangs and the emphasis glow, px. */
         private int nodePad;
-        private final float[] emphasisA = new float[4];
-        private final float[] emphasisB = new float[4];
+        private final float[] emphasisA = new float[5];
+        private final float[] emphasisB = new float[5];
 
 
         LyricsTextView(Context context) {
@@ -5685,6 +5718,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                         }
                     }
                     wordSyllableEmphasis[wordCount] = syllable;
+                    wordSyllables[wordCount] = last - i + 1;
+                    wordFirstSyllableMs[wordCount] = emphasisWindowMs(text, segments, order, i, n, nextLineTimeMs);
                     wordCount++;
                 }
                 i = last + 1;
@@ -5754,15 +5789,18 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             wordEmphasisLive = java.util.Arrays.copyOf(wordEmphasisLive, grown);
             wordSyllableEmphasis = java.util.Arrays.copyOf(wordSyllableEmphasis, grown);
             wordGraphemes = java.util.Arrays.copyOf(wordGraphemes, grown);
-            wordAmount = java.util.Arrays.copyOf(wordAmount, grown);
-            wordGlow = java.util.Arrays.copyOf(wordGlow, grown);
+            wordProgress = java.util.Arrays.copyOf(wordProgress, grown);
+            wordPenalty = java.util.Arrays.copyOf(wordPenalty, grown);
+            wordDecay = java.util.Arrays.copyOf(wordDecay, grown);
+            wordSyllables = java.util.Arrays.copyOf(wordSyllables, grown);
+            wordFirstSyllableMs = java.util.Arrays.copyOf(wordFirstSyllableMs, grown);
             wordEmphasisMs = java.util.Arrays.copyOf(wordEmphasisMs, grown);
             wordEmphasisEndMs = java.util.Arrays.copyOf(wordEmphasisEndMs, grown);
         }
 
         /**
          * Maps graphemes to words and decides which words are emphasised (AMLL
-         * LyricLineBase.shouldEmphasize and calculateEmphasizeParams). Needs the graphemes, so it
+         * LyricLineBase.shouldEmphasize) and how strongly (YouLy+ calculateEmphasisMetrics). Needs the graphemes, so it
          * runs once they exist, once per bind.
          */
         private void mapWords() {
@@ -5807,15 +5845,37 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                         && qualifiesForEmphasis(karaokeTextStr, wordTextStart[i], wordTextEnd[i], duration);
                 wordEmphasis[i] = wordTextStart[i] < backgroundStart && (build5 || whole || single);
                 if (!wordEmphasis[i]) continue;
-                // YouLy+ calculateEmphasisMetrics / applyGrowthStyles: every qualifying word gets
-                // a clearly visible base swell and glow, and longer ones add more on a cubic.
+                // YouLy+ calculateEmphasisMetrics: every qualifying word gets a clearly visible
+                // base swell and glow, and longer ones add more on a cubic...
                 float p = (duration - LyricsTuning.EMPHASIS_MIN_DURATION_MS)
                         / (float) (LyricsTuning.EMPHASIS_FULL_DURATION_MS - LyricsTuning.EMPHASIS_MIN_DURATION_MS);
-                p = (float) Math.pow(Math.max(0f, Math.min(1f, p)), LyricsTuning.EMPHASIS_RAMP_POWER);
-                final float base = graphemes <= LyricsTuning.EMPHASIS_SHORT_GRAPHEMES
-                        ? LyricsTuning.EMPHASIS_SWELL_SHORT_BASE : LyricsTuning.EMPHASIS_SWELL_BASE;
-                wordAmount[i] = base + p * LyricsTuning.EMPHASIS_SWELL_RAMP;
-                wordGlow[i] = LyricsTuning.EMPHASIS_GLOW_BASE + p * LyricsTuning.EMPHASIS_GLOW_RAMP;
+                wordProgress[i] = (float) Math.pow(Math.max(0f, Math.min(1f, p)), LyricsTuning.EMPHASIS_RAMP_POWER);
+                // ...less when the first of several syllables is short (penaltyFactor)...
+                float penalty = 1f;
+                if (wordSyllables[i] > 1 && duration > 0) {
+                    final float imbalance = wordFirstSyllableMs[i] / (float) duration;
+                    if (imbalance < LyricsTuning.EMPHASIS_PENALTY_THRESHOLD) {
+                        penalty = LyricsTuning.EMPHASIS_PENALTY_MIN + (1f - LyricsTuning.EMPHASIS_PENALTY_MIN)
+                                * (imbalance / LyricsTuning.EMPHASIS_PENALTY_THRESHOLD);
+                    }
+                }
+                wordPenalty[i] = penalty;
+                // ...and applyGrowthStyles: later graphemes of a long, short or unbalanced word
+                // grow less (maxDecayRate).
+                float decay = 0f;
+                if (graphemes > LyricsTuning.EMPHASIS_DECAY_LONG_GRAPHEMES) {
+                    decay += Math.min((graphemes - LyricsTuning.EMPHASIS_DECAY_LONG_GRAPHEMES)
+                            / LyricsTuning.EMPHASIS_DECAY_LONG_SPAN, 1f) * LyricsTuning.EMPHASIS_DECAY_LONG;
+                }
+                if (duration < LyricsTuning.EMPHASIS_DECAY_SHORT_MS) {
+                    decay += Math.max(0f, 1f - (duration - LyricsTuning.EMPHASIS_MIN_DURATION_MS)
+                            / LyricsTuning.EMPHASIS_DECAY_SHORT_SPAN_MS) * LyricsTuning.EMPHASIS_DECAY_SHORT;
+                }
+                if (penalty < LyricsTuning.EMPHASIS_DECAY_PENALTY_LIMIT) {
+                    decay += (float) Math.pow(1f - penalty, LyricsTuning.EMPHASIS_DECAY_PENALTY_POWER)
+                            * LyricsTuning.EMPHASIS_DECAY_PENALTY;
+                }
+                wordDecay[i] = Math.min(decay, LyricsTuning.EMPHASIS_DECAY_MAX);
                 wordEmphasisMs[i] = duration;
             }
         }
@@ -5863,15 +5923,11 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             final float previousBlend = blendWeight;
             blendWeight = seekBlend(nowNanos);
             final boolean blending = blendWeight < 1f;
-            final float maxLift = Math.round(LyricsTuning.LIFT_EM * LyricsTuning.LIFT_MULTIPLIER * getTextSize());
-            // Background vocals rise relative to their own smaller size, twice as far (AMLL).
-            final float maxBackgroundLift = Math.round(LyricsTuning.LIFT_EM * LyricsTuning.LIFT_MULTIPLIER * getTextSize()
-                    * LyricsTuning.BACKGROUND_VOCALS_SCALE * LyricsTuning.LIFT_BACKGROUND_MULTIPLIER);
             boolean changed = blending || previousBlend < 1f;
             for (int w = 0; w < wordCount; w++) {
                 float lift = wordLift(w, positionMs);
                 if (blending) lift = lerp(wordLift(w, blendFromMs), lift, blendWeight);
-                final float px = lift * (wordTextStart[w] >= backgroundStart ? maxBackgroundLift : maxLift);
+                final float px = lift * wordLiftMaxPx(w);
                 if (px != wordLiftPx[w]) {
                     wordLiftPx[w] = px;
                     changed = true;
@@ -5883,6 +5939,14 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 }
             }
             if (changed) invalidate();
+        }
+
+        /** A word's full ordinary lift in whole pixels. Background vocals rise relative to their own
+         *  smaller size, twice as far (AMLL). */
+        private float wordLiftMaxPx(int w) {
+            final float lift = LyricsTuning.LIFT_EM * LyricsTuning.LIFT_MULTIPLIER * getTextSize();
+            return Math.round(wordTextStart[w] >= backgroundStart
+                    ? lift * LyricsTuning.BACKGROUND_VOCALS_SCALE * LyricsTuning.LIFT_BACKGROUND_MULTIPLIER : lift);
         }
 
         /** 0 right after a jump, rising to 1 along a critically damped curve over SEEK_BLEND_MS. */
@@ -5931,29 +5995,31 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             return Math.max(0f, (2f * u3 - 3f * u2 + 1f) * top + (u3 - 2f * u2 + u) * Math.max(0f, slope));
         }
 
-        private long emphasisStepMs(int w) {
-            return Math.round(wordEmphasisMs[w] / LyricsTuning.EMPHASIS_STAGGER_DIVISOR / Math.max(1, wordGraphemes[w]));
+        /** When grapheme {@code i} of word {@code w} starts to grow (YouLy+: duration * 0.09 * index). */
+        private long emphasisDelayMs(int w, int i) {
+            return wordStartMs[w] + Math.round(wordEmphasisMs[w] * LyricsTuning.EMPHASIS_CHAR_DELAY * i);
         }
 
         private boolean emphasisLive(int w, long p) {
-            final long first = wordStartMs[w] - LyricsTuning.EMPHASIS_FLOAT_LEAD_MS;
-            final long last = wordStartMs[w] + emphasisStepMs(w) * Math.max(0, wordGraphemes[w] - 1)
-                    + (long) (wordEmphasisMs[w] * Math.max(1f, LyricsTuning.EMPHASIS_FLOAT_STRETCH));
-            return p >= first && p <= last;
+            final long last = emphasisDelayMs(w, Math.max(0, wordGraphemes[w] - 1))
+                    + (long) (wordEmphasisMs[w] * LyricsTuning.EMPHASIS_GROW_STRETCH);
+            return p >= wordStartMs[w] && p <= last;
         }
 
         /**
-         * AMLL makeEmpEasing(0.5): up along cubic-bezier(0.2, 0.4, 0.58, 1) in the first half,
-         * back down along 1 - cubic-bezier(0.3, 0, 0.58, 1) in the second.
+         * YouLy+ @keyframes grow-dynamic, as a share of the peak: 0 at 0%, 1 from PEAK_START to
+         * PEAK_END, 0 again at 100%, each part along CSS ease-in-out (a CSS animation's timing
+         * function applies to every keyframe interval).
          */
-        private static float emphasisEase(float x) {
-            if (x <= 0f || x >= 1f) return 0f;
-            if (x < 0.5f) return EMPHASIS_IN.getInterpolation(x / 0.5f);
-            return 1f - EMPHASIS_OUT.getInterpolation((x - 0.5f) / 0.5f);
+        private static float growPeakShare(float t) {
+            if (t <= 0f || t >= 1f) return 0f;
+            if (t < LyricsTuning.EMPHASIS_PEAK_START) return EMPHASIS_EASE.getInterpolation(t / LyricsTuning.EMPHASIS_PEAK_START);
+            if (t <= LyricsTuning.EMPHASIS_PEAK_END) return 1f;
+            return 1f - EMPHASIS_EASE.getInterpolation((t - LyricsTuning.EMPHASIS_PEAK_END) / (1f - LyricsTuning.EMPHASIS_PEAK_END));
         }
 
-        private static final CubicBezierInterpolator EMPHASIS_IN = new CubicBezierInterpolator(0.2, 0.4, 0.58, 1.0);
-        private static final CubicBezierInterpolator EMPHASIS_OUT = new CubicBezierInterpolator(0.3, 0.0, 0.58, 1.0);
+        private static final CubicBezierInterpolator EMPHASIS_EASE = new CubicBezierInterpolator(
+                LyricsTuning.EMPHASIS_EASE[0], LyricsTuning.EMPHASIS_EASE[1], LyricsTuning.EMPHASIS_EASE[2], LyricsTuning.EMPHASIS_EASE[3]);
 
         /**
          * Counts grapheme clusters in [{@code start}, {@code end}) whose start codepoint is not
@@ -6481,11 +6547,10 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         }
 
         /**
-         * AMLL createEmphasizeAnimation timing with YouLy+ strength, per grapheme: a swell, a push
-         * away from the word's middle, a small rise, a white glow, and an extra sin-shaped float
-         * that starts EMPHASIS_FLOAT_LEAD_MS early. Each grapheme is drawn once, at full size, into
-         * its own layer, and the layer carries the motion. During a seek crossfade the state is
-         * blended between the old position and the new one.
+         * YouLy+ grow-dynamic, per grapheme: a swell, a push away from the word's middle, a rise
+         * and a white glow, all on one curve (emphasisAt). Each grapheme is drawn once, at full
+         * size, into its own layer, and the layer carries the motion. During a seek crossfade the
+         * state is blended between the old position and the new one.
          */
         private void drawEmphasisPiece(Canvas canvas, int p, int w, int line, int contextStart, int contextEnd,
                                        float baseline, float lift, boolean rtl, boolean layers) {
@@ -6506,13 +6571,14 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 emphasisAt(w, i, wordClockMs, emphasisA);
                 if (blending) {
                     emphasisAt(w, i, blendFromMs, emphasisB);
-                    for (int k = 0; k < 4; k++) emphasisA[k] = lerp(emphasisB[k], emphasisA[k], blendWeight);
+                    for (int k = 0; k < 5; k++) emphasisA[k] = lerp(emphasisB[k], emphasisA[k], blendWeight);
                 }
                 final float scale = emphasisA[0];
                 // Logical order: in an RTL word the first grapheme is on the right.
                 final float spread = rtl ? -emphasisA[1] : emphasisA[1];
-                final float rise = emphasisA[2] + lift;
+                final float rise = emphasisA[2];
                 glowAlpha = emphasisA[3] > 0.004f ? Math.min(1f, emphasisA[3]) : 0f;
+                glowShare = emphasisA[4];
                 final float pivotX = (clusterLeft[c] + clusterRight[c]) / 2f;
                 if (layers) {
                     drawInNode(canvas, clusterNode(c), start, end, contextStart, contextEnd,
@@ -6531,52 +6597,84 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
 
         /**
          * The emphasis glow, as its own pass under the glyph: the grapheme's shape blurred, in
-         * white at glowAlpha. It used to be a shadow layer on the glyph's own paint, and a shadow
-         * keeps the paint's shader: in the middle of a line the fill gradient covers the whole
-         * visual line (one run), so the glow came out in the gradient's colours, mostly the
-         * unsung 40%, and read as nothing. Only once the fill had left the line (its last word)
-         * was the paint a flat colour and the glow white. This pass never carries the fill.
+         * white. Its opacity is glowAlpha times the glyph's own at each point, fill included, as
+         * a CSS drop-shadow takes the opacity of what it shadows (YouLy+) and AMLL's text-shadow
+         * sits inside the word's fill mask: ahead of the fill it glows as dimly as the glyph is
+         * lit. Its radius grows and fades with it (glowShare).
          */
         private void drawGlow(Canvas canvas, int start, int end, int contextStart, int contextEnd,
                               float x, float baseline, boolean rtl) {
             // CSS drop-shadow blur is twice the Gaussian sigma; BlurMaskFilter takes a radius,
             // sigma = BLUR_SIGMA_SCALE * r + BLUR_SIGMA_BIAS.
-            final float sigma = LyricsTuning.EMPHASIS_GLOW_RADIUS_EM * getTextSize() / 2f;
-            final float radius = Math.max(0.5f, (sigma - LyricsTuning.BLUR_SIGMA_BIAS) / LyricsTuning.BLUR_SIGMA_SCALE);
-            if (glowFilter == null || glowFilterRadius != radius) {
-                glowFilter = new BlurMaskFilter(radius, BlurMaskFilter.Blur.NORMAL);
-                glowFilterRadius = radius;
+            final float sigma = LyricsTuning.EMPHASIS_GLOW_RADIUS_EM * getTextSize() / 2f * Math.max(0f, Math.min(1f, glowShare));
+            final float radius = (sigma - LyricsTuning.BLUR_SIGMA_BIAS) / LyricsTuning.BLUR_SIGMA_SCALE;
+            final int step = radius <= 0f ? 0 : Math.round(radius / LyricsTuning.EMPHASIS_GLOW_RADIUS_STEP_PX);
+            if (glowFiltersTextSize != getTextSize()) {
+                glowFilters = new BlurMaskFilter[0];
+                glowFiltersTextSize = getTextSize();
             }
-            final Shader shader = drawPaint.getShader();
-            final int color = drawPaint.getColor();
-            drawPaint.setShader(null);
-            drawPaint.setColor(Color.argb(Math.round(glowAlpha * 255), 255, 255, 255));
-            drawPaint.setMaskFilter(glowFilter);
+            BlurMaskFilter filter = null;
+            if (step > 0) {
+                if (step >= glowFilters.length) glowFilters = java.util.Arrays.copyOf(glowFilters, step + 1);
+                if (glowFilters[step] == null) {
+                    glowFilters[step] = new BlurMaskFilter(step * LyricsTuning.EMPHASIS_GLOW_RADIUS_STEP_PX, BlurMaskFilter.Blur.NORMAL);
+                }
+                filter = glowFilters[step];
+            }
+            final int alpha = drawPaint.getAlpha();
+            drawPaint.setAlpha(Math.round(alpha * glowAlpha));
+            drawPaint.setColorFilter(GLOW_WHITE);
+            drawPaint.setMaskFilter(filter);
             canvas.drawTextRun(karaokeTextStr, start, end, contextStart, contextEnd, x, baseline, rtl, drawPaint);
             drawPaint.setMaskFilter(null);
-            drawPaint.setColor(color);
-            drawPaint.setShader(shader);
+            drawPaint.setColorFilter(null);
+            drawPaint.setAlpha(alpha);
         }
 
-        /** One grapheme's emphasis at clock {@code now}: scale, spread (logical), rise, glow alpha. */
+        /** Any colour to white, its opacity kept (the fill's colour is always the lyric colour). */
+        private static final ColorMatrixColorFilter GLOW_WHITE = new ColorMatrixColorFilter(new float[]{
+                0, 0, 0, 0, 255,
+                0, 0, 0, 0, 255,
+                0, 0, 0, 0, 255,
+                0, 0, 0, 1, 0});
+
+        /**
+         * One grapheme's emphasis at clock {@code now}: scale, spread (logical), rise (the whole
+         * rise, the word's ordinary lift included), glow opacity and glow radius share. YouLy+
+         * grow-dynamic: one curve carries all of them, so the glow comes and goes with the rise.
+         * The rise goes from rest to its peak with the swell and then, instead of back to rest,
+         * settles on the word's ordinary lift, where YouLy+ leaves every sung word.
+         */
         private void emphasisAt(int w, int i, long now, float[] out) {
             final float em = getTextSize();
             final int n = Math.max(1, wordGraphemes[w]);
             final long du = Math.max(1L, wordEmphasisMs[w]);
-            final float swell = wordAmount[w];
-            final long delay = wordStartMs[w] + emphasisStepMs(w) * i;
-            final float t = emphasisEase((now - delay) / (float) du);
-            final long floatStart = delay - LyricsTuning.EMPHASIS_FLOAT_LEAD_MS;
-            final float fx = (now - floatStart) / (du * LyricsTuning.EMPHASIS_FLOAT_STRETCH);
-            final float floatUp = fx > 0f && fx < 1f ? (float) Math.sin(fx * Math.PI) * LyricsTuning.EMPHASIS_FLOAT_EM * em : 0f;
-            // YouLy+ grow-dynamic at its peak: scale 1 + swell, each grapheme pushed out from the
-            // word's middle by (position - 0.5) * 2 * swell em, and lifted by a share of its box.
+            // YouLy+ applyGrowthStyles, per grapheme.
+            final float positionInWord = n > 1 ? i / (float) (n - 1) : 0f;
+            final float progress = wordProgress[w] * wordPenalty[w] * (1f - positionInWord * wordDecay[w]);
+            final float base = n <= LyricsTuning.EMPHASIS_SHORT_GRAPHEMES
+                    ? LyricsTuning.EMPHASIS_SWELL_SHORT_BASE : LyricsTuning.EMPHASIS_SWELL_BASE;
+            final float swell = base + progress * LyricsTuning.EMPHASIS_SWELL_RAMP;
+            final float glow = LyricsTuning.EMPHASIS_GLOW_BASE + progress * LyricsTuning.EMPHASIS_GLOW_RAMP;
+            final float peakRise = swell / LyricsTuning.EMPHASIS_RISE_REF_SWELL * LyricsTuning.EMPHASIS_RISE_PEAK_EM * em;
+            final float rest = wordLift(w, now) * wordLiftMaxPx(w);
+            final float t = (now - emphasisDelayMs(w, i)) / (du * LyricsTuning.EMPHASIS_GROW_STRETCH);
+            final float k = growPeakShare(t);
             final float position = (i + 0.5f) / n;
-            out[0] = 1f + t * swell;
-            out[1] = t * (position - 0.5f) * 2f * swell * LyricsTuning.EMPHASIS_SPREAD * em;
-            out[2] = t * swell / LyricsTuning.EMPHASIS_RISE_REF_SWELL * LyricsTuning.EMPHASIS_RISE_BOX
-                    * (fillMetrics.descent - fillMetrics.ascent) + floatUp;
-            out[3] = t * wordGlow[w];
+            out[0] = 1f + k * swell;
+            out[1] = k * (position - 0.5f) * 2f * swell * LyricsTuning.EMPHASIS_SPREAD * em;
+            if (t <= 0f) {
+                out[2] = 0f;
+            } else if (t <= LyricsTuning.EMPHASIS_PEAK_END) {
+                out[2] = k * peakRise;
+            } else if (t < 1f) {
+                out[2] = peakRise + (rest - peakRise) * EMPHASIS_EASE.getInterpolation(
+                        (t - LyricsTuning.EMPHASIS_PEAK_END) / (1f - LyricsTuning.EMPHASIS_PEAK_END));
+            } else {
+                out[2] = rest;
+            }
+            out[3] = k * glow;
+            out[4] = k;
         }
 
         /** Returns the row to plain, uniformly coloured text, clearing any long-note emphasis. */
