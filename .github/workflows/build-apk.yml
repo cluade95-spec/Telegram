@@ -114,35 +114,48 @@ jobs:
       - name: Record build runner resources
         run: |
           mkdir -p build-diagnostics
+          echo "CCACHE_DIR=$RUNNER_TEMP/telegram-ccache" >> "$GITHUB_ENV"
+          echo "CCACHE_CONFIGPATH=$RUNNER_TEMP/telegram-ccache.conf" >> "$GITHUB_ENV"
           { uname -a; lscpu; nproc; free -m; df -h .; java -version; } > build-diagnostics/runner.txt 2>&1
           cat build-diagnostics/runner.txt
 
-      # This is the app javac task observed in the successful AfatStandalone build.
-      # Its compile classpath builds TMessagesProj's standalone compile JAR, so it
-      # also compiles the shared Java source and generated Lottie metadata. Neither
-      # Android module applies Kotlin. Native compilation, R8 and APK packaging
-      # remain in assemble below. Keep the same workspace; do not clean between steps.
-      - name: Compile production standalone QA Java
+      - name: Prepare native compiler cache
+        id: native-key
         run: |
-          /usr/bin/time -v -o build-diagnostics/compile-time.txt \
-            ./gradlew :TMessagesProj_AppStandalone:compileAfatStandaloneJavaWithJavac \
-            --no-daemon --profile --info --console=plain
-          mkdir -p build-diagnostics/compile-profile
-          cp -r build/reports/profile/. build-diagnostics/compile-profile/
+          sudo apt-get update -qq
+          sudo apt-get install -y ccache
+          ccache --version
+          printf '%s\n' 'compiler_check = content' 'max_size = 5G' \
+            'sloppiness =' 'hash_dir = true' > "$CCACHE_CONFIGPATH"
+          python3 .github/scripts/qa-native-key.py >> "$GITHUB_OUTPUT"
+          ccache --show-config > build-diagnostics/ccache-config.txt
 
-      # TMessagesProj_AppStandalone's standalone build type: debuggable false, jniDebuggable
-      # false, minifyEnabled true, release proguard rules, release keystore, and the ordinary
-      # production Telegram runtime - so no Debug/Test Backend UI. The regular release variant of
-      # TMessagesProj_App is deliberately NOT built: its applicationId is org.telegram.messenger,
-      # the Google Play Telegram package.
-      - name: Build production standalone QA APK
+      # Exact input key, with no fallback keys. Ccache validates compiler/source/header
+      # contents and arguments again on every hit. No .cxx directories or .so files
+      # are restored; Ninja generates a fresh graph and links on every runner.
+      - name: Restore native compiler cache
+        id: native-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ steps.native-key.outputs.key }}
+
+      # Request both tasks in one invocation. The CI init script explicitly orders
+      # native configure/build tasks after the Java gate even with parallel mode on.
+      # Gradle executes shared dependencies once; a Java failure aborts before native
+      # compilation. Preserve standalone minification, release signing and all ABIs.
+      - name: Compile Java then build production standalone QA APK
         run: |
+          ccache --zero-stats
           vmstat -t 10 > build-diagnostics/vmstat.txt &
           monitor_pid=$!
           trap 'kill "$monitor_pid" 2>/dev/null || true' EXIT
-          /usr/bin/time -v -o build-diagnostics/assemble-time.txt \
-            ./gradlew :TMessagesProj_AppStandalone:assembleAfatStandalone \
-            --no-daemon --profile --info --console=plain
+          # GNU time measures wrapper wall time; vmstat includes daemon/worker CPU.
+          /usr/bin/time -v -o build-diagnostics/build-time.txt \
+            ./gradlew :TMessagesProj_AppStandalone:compileAfatStandaloneJavaWithJavac \
+            :TMessagesProj_AppStandalone:assembleAfatStandalone \
+            --init-script .github/scripts/qa-build.gradle \
+            --no-daemon --profile --console=plain
 
       - name: Collect APK
         run: |
@@ -209,6 +222,36 @@ jobs:
           fi
           echo "OK: signed with the repository release keystore"
 
+      - name: Verify required native ABIs and record hashes
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          import zipfile
+
+          expected = {"arm64-v8a", "armeabi-v7a", "x86", "x86_64"}
+          with zipfile.ZipFile("Telegram-Lyrics-QA.apk") as apk:
+              names = apk.namelist()
+              actual = {name.split("/")[1] for name in names if name.startswith("lib/") and name.endswith(".so")}
+              if actual != expected:
+                  raise SystemExit(f"Required ABIs differ: {sorted(actual)}")
+              hashes = {}
+              for abi in sorted(expected):
+                  name = f"lib/{abi}/libtmessages.49.so"
+                  hashes[name] = hashlib.sha256(apk.read(name)).hexdigest()
+              Path("build-diagnostics/native-apk-hashes.json").write_text(json.dumps(hashes, indent=2))
+              print("OK: all four required ABIs contain libtmessages.49.so")
+          PY
+
+      # Save only after the complete APK and certificate checks passed.
+      - name: Save native compiler cache
+        if: success() && steps.native-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ steps.native-key.outputs.key }}
+
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
@@ -226,6 +269,11 @@ jobs:
           fi
           find TMessagesProj/.cxx -type f \( -name .ninja_log -o -name build_command.txt -o -name CMakeCache.txt \) \
             -exec cp --parents '{}' build-diagnostics/ \; 2>/dev/null || true
+          if command -v ccache >/dev/null; then
+            ccache --show-stats > build-diagnostics/ccache-stats.txt
+            ccache --print-stats > build-diagnostics/ccache-counters.txt
+            cat build-diagnostics/ccache-stats.txt
+          fi
           cat build-diagnostics/*-time.txt 2>/dev/null || true
 
       - name: Upload build timing reports
