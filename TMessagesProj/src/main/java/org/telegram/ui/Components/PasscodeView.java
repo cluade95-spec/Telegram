@@ -30,6 +30,9 @@ import android.os.SystemClock;
 import android.text.Editable;
 import android.text.InputFilter;
 import android.text.InputType;
+import android.text.SpannableString;
+import android.text.Spanned;
+import android.text.style.AbsoluteSizeSpan;
 import android.text.TextUtils;
 import android.text.TextWatcher;
 import android.text.method.PasswordTransformationMethod;
@@ -63,6 +66,7 @@ import androidx.dynamicanimation.animation.SpringForce;
 import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.ApplicationLoader;
 import org.telegram.messenger.BotWebViewVibrationEffect;
+import org.telegram.messenger.ChatLockLayout;
 import org.telegram.messenger.FileLog;
 import org.telegram.messenger.FingerprintController;
 import org.telegram.messenger.LocaleController;
@@ -106,8 +110,10 @@ public class PasscodeView extends FrameLayout implements NotificationCenter.Noti
 
     /**
      * Chat authentication mode: the same unlock screen (keypad, digit animations, biometrics,
-     * retry throttling) shown inside a floating card for a single protected chat. It verifies the
-     * shared credential through {@link ProtectedChatsState} and never touches the app lock state.
+     * retry throttling) shown inside the bottom popup of a single protected chat. Its layout comes
+     * from {@link ChatLockLayout} (the height the popup is offered), not from the display size used
+     * by the full-screen app lock. It verifies the shared credential through {@link ProtectedChatsState}
+     * and never touches the app lock state.
      */
     public interface ChatLockListener {
         void onAuthenticated(ProtectedChatsState.AuthProof proof);
@@ -128,10 +134,21 @@ public class PasscodeView extends FrameLayout implements NotificationCenter.Noti
         unlockTitleView.setEllipsize(TextUtils.TruncateAt.END);
         passcodeTextView.setSingleLine(true);
         passcodeTextView.setEllipsize(TextUtils.TruncateAt.END);
+        // Label shown instead of the digits while the system biometric prompt is up: centred in the digits band.
         LayoutParams lp = (LayoutParams) passcodeTextView.getLayoutParams();
-        lp.bottomMargin = dp(CHAT_LOCK_PASSWORD_FRAME_HEIGHT - 120);
+        lp.bottomMargin = dp(14);
         lp.leftMargin = lp.rightMargin = dp(24);
         passcodeTextView.setLayoutParams(lp);
+        // The digits sit at the bottom of their band (the full-screen layout leaves 46dp below them).
+        lp = (LayoutParams) passwordEditText2.getLayoutParams();
+        lp.bottomMargin = 0;
+        lp.leftMargin = lp.rightMargin = dp(40);
+        passwordEditText2.setLayoutParams(lp);
+        // Password mode has no title area: the chat name is the hint, small compared to the 36sp input.
+        SpannableString hint = new SpannableString(title);
+        hint.setSpan(new AbsoluteSizeSpan(16, true), 0, hint.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        passwordEditText.setHint(hint);
+        passwordEditText.setHintTextColor(0x99ffffff);
     }
 
     public boolean isChatLockMode() {
@@ -150,10 +167,7 @@ public class PasscodeView extends FrameLayout implements NotificationCenter.Noti
         }, 350);
     }
 
-    public static final int CHAT_LOCK_PASSWORD_FRAME_HEIGHT = 180;
-    public static final int CHAT_LOCK_HEADER_MARGIN = 60;
-    public static final int CHAT_LOCK_PIN_CARD_HEIGHT = CHAT_LOCK_PASSWORD_FRAME_HEIGHT + CHAT_LOCK_HEADER_MARGIN + 60 * 4 + 16 * 3;
-    public static final int CHAT_LOCK_PASSWORD_CARD_HEIGHT = 250;
+    private ChatLockLayout chatLockLayout;
 
     private final int BUTTON_X_MARGIN = 28;
     private final int BUTTON_Y_MARGIN = 16;
@@ -1673,31 +1687,52 @@ public class PasscodeView extends FrameLayout implements NotificationCenter.Noti
         }
 
         if (chatLockMode) {
+            // Popup layout: derived from the height the sheet offers, not from the display size.
             final boolean pin = SharedConfig.passcodeType == SharedConfig.PASSCODE_TYPE_PIN;
+            final int offered = MeasureSpec.getMode(heightMeasureSpec) == MeasureSpec.UNSPECIFIED ? AndroidUtilities.displaySize.y : MeasureSpec.getSize(heightMeasureSpec);
+            final ChatLockLayout metrics = chatLockLayout = ChatLockLayout.compute((int) (offered / AndroidUtilities.density), pin);
+            final int totalPx = dp(metrics.totalHeight);
+
+            imageView.setVisibility(metrics.showIcon ? VISIBLE : GONE);
             imageView.setTranslationX(width / 2f - dp(29));
+            imageView.setTranslationY(imageY = dp(metrics.iconTop()));
+            final int textMax = Math.max(dp(120), width - dp(48));
+            unlockTitleView.setMaxWidth(textMax);
+            subtitleView.setMaxWidth(textMax);
+            passcodeTextView.setMaxWidth(textMax);
 
             layoutParams = (LayoutParams) passwordFrameLayout.getLayoutParams();
             layoutParams.width = width;
             layoutParams.leftMargin = 0;
             layoutParams.topMargin = 0;
-            layoutParams.height = pin ? dp(CHAT_LOCK_PASSWORD_FRAME_HEIGHT) : MeasureSpec.getSize(heightMeasureSpec);
+            layoutParams.height = pin ? dp(metrics.digitsTop + ChatLockLayout.DIGITS_HEIGHT) : totalPx;
             passwordFrameLayout.setLayoutParams(layoutParams);
-            final int passwordBottom = layoutParams.height;
 
-            int cols = 3;
-            int rows = 4;
             layoutParams = (LayoutParams) numbersFrameLayout.getLayoutParams();
-            layoutParams.height = dp(CHAT_LOCK_HEADER_MARGIN) + buttonSize * rows + sizeBetweenNumbersY * Math.max(0, rows - 1);
-            layoutParams.width = buttonSize * cols + sizeBetweenNumbersX * Math.max(0, cols - 1);
+            layoutParams.height = dp(metrics.headerHeight + metrics.keysHeight());
+            layoutParams.width = dp(metrics.keysWidth());
             layoutParams.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
             numbersFrameLayout.setLayoutParams(layoutParams);
 
             layoutParams = (LayoutParams) numbersContainer.getLayoutParams();
             layoutParams.leftMargin = 0;
-            layoutParams.topMargin = passwordBottom;
+            layoutParams.topMargin = dp(metrics.digitsTop);
             layoutParams.width = width;
             layoutParams.height = ViewGroup.LayoutParams.MATCH_PARENT;
             numbersContainer.setLayoutParams(layoutParams);
+
+            for (int a = 0; a < 12; a++) {
+                int num = a == 0 ? 10 : a == 10 ? 11 : a == 11 ? 9 : a - 1;
+                int row = num / 3;
+                int col = num % 3;
+                LayoutParams keyParams = (LayoutParams) numberFrameLayouts.get(a).getLayoutParams();
+                keyParams.width = keyParams.height = dp(metrics.buttonSize);
+                keyParams.topMargin = dp(metrics.headerHeight) + dp(metrics.buttonSize + metrics.gapY) * row;
+                keyParams.leftMargin = dp(metrics.buttonSize + metrics.gapX) * col;
+                numberFrameLayouts.get(a).setLayoutParams(keyParams);
+            }
+            super.onMeasure(widthMeasureSpec, MeasureSpec.makeMeasureSpec(totalPx, MeasureSpec.EXACTLY));
+            return;
         } else if (landscape) {
             imageView.setTranslationX((SharedConfig.passcodeType == SharedConfig.PASSCODE_TYPE_PIN ? width / 2f : width) / 2 - dp(29));
 
@@ -1770,7 +1805,7 @@ public class PasscodeView extends FrameLayout implements NotificationCenter.Noti
             numbersContainer.setLayoutParams(layoutParams);
         }
 
-        int headerMargin = chatLockMode ? dp(CHAT_LOCK_HEADER_MARGIN) : dp(landscape ? 52 : 82);
+        int headerMargin = dp(landscape ? 52 : 82);
         for (int a = 0; a < 12; a++) {
             LayoutParams layoutParams1;
             int num;
@@ -1801,7 +1836,7 @@ public class PasscodeView extends FrameLayout implements NotificationCenter.Noti
     protected void onLayout(boolean changed, int left, int top, int right, int bottom) {
         if (chatLockMode) {
             super.onLayout(changed, left, top, right, bottom);
-            imageView.setTranslationY(imageY = dp(10));
+            imageView.setTranslationY(imageY = dp(ChatLockLayout.ICON_TOP));
             return;
         }
         View rootView = getRootView();

@@ -1,19 +1,17 @@
 package org.telegram.ui;
 
-import android.app.Dialog;
 import android.content.Context;
-import android.text.TextUtils;
+import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.FrameLayout;
-import android.widget.TextView;
 
 import androidx.annotation.NonNull;
-import androidx.recyclerview.widget.DefaultItemAnimator;
 import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 
 import org.telegram.messenger.LocaleController;
+import org.telegram.messenger.NotificationCenter;
 import org.telegram.messenger.ProtectedChats;
 import org.telegram.messenger.ProtectedChatsState;
 import org.telegram.messenger.R;
@@ -24,36 +22,50 @@ import org.telegram.ui.ActionBar.Theme;
 import org.telegram.ui.Cells.TextCheckCell;
 import org.telegram.ui.Cells.TextInfoPrivacyCell;
 import org.telegram.ui.Cells.TextSettingsCell;
-import org.telegram.ui.Components.CubicBezierInterpolator;
 import org.telegram.ui.Components.LayoutHelper;
-import org.telegram.ui.Components.ListView.AdapterWithDiffUtils;
 import org.telegram.ui.Components.NumberPicker;
 import org.telegram.ui.Components.RecyclerListView;
 
-import java.util.ArrayList;
-import java.util.Objects;
-
 /**
- * Options of individual chat protection, reached from Passcode Lock. Follows the structure of
- * {@link ArchiveSettingsActivity}: grouped rows built from a list of items, switches that animate
- * themselves, and diff-based insertion/removal of dependent rows (no page rebuilds).
+ * Details of individual chat protection: preview hiding, the protected chats' own Auto-lock and the
+ * list of protected chats. The on/off switch is on the Passcode Lock page. Same page structure as the
+ * other Telegram settings pages (grouped rows with explanatory info cells between groups).
  */
-public class ProtectedChatsSettingsActivity extends BaseFragment {
+public class ProtectedChatsSettingsActivity extends BaseFragment implements NotificationCenter.NotificationCenterDelegate {
 
     private final static int VIEW_TYPE_CHECK = 0;
     private final static int VIEW_TYPE_SETTING = 1;
-    private final static int VIEW_TYPE_SHADOW = 2;
+    private final static int VIEW_TYPE_INFO = 2;
 
-    private final static int ID_ENABLE = 1;
-    private final static int ID_ENABLE_INFO = 2;
-    private final static int ID_HIDE_PREVIEW = 3;
-    private final static int ID_RELOCK = 4;
-    private final static int ID_OPTIONS_INFO = 5;
+    private final int hidePreviewRow = 0;
+    private final int hidePreviewInfoRow = 1;
+    private final int autoLockRow = 2;
+    private final int autoLockInfoRow = 3;
+    private final int chatsRow = 4;
+    private final int rowCount = 5;
 
     private RecyclerListView listView;
     private ListAdapter adapter;
 
-    private final ArrayList<ItemInner> oldItems = new ArrayList<>(), items = new ArrayList<>();
+    @Override
+    public boolean onFragmentCreate() {
+        NotificationCenter.getGlobalInstance().addObserver(this, NotificationCenter.protectedChatsChanged);
+        return super.onFragmentCreate();
+    }
+
+    @Override
+    public void onFragmentDestroy() {
+        NotificationCenter.getGlobalInstance().removeObserver(this, NotificationCenter.protectedChatsChanged);
+        super.onFragmentDestroy();
+    }
+
+    @Override
+    public void didReceivedNotification(int id, int account, Object... args) {
+        if (id == NotificationCenter.protectedChatsChanged && adapter != null) {
+            // Only the count depends on protection changes.
+            adapter.notifyItemChanged(chatsRow);
+        }
+    }
 
     @Override
     public View createView(Context context) {
@@ -83,65 +95,25 @@ public class ProtectedChatsSettingsActivity extends BaseFragment {
             }
         });
         listView.setVerticalScrollBarEnabled(false);
+        listView.setItemAnimator(null);
         listView.setLayoutAnimation(null);
         listView.setAdapter(adapter = new ListAdapter());
-        DefaultItemAnimator itemAnimator = new DefaultItemAnimator();
-        itemAnimator.setDurations(350);
-        itemAnimator.setInterpolator(CubicBezierInterpolator.EASE_OUT_QUINT);
-        itemAnimator.setDelayAnimations(false);
-        itemAnimator.setSupportsChangeAnimations(false);
-        listView.setItemAnimator(itemAnimator);
         frameLayout.addView(listView, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.MATCH_PARENT));
         listView.setOnItemClickListener((view, position) -> {
-            if (position < 0 || position >= items.size()) {
-                return;
-            }
-            final ItemInner item = items.get(position);
-            if (item.id == ID_ENABLE) {
-                toggleFeature((TextCheckCell) view);
-            } else if (item.id == ID_HIDE_PREVIEW) {
+            if (position == hidePreviewRow) {
                 final boolean hide = !ProtectedChats.getState().isHidePreviewWhenLocked();
                 ProtectedChats.setHidePreviewWhenLocked(hide);
                 ((TextCheckCell) view).setChecked(hide);
-            } else if (item.id == ID_RELOCK) {
-                showRelockDialog((TextSettingsCell) view);
+            } else if (position == autoLockRow) {
+                showAutoLockDialog((TextSettingsCell) view);
+            } else if (position == chatsRow) {
+                presentFragment(new ProtectedChatsListActivity());
             }
         });
-
-        updateItems(false);
         return fragmentView;
     }
 
-    private void toggleFeature(TextCheckCell cell) {
-        if (!ProtectedChats.isFeatureEnabled()) {
-            if (ProtectedChats.enableFeature() == ProtectedChatsState.Result.OK) {
-                cell.setChecked(true);
-                updateItems(true);
-            }
-            return;
-        }
-        final int count = ProtectedChats.getState().protectedCount();
-        if (count == 0) {
-            ProtectedChats.disableFeatureRemovingAllProtection();
-            cell.setChecked(false);
-            updateItems(true);
-            return;
-        }
-        // Turning the feature off removes every protection in one deliberate step.
-        AlertDialog alertDialog = new AlertDialog.Builder(getParentActivity())
-                .setTitle(LocaleController.getString(R.string.ChatProtectionDisableTitle))
-                .setMessage(LocaleController.formatString(R.string.ChatProtectionDisableMessage, count))
-                .setNegativeButton(LocaleController.getString(R.string.Cancel), null)
-                .setPositiveButton(LocaleController.getString(R.string.ChatProtectionDisableConfirm), (dialog, which) -> {
-                    ProtectedChats.disableFeatureRemovingAllProtection();
-                    cell.setChecked(false);
-                    updateItems(true);
-                }).create();
-        showDialog(alertDialog);
-        ((TextView) alertDialog.getButton(Dialog.BUTTON_POSITIVE)).setTextColor(Theme.getColor(Theme.key_text_RedBold));
-    }
-
-    private String relockValue(int seconds) {
+    private String autoLockValue(int seconds) {
         if (seconds == 0) {
             return LocaleController.getString(R.string.ChatProtectionRelockImmediately);
         } else if (seconds < 60 * 60) {
@@ -150,13 +122,13 @@ public class ProtectedChatsSettingsActivity extends BaseFragment {
         return LocaleController.formatString("AutoLockInTime", R.string.AutoLockInTime, LocaleController.formatPluralString("Hours", seconds / 60 / 60));
     }
 
-    private void showRelockDialog(TextSettingsCell cell) {
+    private void showAutoLockDialog(TextSettingsCell cell) {
         if (getParentActivity() == null) {
             return;
         }
         final int[] choices = ProtectedChatsState.RELOCK_CHOICES;
         AlertDialog.Builder builder = new AlertDialog.Builder(getParentActivity());
-        builder.setTitle(LocaleController.getString(R.string.ChatProtectionRelock));
+        builder.setTitle(LocaleController.getString(R.string.AutoLock));
         final NumberPicker numberPicker = new NumberPicker(getParentActivity());
         numberPicker.setMinValue(0);
         numberPicker.setMaxValue(choices.length - 1);
@@ -165,64 +137,27 @@ public class ProtectedChatsSettingsActivity extends BaseFragment {
                 numberPicker.setValue(i);
             }
         }
-        numberPicker.setFormatter(value -> relockValue(choices[value]));
+        numberPicker.setFormatter(value -> autoLockValue(choices[value]));
         builder.setView(numberPicker);
         builder.setNegativeButton(LocaleController.getString(R.string.Done), (dialog, which) -> {
             ProtectedChats.getState().setRelockSeconds(choices[numberPicker.getValue()]);
-            cell.setTextAndValue(LocaleController.getString(R.string.ChatProtectionRelock), relockValue(ProtectedChats.getState().getRelockSeconds()), false);
+            cell.setTextAndValue(LocaleController.getString(R.string.AutoLock), autoLockValue(ProtectedChats.getState().getRelockSeconds()), false);
         });
         showDialog(builder.create());
     }
 
-    private void updateItems(boolean animated) {
-        oldItems.clear();
-        oldItems.addAll(items);
-        items.clear();
-
-        items.add(new ItemInner(VIEW_TYPE_CHECK, ID_ENABLE, LocaleController.getString(R.string.ChatProtectionEnable)));
-        items.add(new ItemInner(VIEW_TYPE_SHADOW, ID_ENABLE_INFO, LocaleController.getString(R.string.ChatProtectionEnableInfo)));
-        if (ProtectedChats.isFeatureEnabled()) {
-            items.add(new ItemInner(VIEW_TYPE_CHECK, ID_HIDE_PREVIEW, LocaleController.getString(R.string.ChatProtectionHidePreview)));
-            items.add(new ItemInner(VIEW_TYPE_SETTING, ID_RELOCK, LocaleController.getString(R.string.ChatProtectionRelock)));
-            items.add(new ItemInner(VIEW_TYPE_SHADOW, ID_OPTIONS_INFO, LocaleController.getString(R.string.ChatProtectionHidePreviewInfo) + "\n\n" + LocaleController.getString(R.string.ChatProtectionRelockInfo)));
-        }
-
-        if (adapter == null) {
-            return;
-        }
-        if (animated) {
-            adapter.setItems(oldItems, items);
-        } else {
-            adapter.notifyDataSetChanged();
-        }
-    }
-
-    private static class ItemInner extends AdapterWithDiffUtils.Item {
-        public final CharSequence text;
-        public final int id;
-
-        public ItemInner(int viewType, int id, CharSequence text) {
-            super(viewType, false);
-            this.id = id;
-            this.text = text;
+    private class ListAdapter extends RecyclerListView.SelectionAdapter {
+        @Override
+        public boolean isEnabled(RecyclerView.ViewHolder holder) {
+            final int position = holder.getAdapterPosition();
+            return position == hidePreviewRow || position == autoLockRow || position == chatsRow;
         }
 
         @Override
-        public boolean equals(Object o) {
-            if (this == o) return true;
-            if (o == null || getClass() != o.getClass()) return false;
-            ItemInner item = (ItemInner) o;
-            return id == item.id && Objects.equals(text, item.text);
+        public int getItemCount() {
+            return rowCount;
         }
 
-        @Override
-        protected boolean contentsEquals(AdapterWithDiffUtils.Item item) {
-            // Switch state is applied by the cell itself (animated); unchanged rows are never rebound.
-            return equals(item);
-        }
-    }
-
-    private class ListAdapter extends AdapterWithDiffUtils {
         @NonNull
         @Override
         public RecyclerView.ViewHolder onCreateViewHolder(@NonNull ViewGroup parent, int viewType) {
@@ -239,49 +174,38 @@ public class ProtectedChatsSettingsActivity extends BaseFragment {
 
         @Override
         public void onBindViewHolder(@NonNull RecyclerView.ViewHolder holder, int position) {
-            if (position < 0 || position >= items.size()) {
-                return;
-            }
-            final ItemInner item = items.get(position);
-            final int viewType = holder.getItemViewType();
-            if (viewType == VIEW_TYPE_SHADOW) {
-                TextInfoPrivacyCell cell = (TextInfoPrivacyCell) holder.itemView;
-                if (TextUtils.isEmpty(item.text)) {
-                    cell.setFixedSize(12);
-                    cell.setText(null);
-                } else {
-                    cell.setFixedSize(0);
-                    cell.setText(item.text);
+            switch (holder.getItemViewType()) {
+                case VIEW_TYPE_CHECK: {
+                    ((TextCheckCell) holder.itemView).setTextAndCheck(LocaleController.getString(R.string.ChatProtectionHidePreview), ProtectedChats.getState().isHidePreviewWhenLocked(), false);
+                    break;
                 }
-            } else if (viewType == VIEW_TYPE_CHECK) {
-                TextCheckCell cell = (TextCheckCell) holder.itemView;
-                if (item.id == ID_ENABLE) {
-                    cell.setTextAndCheck(item.text, ProtectedChats.isFeatureEnabled(), false);
-                } else if (item.id == ID_HIDE_PREVIEW) {
-                    cell.setTextAndCheck(item.text, ProtectedChats.getState().isHidePreviewWhenLocked(), true);
+                case VIEW_TYPE_SETTING: {
+                    TextSettingsCell cell = (TextSettingsCell) holder.itemView;
+                    if (position == autoLockRow) {
+                        cell.setTextAndValue(LocaleController.getString(R.string.AutoLock), autoLockValue(ProtectedChats.getState().getRelockSeconds()), false);
+                    } else {
+                        final int count = ProtectedChats.getProtectedDialogs(currentAccount).size();
+                        cell.setTextAndValue(LocaleController.getString(R.string.Chats), count == 0 ? LocaleController.getString(R.string.None) : Integer.toString(count), false);
+                    }
+                    break;
                 }
-            } else if (viewType == VIEW_TYPE_SETTING) {
-                TextSettingsCell cell = (TextSettingsCell) holder.itemView;
-                cell.setTextAndValue(item.text, relockValue(ProtectedChats.getState().getRelockSeconds()), false);
+                case VIEW_TYPE_INFO: {
+                    TextInfoPrivacyCell cell = (TextInfoPrivacyCell) holder.itemView;
+                    cell.setText(LocaleController.getString(position == hidePreviewInfoRow ? R.string.ChatProtectionHidePreviewInfo : R.string.ChatProtectionRelockInfo));
+                    cell.getTextView().setGravity(LocaleController.isRTL ? Gravity.RIGHT : Gravity.LEFT);
+                    break;
+                }
             }
-        }
-
-        @Override
-        public int getItemCount() {
-            return items.size();
-        }
-
-        @Override
-        public boolean isEnabled(RecyclerView.ViewHolder holder) {
-            return holder.getItemViewType() != VIEW_TYPE_SHADOW;
         }
 
         @Override
         public int getItemViewType(int position) {
-            if (position < 0 || position >= items.size()) {
-                return VIEW_TYPE_SHADOW;
+            if (position == hidePreviewRow) {
+                return VIEW_TYPE_CHECK;
+            } else if (position == autoLockRow || position == chatsRow) {
+                return VIEW_TYPE_SETTING;
             }
-            return items.get(position).viewType;
+            return VIEW_TYPE_INFO;
         }
     }
 

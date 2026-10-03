@@ -55,6 +55,7 @@ import org.telegram.messenger.ProtectedChats;
 import org.telegram.messenger.ProtectedChatsState;
 import org.telegram.messenger.R;
 import org.telegram.messenger.SharedConfig;
+import org.telegram.messenger.SwitchRowHitTest;
 import org.telegram.messenger.UserConfig;
 import org.telegram.messenger.Utilities;
 import org.telegram.ui.ActionBar.ActionBar;
@@ -65,7 +66,7 @@ import org.telegram.ui.ActionBar.AlertDialog;
 import org.telegram.ui.ActionBar.BaseFragment;
 import org.telegram.ui.ActionBar.Theme;
 import org.telegram.ui.ActionBar.ThemeDescription;
-import org.telegram.ui.Cells.HeaderCell;
+import org.telegram.ui.Cells.NotificationsCheckCell;
 import org.telegram.ui.Cells.ShadowSectionCell;
 import org.telegram.ui.Cells.TextCheckCell;
 import org.telegram.ui.Cells.TextInfoPrivacyCell;
@@ -77,7 +78,6 @@ import org.telegram.ui.Components.Easings;
 import org.telegram.ui.Components.EditTextBoldCursor;
 import org.telegram.ui.Components.FragmentFloatingButton;
 import org.telegram.ui.Components.LayoutHelper;
-import org.telegram.ui.Components.NumberPicker;
 import org.telegram.ui.Components.OutlineTextContainerView;
 import org.telegram.ui.Components.RLottieImageView;
 import org.telegram.ui.Components.RecyclerListView;
@@ -138,19 +138,10 @@ public class PasscodeActivity extends BaseFragment implements NotificationCenter
     private int changePasscodeRow;
     @Keep
     private int fingerprintRow;
-    @Keep
-    private int autoLockRow;
-    private int autoLockDetailRow;
-
-    private int captureHeaderRow;
-    private int captureRow;
-    private int captureDetailRow;
-
     private int credentialGapRow;
     private int appLockRow;
-    private int appLockDetailRow;
     private int chatProtectionRow;
-    private int chatProtectionDetailRow;
+    private int featuresInfoRow;
 
     @Keep
     private int disablePasscodeRow;
@@ -279,7 +270,7 @@ public class PasscodeActivity extends BaseFragment implements NotificationCenter
                 listView.setLayoutAnimation(null);
                 frameLayout.addView(listView, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.MATCH_PARENT));
                 listView.setAdapter(listAdapter = new ListAdapter(context));
-                listView.setOnItemClickListener((view, position) -> {
+                listView.setOnItemClickListener((view, position, x, y) -> {
                     if (!view.isEnabled()) {
                         return;
                     }
@@ -315,74 +306,22 @@ public class PasscodeActivity extends BaseFragment implements NotificationCenter
                         ((TextView)alertDialog.getButton(Dialog.BUTTON_POSITIVE)).setTextColor(Theme.getColor(Theme.key_text_RedBold));
                     } else if (position == changePasscodeRow) {
                         presentFragment(new PasscodeActivity(TYPE_SETUP_CODE));
-                    } else if (position == autoLockRow) {
-                        if (getParentActivity() == null) {
-                            return;
-                        }
-                        AlertDialog.Builder builder = new AlertDialog.Builder(getParentActivity());
-                        builder.setTitle(LocaleController.getString(R.string.AutoLock));
-                        final NumberPicker numberPicker = new NumberPicker(getParentActivity());
-                        numberPicker.setMinValue(0);
-                        numberPicker.setMaxValue(4);
-                        if (SharedConfig.autoLockIn == 0) {
-                            numberPicker.setValue(0);
-                        } else if (SharedConfig.autoLockIn == 60) {
-                            numberPicker.setValue(1);
-                        } else if (SharedConfig.autoLockIn == 60 * 5) {
-                            numberPicker.setValue(2);
-                        } else if (SharedConfig.autoLockIn == 60 * 60) {
-                            numberPicker.setValue(3);
-                        } else if (SharedConfig.autoLockIn == 60 * 60 * 5) {
-                            numberPicker.setValue(4);
-                        }
-                        numberPicker.setFormatter(value -> {
-                            if (value == 0) {
-                                return LocaleController.getString(R.string.AutoLockDisabled);
-                            } else if (value == 1) {
-                                return LocaleController.formatString("AutoLockInTime", R.string.AutoLockInTime, LocaleController.formatPluralString("Minutes", 1));
-                            } else if (value == 2) {
-                                return LocaleController.formatString("AutoLockInTime", R.string.AutoLockInTime, LocaleController.formatPluralString("Minutes", 5));
-                            } else if (value == 3) {
-                                return LocaleController.formatString("AutoLockInTime", R.string.AutoLockInTime, LocaleController.formatPluralString("Hours", 1));
-                            } else if (value == 4) {
-                                return LocaleController.formatString("AutoLockInTime", R.string.AutoLockInTime, LocaleController.formatPluralString("Hours", 5));
-                            }
-                            return "";
-                        });
-                        builder.setView(numberPicker);
-                        builder.setNegativeButton(LocaleController.getString(R.string.Done), (dialog, which) -> {
-                            which = numberPicker.getValue();
-                            if (which == 0) {
-                                SharedConfig.autoLockIn = 0;
-                            } else if (which == 1) {
-                                SharedConfig.autoLockIn = 60;
-                            } else if (which == 2) {
-                                SharedConfig.autoLockIn = 60 * 5;
-                            } else if (which == 3) {
-                                SharedConfig.autoLockIn = 60 * 60;
-                            } else if (which == 4) {
-                                SharedConfig.autoLockIn = 60 * 60 * 5;
-                            }
-                            listAdapter.notifyItemChanged(position);
-                            UserConfig.getInstance(currentAccount).saveConfig(false);
-                        });
-                        showDialog(builder.create());
                     } else if (position == appLockRow) {
-                        toggleAppLock((TextCheckCell) view);
+                        if (isToggleArea(view, x)) {
+                            toggleAppLock((NotificationsCheckCell) view);
+                        } else {
+                            presentFragment(new AppLockSettingsActivity());
+                        }
                     } else if (position == chatProtectionRow) {
-                        presentFragment(new ProtectedChatsSettingsActivity());
+                        if (isToggleArea(view, x)) {
+                            toggleChatProtection((NotificationsCheckCell) view);
+                        } else {
+                            presentFragment(new ProtectedChatsSettingsActivity());
+                        }
                     } else if (position == fingerprintRow) {
                         SharedConfig.useFingerprintLock = !SharedConfig.useFingerprintLock;
                         UserConfig.getInstance(currentAccount).saveConfig(false);
                         ((TextCheckCell) view).setChecked(SharedConfig.useFingerprintLock);
-                    } else if (position == captureRow) {
-                        SharedConfig.allowScreenCapture = !SharedConfig.allowScreenCapture;
-                        UserConfig.getInstance(currentAccount).saveConfig(false);
-                        ((TextCheckCell) view).setChecked(SharedConfig.allowScreenCapture);
-                        NotificationCenter.getGlobalInstance().postNotificationName(NotificationCenter.didSetPasscode, false);
-                        if (!SharedConfig.allowScreenCapture) {
-                            AlertsCreator.showSimpleAlert(PasscodeActivity.this, LocaleController.getString(R.string.ScreenCaptureAlert));
-                        }
                     }
                 });
                 break;
@@ -752,11 +691,16 @@ public class PasscodeActivity extends BaseFragment implements NotificationCenter
         return new ActionIntroActivity(ActionIntroActivity.ACTION_TYPE_SET_PASSCODE);
     }
 
+    /** Same hit test as the other rows with a switch and a details page (Appearance > Auto-Night Theme). */
+    private boolean isToggleArea(View view, float x) {
+        return SwitchRowHitTest.isSwitchArea(LocaleController.isRTL, x, view.getMeasuredWidth(), dp(76));
+    }
+
     /**
-     * Same pattern as the neighbouring switches: the tapped cell animates itself and only the rows
-     * that depend on the setting are inserted or removed; nothing is rebound or rebuilt.
+     * The tapped row animates its own switch; nothing is rebound or rebuilt. Turning the app lock off
+     * keeps the passcode and every protected chat.
      */
-    private void toggleAppLock(TextCheckCell cell) {
+    private void toggleAppLock(NotificationsCheckCell cell) {
         final boolean enable = !SharedConfig.appLockEnabled;
         SharedConfig.appLockEnabled = enable;
         SharedConfig.appLocked = false;
@@ -764,23 +708,34 @@ public class PasscodeActivity extends BaseFragment implements NotificationCenter
         SharedConfig.saveConfig();
         getMediaDataController().buildShortcuts();
         cell.setChecked(enable);
-        final int oldAutoLockRow = autoLockRow;
-        updateRows();
-        if (enable) {
-            listAdapter.notifyItemRangeInserted(autoLockRow, 2);
-        } else {
-            listAdapter.notifyItemRangeRemoved(oldAutoLockRow, 2);
-        }
         // "false": local change, this screen must not rebuild itself (see didReceivedNotification).
         NotificationCenter.getGlobalInstance().postNotificationName(NotificationCenter.didSetPasscode, false);
     }
 
-    private String protectedChatsValue() {
+    private void toggleChatProtection(NotificationsCheckCell cell) {
         if (!ProtectedChats.isFeatureEnabled()) {
-            return LocaleController.getString(R.string.PasswordOff);
+            if (ProtectedChats.enableFeature() == ProtectedChatsState.Result.OK) {
+                cell.setChecked(true);
+            }
+            return;
         }
         final int count = ProtectedChats.getState().protectedCount();
-        return count == 0 ? LocaleController.getString(R.string.None) : LocaleController.formatPluralString("Chats", count);
+        if (count == 0) {
+            ProtectedChats.disableFeatureRemovingAllProtection();
+            cell.setChecked(false);
+            return;
+        }
+        // Turning the feature off removes every protection in one deliberate step.
+        AlertDialog alertDialog = new AlertDialog.Builder(getParentActivity())
+                .setTitle(LocaleController.getString(R.string.ChatProtectionDisableTitle))
+                .setMessage(LocaleController.formatString(R.string.ChatProtectionDisableMessage, count))
+                .setNegativeButton(LocaleController.getString(R.string.Cancel), null)
+                .setPositiveButton(LocaleController.getString(R.string.ChatProtectionDisableConfirm), (dialog, which) -> {
+                    ProtectedChats.disableFeatureRemovingAllProtection();
+                    cell.setChecked(false);
+                }).create();
+        showDialog(alertDialog);
+        ((TextView) alertDialog.getButton(Dialog.BUTTON_POSITIVE)).setTextColor(Theme.getColor(Theme.key_text_RedBold));
     }
 
     private void animateSuccessAnimation(Runnable callback) {
@@ -852,19 +807,10 @@ public class PasscodeActivity extends BaseFragment implements NotificationCenter
 
     private void updateRows() {
         fingerprintRow = -1;
-        credentialGapRow = -1;
-        appLockRow = -1;
-        appLockDetailRow = -1;
-        autoLockRow = -1;
-        autoLockDetailRow = -1;
-        captureHeaderRow = -1;
-        captureRow = -1;
-        captureDetailRow = -1;
-        chatProtectionRow = -1;
-        chatProtectionDetailRow = -1;
         rowCount = 0;
         utyanRow = rowCount++;
         hintRow = rowCount++;
+        // The shared credential first: change it, unlock with fingerprint.
         changePasscodeRow = rowCount++;
         try {
             if (Build.VERSION.SDK_INT >= 23) {
@@ -878,20 +824,12 @@ public class PasscodeActivity extends BaseFragment implements NotificationCenter
         } catch (Throwable e) {
             FileLog.e(e);
         }
-        // The credential (change, fingerprint) first; then whether Telegram itself locks; then chats.
+        // What uses it: Telegram itself (App Lock) and individual chats (Protected Chats). Each row has
+        // its own switch; the row body opens that feature's details.
         credentialGapRow = rowCount++;
         appLockRow = rowCount++;
-        appLockDetailRow = rowCount++;
-        if (SharedConfig.appLockEnabled) {
-            autoLockRow = rowCount++;
-            autoLockDetailRow = rowCount++;
-        }
-        // Screenshot / task-switcher protection follows the credential, not only the app lock.
-        captureHeaderRow = rowCount++;
-        captureRow = rowCount++;
-        captureDetailRow = rowCount++;
         chatProtectionRow = rowCount++;
-        chatProtectionDetailRow = rowCount++;
+        featuresInfoRow = rowCount++;
         disablePasscodeRow = rowCount++;
     }
 
@@ -1134,9 +1072,9 @@ public class PasscodeActivity extends BaseFragment implements NotificationCenter
         private final static int VIEW_TYPE_CHECK = 0,
                 VIEW_TYPE_SETTING = 1,
                 VIEW_TYPE_INFO = 2,
-                VIEW_TYPE_HEADER = 3,
                 VIEW_TYPE_UTYAN = 4,
-                VIEW_TYPE_SHADOW = 5;
+                VIEW_TYPE_SHADOW = 5,
+                VIEW_TYPE_FEATURE = 6;
 
         private final Context mContext;
 
@@ -1147,8 +1085,7 @@ public class PasscodeActivity extends BaseFragment implements NotificationCenter
         @Override
         public boolean isEnabled(RecyclerView.ViewHolder holder) {
             int position = holder.getAdapterPosition();
-            return position == fingerprintRow || position == autoLockRow || position == captureRow ||
-                    position == changePasscodeRow || position == disablePasscodeRow ||
+            return position == fingerprintRow || position == changePasscodeRow || position == disablePasscodeRow ||
                     position == appLockRow || position == chatProtectionRow;
         }
 
@@ -1168,8 +1105,8 @@ public class PasscodeActivity extends BaseFragment implements NotificationCenter
                 case VIEW_TYPE_SETTING:
                     view = new TextSettingsCell(mContext);
                     break;
-                case VIEW_TYPE_HEADER:
-                    view = new HeaderCell(mContext);
+                case VIEW_TYPE_FEATURE:
+                    view = new NotificationsCheckCell(mContext);
                     break;
                 case VIEW_TYPE_SHADOW:
                     view = new ShadowSectionCell(mContext);
@@ -1193,10 +1130,15 @@ public class PasscodeActivity extends BaseFragment implements NotificationCenter
                     TextCheckCell textCell = (TextCheckCell) holder.itemView;
                     if (position == fingerprintRow) {
                         textCell.setTextAndCheck(LocaleController.getString(R.string.UnlockFingerprint), SharedConfig.useFingerprintLock, false);
-                    } else if (position == captureRow) {
-                        textCell.setTextAndCheck(LocaleController.getString(R.string.ScreenCaptureShowContent), SharedConfig.allowScreenCapture, false);
-                    } else if (position == appLockRow) {
-                        textCell.setTextAndCheck(LocaleController.getString(R.string.AppLockToggle), SharedConfig.appLockEnabled, false);
+                    }
+                    break;
+                }
+                case VIEW_TYPE_FEATURE: {
+                    NotificationsCheckCell checkCell = (NotificationsCheckCell) holder.itemView;
+                    if (position == appLockRow) {
+                        checkCell.setTextAndValueAndCheck(LocaleController.getString(R.string.AppLockTitle), LocaleController.getString(R.string.AppLockRowSummary), SharedConfig.appLockEnabled, true);
+                    } else if (position == chatProtectionRow) {
+                        checkCell.setTextAndValueAndCheck(LocaleController.getString(R.string.ChatProtectionHeader), LocaleController.getString(R.string.ChatProtectionRowSummary), ProtectedChats.isFeatureEnabled(), false);
                     }
                     break;
                 }
@@ -1211,36 +1153,10 @@ public class PasscodeActivity extends BaseFragment implements NotificationCenter
                             textCell.setTag(Theme.key_windowBackgroundWhiteBlackText);
                             textCell.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText));
                         }
-                    } else if (position == autoLockRow) {
-                        String val;
-                        if (SharedConfig.autoLockIn == 0) {
-                            val = LocaleController.formatString("AutoLockDisabled", R.string.AutoLockDisabled);
-                        } else if (SharedConfig.autoLockIn < 60 * 60) {
-                            val = LocaleController.formatString("AutoLockInTime", R.string.AutoLockInTime, LocaleController.formatPluralString("Minutes", SharedConfig.autoLockIn / 60));
-                        } else if (SharedConfig.autoLockIn < 60 * 60 * 24) {
-                            val = LocaleController.formatString("AutoLockInTime", R.string.AutoLockInTime, LocaleController.formatPluralString("Hours", (int) Math.ceil(SharedConfig.autoLockIn / 60.0f / 60)));
-                        } else {
-                            val = LocaleController.formatString("AutoLockInTime", R.string.AutoLockInTime, LocaleController.formatPluralString("Days", (int) Math.ceil(SharedConfig.autoLockIn / 60.0f / 60 / 24)));
-                        }
-                        textCell.setTextAndValue(LocaleController.getString(R.string.AutoLock), val, true);
-                        textCell.setTag(Theme.key_windowBackgroundWhiteBlackText);
-                        textCell.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText));
-                    } else if (position == chatProtectionRow) {
-                        textCell.setTextAndValue(LocaleController.getString(R.string.ChatProtectionHeader), protectedChatsValue(), false);
-                        textCell.setTag(Theme.key_windowBackgroundWhiteBlackText);
-                        textCell.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText));
                     } else if (position == disablePasscodeRow) {
                         textCell.setText(LocaleController.getString(R.string.DisablePasscode), false);
                         textCell.setTag(Theme.key_text_RedBold);
                         textCell.setTextColor(Theme.getColor(Theme.key_text_RedBold));
-                    }
-                    break;
-                }
-                case VIEW_TYPE_HEADER: {
-                    HeaderCell cell = (HeaderCell) holder.itemView;
-                    cell.setHeight(46);
-                    if (position == captureHeaderRow) {
-                        cell.setText(LocaleController.getString(R.string.ScreenCaptureHeader));
                     }
                     break;
                 }
@@ -1256,17 +1172,8 @@ public class PasscodeActivity extends BaseFragment implements NotificationCenter
                         cell.setText(LocaleController.getString(R.string.PasscodeScreenHint));
                         cell.setBackground(null);
                         cell.getTextView().setGravity(Gravity.CENTER_HORIZONTAL);
-                    } else if (position == autoLockDetailRow) {
-                        cell.setText(LocaleController.getString(R.string.AutoLockInfo));
-                        cell.getTextView().setGravity(LocaleController.isRTL ? Gravity.RIGHT : Gravity.LEFT);
-                    } else if (position == appLockDetailRow) {
-                        cell.setText(LocaleController.getString(R.string.AppLockToggleInfo));
-                        cell.getTextView().setGravity(LocaleController.isRTL ? Gravity.RIGHT : Gravity.LEFT);
-                    } else if (position == chatProtectionDetailRow) {
-                        cell.setText(LocaleController.getString(R.string.ChatProtectionRowInfo));
-                        cell.getTextView().setGravity(LocaleController.isRTL ? Gravity.RIGHT : Gravity.LEFT);
-                    } else if (position == captureDetailRow) {
-                        cell.setText(LocaleController.getString(R.string.ScreenCaptureInfo));
+                    } else if (position == featuresInfoRow) {
+                        cell.setText(LocaleController.getString(R.string.PasscodeFeaturesInfo));
                         cell.getTextView().setGravity(LocaleController.isRTL ? Gravity.RIGHT : Gravity.LEFT);
                     }
                     break;
@@ -1276,14 +1183,14 @@ public class PasscodeActivity extends BaseFragment implements NotificationCenter
 
         @Override
         public int getItemViewType(int position) {
-            if (position == fingerprintRow || position == captureRow || position == appLockRow) {
+            if (position == fingerprintRow) {
                 return VIEW_TYPE_CHECK;
-            } else if (position == changePasscodeRow || position == autoLockRow || position == disablePasscodeRow || position == chatProtectionRow) {
+            } else if (position == appLockRow || position == chatProtectionRow) {
+                return VIEW_TYPE_FEATURE;
+            } else if (position == changePasscodeRow || position == disablePasscodeRow) {
                 return VIEW_TYPE_SETTING;
-            } else if (position == autoLockDetailRow || position == captureDetailRow || position == hintRow || position == appLockDetailRow || position == chatProtectionDetailRow) {
+            } else if (position == featuresInfoRow || position == hintRow) {
                 return VIEW_TYPE_INFO;
-            } else if (position == captureHeaderRow) {
-                return VIEW_TYPE_HEADER;
             } else if (position == credentialGapRow) {
                 return VIEW_TYPE_SHADOW;
             } else if (position == utyanRow) {
@@ -1297,7 +1204,7 @@ public class PasscodeActivity extends BaseFragment implements NotificationCenter
     public ArrayList<ThemeDescription> getThemeDescriptions() {
         ArrayList<ThemeDescription> themeDescriptions = new ArrayList<>();
 
-        themeDescriptions.add(new ThemeDescription(listView, ThemeDescription.FLAG_CELLBACKGROUNDCOLOR, new Class[]{TextCheckCell.class, TextSettingsCell.class}, null, null, null, Theme.key_windowBackgroundWhite));
+        themeDescriptions.add(new ThemeDescription(listView, ThemeDescription.FLAG_CELLBACKGROUNDCOLOR, new Class[]{TextCheckCell.class, TextSettingsCell.class, NotificationsCheckCell.class}, null, null, null, Theme.key_windowBackgroundWhite));
         themeDescriptions.add(new ThemeDescription(fragmentView, ThemeDescription.FLAG_BACKGROUND | ThemeDescription.FLAG_CHECKTAG, null, null, null, null, Theme.key_windowBackgroundWhite));
         themeDescriptions.add(new ThemeDescription(fragmentView, ThemeDescription.FLAG_BACKGROUND | ThemeDescription.FLAG_CHECKTAG, null, null, null, null, Theme.key_windowBackgroundGray));
 
@@ -1324,6 +1231,10 @@ public class PasscodeActivity extends BaseFragment implements NotificationCenter
         themeDescriptions.add(new ThemeDescription(listView, 0, new Class[]{TextCheckCell.class}, new String[]{"checkBox"}, null, null, null, Theme.key_switchTrack));
         themeDescriptions.add(new ThemeDescription(listView, 0, new Class[]{TextCheckCell.class}, new String[]{"checkBox"}, null, null, null, Theme.key_switchTrackChecked));
 
+        themeDescriptions.add(new ThemeDescription(listView, 0, new Class[]{NotificationsCheckCell.class}, new String[]{"textView"}, null, null, null, Theme.key_windowBackgroundWhiteBlackText));
+        themeDescriptions.add(new ThemeDescription(listView, 0, new Class[]{NotificationsCheckCell.class}, new String[]{"valueTextView"}, null, null, null, Theme.key_windowBackgroundWhiteGrayText2));
+        themeDescriptions.add(new ThemeDescription(listView, 0, new Class[]{NotificationsCheckCell.class}, new String[]{"checkBox"}, null, null, null, Theme.key_switchTrack));
+        themeDescriptions.add(new ThemeDescription(listView, 0, new Class[]{NotificationsCheckCell.class}, new String[]{"checkBox"}, null, null, null, Theme.key_switchTrackChecked));
         themeDescriptions.add(new ThemeDescription(listView, ThemeDescription.FLAG_CHECKTAG, new Class[]{TextSettingsCell.class}, new String[]{"textView"}, null, null, null, Theme.key_windowBackgroundWhiteBlackText));
         themeDescriptions.add(new ThemeDescription(listView, ThemeDescription.FLAG_CHECKTAG, new Class[]{TextSettingsCell.class}, new String[]{"textView"}, null, null, null, Theme.key_windowBackgroundWhiteGrayText7));
         themeDescriptions.add(new ThemeDescription(listView, 0, new Class[]{TextSettingsCell.class}, new String[]{"valueTextView"}, null, null, null, Theme.key_windowBackgroundWhiteValueText));

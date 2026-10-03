@@ -137,6 +137,15 @@ public class ProtectedChats {
         return key != 0 && state().canManuallyRelock(key, dialogId);
     }
 
+    /** Protected dialogs of the account (empty while the feature is off), for the management screen. */
+    public static java.util.ArrayList<Long> getProtectedDialogs(int account) {
+        long key = accountKey(account);
+        if (key == 0 || !state().isFeatureEnabled()) {
+            return new java.util.ArrayList<>();
+        }
+        return state().protectedDialogs(key);
+    }
+
     public static boolean hasAnyProtectedChat() {
         return state().protectedCount() > 0;
     }

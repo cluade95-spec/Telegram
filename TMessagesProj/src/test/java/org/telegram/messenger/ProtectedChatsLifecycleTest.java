@@ -285,4 +285,51 @@ public class ProtectedChatsLifecycleTest {
         assertFalse(state.shouldHideContent(ACC, CHAT_B));
         assertFalse(state.canManuallyRelock(ACC, CHAT_B));
     }
+
+    // ------------------------------------------------------------ management list
+
+    @Test
+    public void managementListShowsEveryTypeOfCurrentAccountAndShrinksOnRemoval() {
+        final long secret = ProtectedDialogIds.fromArgs(0, 0, 7, 0, false);
+        final long[] dialogs = {SAVED, 900L /* user or bot */, -901L /* group */, -1_000_000_555L /* channel */, secret};
+        for (long id : dialogs) {
+            assertEquals(ProtectedChatsState.Result.OK, state.protect(ACC, id, proof()));
+        }
+        assertEquals(ProtectedChatsState.Result.OK, state.protect(ACC + 1, 123L, proof()));
+
+        java.util.List<Long> list = state.protectedDialogs(ACC);
+        assertEquals(5, list.size());
+        assertTrue(list.contains(SAVED) && list.contains(secret));
+        assertFalse("other account is not listed", list.contains(123L));
+
+        // remove one: needs authentication, row and count disappear, authorization is cleared
+        state.relock(ACC, 900L);
+        open(900L);
+        assertEquals(ProtectedChatsState.Result.NOT_AUTHENTICATED, state.unprotect(ACC, 900L, null));
+        assertEquals(5, state.protectedDialogs(ACC).size());
+        assertEquals(ProtectedChatsState.Result.OK, state.unprotect(ACC, 900L, proof()));
+        assertEquals(4, state.protectedDialogs(ACC).size());
+        assertEquals(4, state.protectedCount(ACC));
+        assertFalse(state.canManuallyRelock(ACC, 900L));
+        assertTrue(state.isUnlocked(ACC, 900L));
+        assertFalse(state.shouldHideContent(ACC, 900L));
+        assertFalse(create().protectedDialogs(ACC).contains(900L));
+    }
+
+    @Test
+    public void managementListZeroState() {
+        assertTrue(state.protectedDialogs(ACC).isEmpty());
+        state.protect(ACC, CHAT_A, proof());
+        state.unprotect(ACC, CHAT_A, proof());
+        assertTrue(state.protectedDialogs(ACC).isEmpty());
+        assertEquals(0, state.protectedCount(ACC));
+        assertTrue(create().protectedDialogs(ACC).isEmpty());
+    }
+
+    @Test
+    public void turningTheFeatureOffEmptiesTheList() {
+        state.protect(ACC, CHAT_A, proof());
+        state.disableFeatureRemovingAllProtection();
+        assertTrue(state.protectedDialogs(ACC).isEmpty());
+    }
 }
