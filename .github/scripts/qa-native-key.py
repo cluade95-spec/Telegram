@@ -57,8 +57,13 @@ def fingerprint(root, ndk, cmake):
     for tool in ('ccache', 'nasm'):
         executable = shutil.which(tool)
         if not executable:
-            raise SystemExit(f'Missing native tool: {tool}')
-        add(f'host-tool/{tool}', Path(executable))
+            if tool == 'ccache':
+                raise SystemExit('Missing native tool: ccache')
+            # ASM_NASM is declared but no NASM executable is needed by the
+            # measured target. Preserve this fact in the key without installing one.
+            digest.update(f'host-tool/{tool}=absent\0'.encode())
+        else:
+            add(f'host-tool/{tool}', Path(executable))
 
     # Ccache retains default header/argument/CWD checks, including time macros.
     # No sloppiness, ignored headers, or broad fallback cache keys are enabled.
