@@ -1,0 +1,17 @@
+// CI only: keep Java validation ahead of native work in the same task graph.
+// The compile task has no native dependencies (measured in runs 73 and 74).
+gradle.beforeProject { project ->
+    project.plugins.withId('com.android.library') {
+        if (project.path == ':TMessagesProj') {
+            project.android.defaultConfig.externalNativeBuild.cmake.arguments(
+                '-DCMAKE_C_COMPILER_LAUNCHER=/usr/bin/ccache',
+                '-DCMAKE_CXX_COMPILER_LAUNCHER=/usr/bin/ccache'
+            )
+            project.tasks.configureEach { task ->
+                if (task.name.startsWith('configureCMake') || task.name.startsWith('buildCMake')) {
+                    task.mustRunAfter(':TMessagesProj_AppStandalone:compileAfatStandaloneJavaWithJavac')
+                }
+            }
+        }
+    }
+}
