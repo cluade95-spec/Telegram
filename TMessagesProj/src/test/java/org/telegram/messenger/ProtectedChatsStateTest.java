@@ -322,17 +322,6 @@ public class ProtectedChatsStateTest {
     }
 
     @Test
-    public void notificationContentHiddenEvenWhileAuthorized() {
-        protect(ACC_A, CHAT_1);
-        unlock(ACC_A, CHAT_1);
-        assertFalse(state.shouldHideContent(ACC_A, CHAT_1));
-        assertTrue(state.shouldHideNotificationContent(ACC_A, CHAT_1));
-        assertFalse(state.shouldHideNotificationContent(ACC_A, CHAT_2));
-        state.setHidePreviewWhenLocked(false);
-        assertFalse(state.shouldHideNotificationContent(ACC_A, CHAT_1));
-    }
-
-    @Test
     public void protectedChatsSurviveAppLockBeingDisabled() {
         // App-wide lock lives in SharedConfig; this model only depends on the credential.
         protect(ACC_A, CHAT_1);
@@ -374,17 +363,18 @@ public class ProtectedChatsStateTest {
     }
 
     @Test
-    public void previewHiddenOnlyWhileLocked() {
+    public void previewHiddenOutsideTheConversationEvenWhenAuthorized() {
         protect(ACC_A, CHAT_1);
         state.relock(ACC_A, CHAT_1);
         assertTrue(state.isHidePreviewWhenLocked());
         assertTrue(state.shouldHideContent(ACC_A, CHAT_1));
         assertFalse("unprotected chat is never hidden", state.shouldHideContent(ACC_A, CHAT_2));
         unlock(ACC_A, CHAT_1);
-        assertFalse(state.shouldHideContent(ACC_A, CHAT_1));
-        state.relock(ACC_A, CHAT_1);
+        state.chatEntered(ACC_A, CHAT_1);
+        assertTrue("authorization only opens the conversation, previews elsewhere stay hidden", state.shouldHideContent(ACC_A, CHAT_1));
         state.setHidePreviewWhenLocked(false);
         assertFalse("preference off keeps normal behavior", state.shouldHideContent(ACC_A, CHAT_1));
+        assertTrue("but the conversation still needs authentication", state.isProtected(ACC_A, CHAT_1));
     }
 
     @Test

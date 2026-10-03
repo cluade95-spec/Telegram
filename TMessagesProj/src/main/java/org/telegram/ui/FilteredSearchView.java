@@ -739,7 +739,7 @@ public class FilteredSearchView extends FrameLayout implements NotificationCente
                     int n = messageObjects.size();
                     for (int i = 0; i < n; i++) {
                         MessageObject messageObject = messageObjects.get(i);
-                        if (ProtectedChats.isLockedProtected(currentAccount, messageObject.getDialogId())) {
+                        if (ProtectedChats.shouldHideContent(currentAccount, messageObject.getDialogId())) {
                             continue;
                         }
                         ArrayList<MessageObject> messageObjectsByDate = sectionArrays.get(messageObject.monthKey);

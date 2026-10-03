@@ -2169,7 +2169,7 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
                 }
             }
 
-            if (currentDialogFolderId == 0 && currentDialogCommunityId == 0 && ProtectedChats.shouldHideContent(currentAccount, currentDialogId)) {
+            if (currentDialogFolderId == 0 && currentDialogCommunityId == 0 && ProtectedChats.shouldHideContent(currentAccount, protectedContentDialogId())) {
                 // Protected chat that is locked: keep name, avatar, time and counters, drop the content.
                 messageString = getString(R.string.ChatPasscodeHiddenPreview);
                 messageNameString = null;
@@ -5591,7 +5591,7 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
                 sb.append(". ");
             }
         }
-        if (ProtectedChats.shouldHideContent(currentAccount, currentDialogId)) {
+        if (ProtectedChats.shouldHideContent(currentAccount, protectedContentDialogId())) {
             sb.append(getString(R.string.ChatPasscodeHiddenPreview));
         } else if (encryptedChat == null) {
             StringBuilder messageString = new StringBuilder();
@@ -5621,6 +5621,11 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
         }
         event.setContentDescription(sb);
         setContentDescription(sb);
+    }
+
+    /** Rows of the Saved Messages sub-lists show Saved Messages content, whatever peer they group by. */
+    private long protectedContentDialogId() {
+        return isSavedDialog || isSavedDialogCell ? UserConfig.getInstance(currentAccount).getClientUserId() : currentDialogId;
     }
 
     private MessageObject getCaptionMessage() {

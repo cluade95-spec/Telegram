@@ -933,10 +933,11 @@ public class PasscodeActivity extends BaseFragment implements NotificationCenter
         if (SharedConfig.appLockEnabled) {
             autoLockRow = rowCount++;
             autoLockDetailRow = rowCount++;
-            captureHeaderRow = rowCount++;
-            captureRow = rowCount++;
-            captureDetailRow = rowCount++;
         }
+        // Screenshot / task-switcher protection follows the credential, not only the app lock.
+        captureHeaderRow = rowCount++;
+        captureRow = rowCount++;
+        captureDetailRow = rowCount++;
         chatProtectionHeaderRow = rowCount++;
         chatProtectionRow = rowCount++;
         if (ProtectedChats.isFeatureEnabled()) {

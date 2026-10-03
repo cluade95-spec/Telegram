@@ -629,7 +629,7 @@ public class DialogsSearchAdapter extends RecyclerListView.SelectionAdapter {
                             if (maxId != 0 && message.id <= maxId) {
                                 continue;
                             }
-                            if (ProtectedChats.isLockedProtected(currentAccount, did)) {
+                            if (ProtectedChats.shouldHideContent(currentAccount, did)) {
                                 // Do not let search reveal content of (or even hits in) locked protected chats.
                                 continue;
                             }

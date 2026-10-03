@@ -499,7 +499,11 @@ public final class ProtectedChatsState {
         }
     }
 
-    /** App returned to the foreground: chats that were open and are still fresh become active again. */
+    /**
+     * App returned to the foreground: chats that were open when it was backgrounded and whose
+     * interval ran out are revoked. Fresh ones stay in their countdown window; a fragment that
+     * becomes visible again re-activates them through {@link #chatEntered}.
+     */
     public synchronized void appResumed() {
         for (Iterator<Map.Entry<String, Auth>> it = authorized.entrySet().iterator(); it.hasNext(); ) {
             Auth auth = it.next().getValue();
@@ -510,8 +514,6 @@ public final class ProtectedChatsState {
             long now = clock.elapsedMs();
             if (relockSeconds <= 0 || now < auth.leftAt || now - auth.leftAt >= relockSeconds * 1000L) {
                 it.remove();
-            } else {
-                auth.active = true;
             }
         }
     }
@@ -531,17 +533,13 @@ public final class ProtectedChatsState {
 
     // ---------------------------------------------------------------- previews
 
-    /** Message content must be withheld for this dialog (dialog rows, notifications). */
-    public synchronized boolean shouldHideContent(long accountKey, long dialogId) {
-        return hidePreview && isLockedProtected(accountKey, dialogId);
-    }
-
     /**
-     * Notifications stay in the shade after the temporary authorization expired and are visible to
-     * bystanders, so their content is withheld for every protected chat whenever the preference is
-     * on, independent of the authorization state.
+     * Message content must be withheld for this dialog on every surface outside the opened,
+     * authenticated conversation (dialog rows, search, notifications, widgets, popups). Identity
+     * (title, avatar) is never hidden. Independent of the temporary authorization: that only
+     * opens the conversation itself.
      */
-    public synchronized boolean shouldHideNotificationContent(long accountKey, long dialogId) {
+    public synchronized boolean shouldHideContent(long accountKey, long dialogId) {
         return hidePreview && isProtected(accountKey, dialogId);
     }
 

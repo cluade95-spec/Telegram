@@ -187,7 +187,7 @@ class ChatsRemoteViewsFactory implements RemoteViewsService.RemoteViewsFactory {
         }
 
         MessageObject message = messageObjects.get(id);
-        if (message != null && ProtectedChats.shouldHideNotificationContent(accountInstance.getCurrentAccount(), id)) {
+        if (message != null && ProtectedChats.shouldHideContent(accountInstance.getCurrentAccount(), id)) {
             // Widgets stay on the home screen, so protected chats never show message content here.
             message = null;
         }

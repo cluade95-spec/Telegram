@@ -123,16 +123,6 @@ public class ProtectedChats {
         return key != 0 && s.shouldHideContent(key, dialogId);
     }
 
-    /** Notifications hide content of every protected chat (not only locked ones) when the preference is on. */
-    public static boolean shouldHideNotificationContent(int account, long dialogId) {
-        ProtectedChatsState s = state();
-        if (!s.isFeatureEnabled() || s.protectedCount() == 0) {
-            return false;
-        }
-        long key = accountKey(account);
-        return key != 0 && s.shouldHideNotificationContent(key, dialogId);
-    }
-
     public static boolean isLockedProtected(int account, long dialogId) {
         ProtectedChatsState s = state();
         if (!s.isFeatureEnabled() || s.protectedCount() == 0) {
@@ -235,7 +225,14 @@ public class ProtectedChats {
         Integer c = openCounts.get(k);
         if (c == null || c <= 1) {
             openCounts.remove(k);
-            state().chatLeft(accountKey(account), dialogId);
+            // Fragment transitions pause one fragment and resume/create the next in the same pass;
+            // decide after they settled so moving between fragments of one chat never re-locks it.
+            final long key = accountKey(account);
+            AndroidUtilities.runOnUIThread(() -> {
+                if (!openCounts.containsKey(key + ":" + dialogId)) {
+                    state().chatLeft(key, dialogId);
+                }
+            });
         } else {
             openCounts.put(k, c - 1);
         }
@@ -283,6 +280,7 @@ public class ProtectedChats {
             for (int a = 0; a < UserConfig.MAX_ACCOUNT_COUNT; a++) {
                 if (UserConfig.getInstance(a).isClientActivated()) {
                     NotificationsController.getInstance(a).showNotifications();
+                    MediaDataController.getInstance(a).buildShortcuts();
                 }
             }
         });

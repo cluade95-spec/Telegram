@@ -76,6 +76,8 @@ public abstract class BaseFragment {
     /** Dialog registered with ProtectedChatGate for this fragment, 0 if none. */
     public long protectedGateDialogId;
     public int protectedGateAccount;
+    /** The fragment currently counts as visible for the protected chat re-lock countdown. */
+    public boolean protectedGateVisible;
     protected boolean finishing;
     public Dialog visibleDialog;
     protected int currentAccount = UserConfig.selectedAccount;
@@ -533,6 +535,7 @@ public abstract class BaseFragment {
     @CallSuper
     public void onResume() {
         isPaused = false;
+        ProtectedChatGate.onFragmentResumed(this);
         if (actionBar != null) {
             actionBar.onResume();
         }
@@ -544,6 +547,7 @@ public abstract class BaseFragment {
 
     @CallSuper
     public void onPause() {
+        ProtectedChatGate.onFragmentPaused(this);
         if (actionBar != null) {
             actionBar.onPause();
         }

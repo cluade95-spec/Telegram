@@ -47,7 +47,9 @@ public final class ProtectedChatGate {
         }
         if (fragment instanceof TopicsFragment || fragment instanceof ProfileActivity || fragment instanceof ProfileActivity2) {
             long dialogId = dialogIdFromArgs(fragment.getArguments(), true);
-            // The own profile page is account settings, not the Saved Messages conversation.
+            // The own profile is an account page (also hosted as a main tab that never goes through a
+            // navigation layout). It is not gated; ProfileActivity itself hides the Saved Messages
+            // media section while Saved Messages is locked.
             if (dialogId != 0 && fragment instanceof ProfileActivity && dialogId == UserConfig.getInstance(fragment.getCurrentAccount()).getClientUserId()) {
                 return 0;
             }
@@ -71,14 +73,48 @@ public final class ProtectedChatGate {
         }
         fragment.protectedGateDialogId = dialogId;
         fragment.protectedGateAccount = fragment.getCurrentAccount();
+        fragment.protectedGateVisible = true;
         ProtectedChats.enter(fragment.protectedGateAccount, dialogId);
+    }
+
+    /**
+     * A covered fragment (another chat, a sheet, the app in the background) is not "being used":
+     * the re-lock countdown of its dialog starts once no fragment of it is visible.
+     */
+    public static void onFragmentPaused(BaseFragment fragment) {
+        if (fragment.protectedGateDialogId != 0 && fragment.protectedGateVisible) {
+            fragment.protectedGateVisible = false;
+            ProtectedChats.leave(fragment.protectedGateAccount, fragment.protectedGateDialogId);
+        }
+    }
+
+    /** Back on screen: if the authorization ended while it was covered, it must not show again. */
+    public static void onFragmentResumed(BaseFragment fragment) {
+        if (fragment.protectedGateDialogId == 0 || fragment.protectedGateVisible) {
+            return;
+        }
+        final int account = fragment.protectedGateAccount;
+        final long dialogId = fragment.protectedGateDialogId;
+        if (ProtectedChats.isLockedProtected(account, dialogId)) {
+            AndroidUtilities.runOnUIThread(() -> {
+                if (!fragment.isFinished && ProtectedChats.isLockedProtected(account, dialogId)) {
+                    fragment.removeSelfFromStack();
+                }
+            });
+            return;
+        }
+        fragment.protectedGateVisible = true;
+        ProtectedChats.enter(account, dialogId);
     }
 
     public static void onFragmentDestroyed(BaseFragment fragment) {
         if (fragment.protectedGateDialogId != 0) {
             long dialogId = fragment.protectedGateDialogId;
             fragment.protectedGateDialogId = 0;
-            ProtectedChats.leave(fragment.protectedGateAccount, dialogId);
+            if (fragment.protectedGateVisible) {
+                fragment.protectedGateVisible = false;
+                ProtectedChats.leave(fragment.protectedGateAccount, dialogId);
+            }
         }
     }
 

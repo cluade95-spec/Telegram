@@ -55,11 +55,15 @@ public abstract class RightSlidingDialogContainer extends FrameLayout {
     }
 
     public void presentFragment(INavigationLayout navigationLayout, BaseFragment fragment) {
+        if (ProtectedChatGate.block(fragment, AndroidUtilities.findActivity(getContext()), () -> presentFragment(navigationLayout, fragment))) {
+            return;
+        }
         if (isPaused) {
             return;
         }
         this.navigationLayout = navigationLayout;
         if (fragment.onFragmentCreate()) {
+            ProtectedChatGate.onFragmentCreated(fragment);
             fragment.setInPreviewMode(true);
             fragment.setParentLayout(navigationLayout);
             View view = fragment.performCreateView(getContext());

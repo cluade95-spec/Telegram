@@ -5294,7 +5294,7 @@ public class AndroidUtilities {
     }
 
     public static boolean allowScreenCapture() {
-        return !SharedConfig.isAppLockEnabled() || SharedConfig.allowScreenCapture;
+        return !SharedConfig.hasPasscode() || SharedConfig.allowScreenCapture;
     }
 
     public static File getSharingDirectory() {
