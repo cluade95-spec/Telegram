@@ -6205,9 +6205,11 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
         // Content shared from outside (share sheet, Direct Share shortcut, share picker) lands in the
         // chat it is sent to, so a locked protected chat needs the same authentication that opening it
         // needs, Saved Messages included (unlike an in-app forward, a share opens its chat). After the
-        // unlock the same selection goes through again, once.
+        // unlock the same selection goes through again, once. The message is copied because this
+        // method assigns it later (a lambda can only capture a variable that is never reassigned).
+        final CharSequence selectedMessage = message;
         if (ProtectedChatGate.holdForDestinations(this, account, dids, false,
-                () -> didSelectDialogs(dialogsFragment, dids, message, param, _notify, _scheduleDate, scheduleRepeatPeriod, topicsFragment))) {
+                () -> didSelectDialogs(dialogsFragment, dids, selectedMessage, param, _notify, _scheduleDate, scheduleRepeatPeriod, topicsFragment))) {
             return false;
         }
 
