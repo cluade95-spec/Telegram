@@ -111,13 +111,24 @@ jobs:
           fi
           echo "OK: standalone package suffix is .beta"
 
+      - name: Record build runner resources
+        run: |
+          mkdir -p build-diagnostics
+          { uname -a; lscpu; nproc; free -m; df -h .; java -version; } > build-diagnostics/runner.txt 2>&1
+          cat build-diagnostics/runner.txt
+
       # This is the app javac task observed in the successful AfatStandalone build.
       # Its compile classpath builds TMessagesProj's standalone compile JAR, so it
       # also compiles the shared Java source and generated Lottie metadata. Neither
       # Android module applies Kotlin. Native compilation, R8 and APK packaging
       # remain in assemble below. Keep the same workspace; do not clean between steps.
       - name: Compile production standalone QA Java
-        run: ./gradlew :TMessagesProj_AppStandalone:compileAfatStandaloneJavaWithJavac --no-daemon
+        run: |
+          /usr/bin/time -v -o build-diagnostics/compile-time.txt \
+            ./gradlew :TMessagesProj_AppStandalone:compileAfatStandaloneJavaWithJavac \
+            --no-daemon --profile --info --console=plain
+          mkdir -p build-diagnostics/compile-profile
+          cp -r build/reports/profile/. build-diagnostics/compile-profile/
 
       # TMessagesProj_AppStandalone's standalone build type: debuggable false, jniDebuggable
       # false, minifyEnabled true, release proguard rules, release keystore, and the ordinary
@@ -125,7 +136,13 @@ jobs:
       # TMessagesProj_App is deliberately NOT built: its applicationId is org.telegram.messenger,
       # the Google Play Telegram package.
       - name: Build production standalone QA APK
-        run: ./gradlew :TMessagesProj_AppStandalone:assembleAfatStandalone --no-daemon
+        run: |
+          vmstat -t 10 > build-diagnostics/vmstat.txt &
+          monitor_pid=$!
+          trap 'kill "$monitor_pid" 2>/dev/null || true' EXIT
+          /usr/bin/time -v -o build-diagnostics/assemble-time.txt \
+            ./gradlew :TMessagesProj_AppStandalone:assembleAfatStandalone \
+            --no-daemon --profile --info --console=plain
 
       - name: Collect APK
         run: |
@@ -198,3 +215,24 @@ jobs:
           name: Telegram-Lyrics-QA
           path: Telegram-Lyrics-QA.apk
           if-no-files-found: error
+
+      # Local Gradle profiles and Ninja's per-command timings; no build scan or source upload.
+      - name: Collect build timing reports
+        if: always()
+        run: |
+          mkdir -p build-diagnostics/assemble-profile
+          if [ -d build/reports/profile ]; then
+            cp -r build/reports/profile/. build-diagnostics/assemble-profile/
+          fi
+          find TMessagesProj/.cxx -type f \( -name .ninja_log -o -name build_command.txt -o -name CMakeCache.txt \) \
+            -exec cp --parents '{}' build-diagnostics/ \; 2>/dev/null || true
+          cat build-diagnostics/*-time.txt 2>/dev/null || true
+
+      - name: Upload build timing reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-timing-${{ github.run_number }}
+          path: build-diagnostics/
+          include-hidden-files: true
+          if-no-files-found: warn
