@@ -11280,4 +11280,8 @@
     <string name="ChatProtectionPasscodeOffMessage">Turning off the passcode will also remove protection from all protected chats (%1$d). Continue?</string>
     <string name="AppLockToggle">Lock App with Passcode</string>
     <string name="AppLockToggleInfo">When off, your passcode is kept and still protects individual chats, but Telegram itself no longer locks.</string>
+    <string name="ChatPasscodeUnlockNamed">Unlock %1$s</string>
+    <string name="ChatPasscodeProtectNamed">Protect %1$s</string>
+    <string name="ChatPasscodeUnprotectNamed">Unprotect %1$s</string>
+    <string name="ChatProtectionRowInfo">Lock individual chats with your passcode. Long-press a chat in the chat list to protect it.</string>
 </resources>

@@ -24,3 +24,15 @@ Three separate notions exist now:
 Preview rule: with "hide previews" on, content of a protected chat is hidden on every surface outside the opened
 conversation (dialog rows incl. accessibility, Saved Messages sub-lists, search, hashtag search, downloads list,
 notifications, widgets, popups, car) regardless of temporary authorization. Identity is never hidden.
+
+## Chat authentication UI and settings (device QA pass)
+
+* The chat unlock card hosts Telegram's own `PasscodeView` in a "chat lock" mode inside a dismissible card
+  (`ProtectedChatAuthSheet`). Keypad, digit animation (`AnimatingTextView`), error shake/haptics, wallpaper background,
+  retry throttling and the biometric flow (keypad hidden while the system prompt is up, restored on cancel) are the app
+  lock's own code. Chat mode only changes: verification goes through `ProtectedChatsState` (same credential and
+  counters), success reports an auth proof instead of unlocking the app, and layout is card based.
+* PIN input state is `PasscodeInputBuffer` (pure, unit tested). There is no selected digit: delete removes the latest digit.
+* Settings: Passcode Lock shows the credential rows, a "Lock App with Passcode" switch (Auto-Lock only while it is on),
+  and a single "Protected Chats" row that opens `ProtectedChatsSettingsActivity` (feature switch, hide previews, re-lock time),
+  built like `ArchiveSettingsActivity` (animated switches, diff based row insertion/removal).
