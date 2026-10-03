@@ -1690,8 +1690,10 @@ public class PasscodeView extends FrameLayout implements NotificationCenter.Noti
             // Popup layout: derived from the height the sheet offers, not from the display size.
             final boolean pin = SharedConfig.passcodeType == SharedConfig.PASSCODE_TYPE_PIN;
             final int offered = MeasureSpec.getMode(heightMeasureSpec) == MeasureSpec.UNSPECIFIED ? AndroidUtilities.displaySize.y : MeasureSpec.getSize(heightMeasureSpec);
-            final ChatLockLayout metrics = chatLockLayout = ChatLockLayout.compute((int) (offered / AndroidUtilities.density), pin);
-            final int totalPx = dp(metrics.totalHeight);
+            // Pixel totals can exceed their dp totals (every dp term rounds up), so that much is kept back.
+            final ChatLockLayout metrics = chatLockLayout = ChatLockLayout.compute((int) ((offered - ChatLockLayout.MAX_ROUNDING_PX) / AndroidUtilities.density), pin);
+            final ChatLockLayout.Px px = AndroidUtilities::dp;
+            final int totalPx = metrics.totalHeightPx(px);
 
             imageView.setVisibility(metrics.showIcon ? VISIBLE : GONE);
             imageView.setTranslationX(width / 2f - dp(29));
@@ -1709,8 +1711,8 @@ public class PasscodeView extends FrameLayout implements NotificationCenter.Noti
             passwordFrameLayout.setLayoutParams(layoutParams);
 
             layoutParams = (LayoutParams) numbersFrameLayout.getLayoutParams();
-            layoutParams.height = dp(metrics.headerHeight + metrics.keysHeight());
-            layoutParams.width = dp(metrics.keysWidth());
+            layoutParams.height = metrics.keysFrameHeightPx(px);
+            layoutParams.width = metrics.keysFrameWidthPx(px);
             layoutParams.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
             numbersFrameLayout.setLayoutParams(layoutParams);
 
@@ -1727,8 +1729,8 @@ public class PasscodeView extends FrameLayout implements NotificationCenter.Noti
                 int col = num % 3;
                 LayoutParams keyParams = (LayoutParams) numberFrameLayouts.get(a).getLayoutParams();
                 keyParams.width = keyParams.height = dp(metrics.buttonSize);
-                keyParams.topMargin = dp(metrics.headerHeight) + dp(metrics.buttonSize + metrics.gapY) * row;
-                keyParams.leftMargin = dp(metrics.buttonSize + metrics.gapX) * col;
+                keyParams.topMargin = metrics.keyTopPx(row, px);
+                keyParams.leftMargin = metrics.keyLeftPx(col, px);
                 numberFrameLayouts.get(a).setLayoutParams(keyParams);
             }
             super.onMeasure(widthMeasureSpec, MeasureSpec.makeMeasureSpec(totalPx, MeasureSpec.EXACTLY));

@@ -173,8 +173,11 @@ public final class LyricsTuning {
     /** Text in parentheses is shown as a second, smaller line under the main one: this size
      *  relative to the main text (set once when the row is bound, never per frame)... */
     public static final float BACKGROUND_VOCALS_SCALE = 0.7f;
-    /** ...and this opacity on top of the line's own brightness stage. */
-    public static final float BACKGROUND_VOCALS_ALPHA = 0.4f;
+    /** ...and this opacity on top of the line's own brightness stage. It was 0.4, which left the
+     *  sung part of the small line exactly as dim as the main line's text still to come; at this
+     *  value it reads as sung, while staying clearly below the sung main line. The unsung part
+     *  (ALPHA_UNSUNG times this) stays below the sung part, so the fill still travels. */
+    public static final float BACKGROUND_VOCALS_ALPHA = 0.65f;
 
     // --- Instrumental gap dots (AMLL base/interlude-dots.ts, base/timeline.ts) ----------------
     /** A gap between the end of one line's singing and the next line of at least this long gets

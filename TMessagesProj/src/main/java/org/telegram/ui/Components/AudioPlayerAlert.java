@@ -96,6 +96,8 @@ import org.telegram.messenger.ImageLoader;
 import org.telegram.messenger.ImageLocation;
 import org.telegram.messenger.ImageReceiver;
 import org.telegram.messenger.LocaleController;
+import org.telegram.messenger.LyricsGlow;
+import org.telegram.messenger.LyricsOverlap;
 import org.telegram.messenger.MediaController;
 import org.telegram.messenger.MessageObject;
 import org.telegram.messenger.MessagesController;
@@ -3313,16 +3315,13 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
      */
     private long[] lyricsLineHoldEnd = new long[0];
     /**
-     * Scroll groups. A line whose background vocals are still sung when the next line starts
-     * forms a group with that line (and on, while the last line's background vocals overlap the
-     * one after it). The list stays on the group's first line for the whole group and moves once,
-     * to the line after the group. Per document line: its group's first line, or -1.
+     * Which lines the list keeps while the singing of neighbouring lines overlaps (a line, or its
+     * background vocals, still sung when the next line starts). Every line retires on its own: the
+     * list stays on the oldest line still singing and moves on when that one ends, however long a
+     * chain of overlaps runs.
      */
-    private int[] lyricsGroupStart = new int[0];
-    /** Per group's first line: the group's last line. */
-    private int[] lyricsGroupLast = new int[0];
-    /** Per group's first line: when its last sound ends, background vocals included. */
-    private long[] lyricsGroupEnd = new long[0];
+    private LyricsOverlap lyricsOverlap = new LyricsOverlap(new long[0], new boolean[0], new boolean[0], new int[0]);
+    private final LyricsOverlap.Followable lyricsFollowable = this::canLyricsLineFollow;
     /**
      * Instrumental gaps that show the dots: each has a row of its own (LYRICS_ROW_INTERLUDE in
      * visibleLyrics) just before the line that ends it, and spans [start, end) of the song.
@@ -3459,20 +3458,15 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             final int preRolled = lyricsPreRollLine(index, position);
             if (preRolled != index) activeLine = preRolled;
         }
-        // The lit lines: the current one, every line of its chain that has started (and so their
-        // background vocals), or, once the chain has ended and the list has moved on, the next
-        // line on its own.
+        // The lit lines: from the oldest line still singing to the current one (so an overlapping
+        // pair stays lit together), or, once all of them have ended and the list has moved on, the
+        // next line on its own.
         int litFirst = activeLine;
         int litLast = activeLine;
         if (!idle && activeLine >= 0 && lyricsWordTimed) {
-            final int group = lyricsGroupOf(index);
-            if (group >= 0) {
-                final int after = lyricsGroupAfter(group, position);
-                if (after >= 0) {
-                    litFirst = litLast = after;
-                } else {
-                    litFirst = group;
-                }
+            if (lyricsOverlap.isKnown(index)) {
+                litFirst = lyricsOverlap.litFirst(index, position, lyricsFollowable);
+                litLast = lyricsOverlap.litLast(index, position, lyricsFollowable);
             } else {
                 final int heldRow = lyricsHeldRowAt(index, position);
                 if (heldRow != RecyclerView.NO_POSITION) litFirst = index - 1;
@@ -3812,15 +3806,14 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         int targetRow = line < 0 ? 0 : rowForLyricsLine(line);
         // During an instrumental gap the dots sit on the anchor.
         if (lyricsInterludeRow != RecyclerView.NO_POSITION) targetRow = lyricsInterludeRow;
-        // Apple Music: the list stays on a line (and on the first line of a chain, where each
-        // line starts before the one before it has ended) until that line or the whole chain has
-        // ended, background vocals included, and then moves once, to the line after it.
-        final int group = lyricsWordTimed ? lyricsGroupOf(line) : -1;
-        if (group >= 0 && lyricsInterludeRow == RecyclerView.NO_POSITION) {
-            final int after = lyricsGroupAfter(group, position);
-            if (after >= 0) return rowForLyricsLine(after);
-            final int groupRow = rowForLyricsLine(group);
-            return groupRow != RecyclerView.NO_POSITION ? groupRow : targetRow;
+        // Apple Music: the list stays on a line, and on the oldest line of an overlap that is still
+        // singing, until that line has ended, background vocals included, and then moves on: to the
+        // next oldest line still singing, or, once all have ended, to the line after them. Every
+        // line retires on its own; a chain of overlaps is not one block.
+        if (lyricsWordTimed && lyricsOverlap.isKnown(line) && lyricsInterludeRow == RecyclerView.NO_POSITION) {
+            final int follow = lyricsOverlap.followLine(line, position, lyricsFollowable);
+            final int followRow = rowForLyricsLine(follow);
+            return followRow != RecyclerView.NO_POSITION ? followRow : targetRow;
         }
         final int preRolled = lyricsPreRollLine(line, position);
         if (preRolled != line) targetRow = rowForLyricsLine(preRolled);
@@ -3971,9 +3964,17 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         lyricsDisplayLines = new SyncedLyricsController.Line[lines];
         lyricsLineHoldEnd = new long[lines];
         java.util.Arrays.fill(lyricsLineHoldEnd, Long.MIN_VALUE);
+        final long[] ends = new long[lines];
+        final boolean[] known = new boolean[lines];
+        final boolean[] untimed = new boolean[lines];
+        final int[] nextTimed = new int[lines];
         for (int i = 0; i < lines; i++) {
-            final SyncedLyricsController.Line display = SyncedLyricsController.splitBackgroundVocals(currentLyrics.lines.get(i));
+            final SyncedLyricsController.Line source = currentLyrics.lines.get(i);
+            final SyncedLyricsController.Line display = SyncedLyricsController.splitBackgroundVocals(source);
             lyricsDisplayLines[i] = display;
+            ends[i] = LyricsOverlap.UNKNOWN;
+            nextTimed[i] = nextTimedLyricsLine(i);
+            untimed[i] = !source.timed;
             final SyncedLyricsController.Segments segments = display.segments;
             if (!display.timed || segments == null || segments.size() == 0) continue;
             final long next = nextLyricsLineTimeMs(i);
@@ -3984,65 +3985,28 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 end = Math.max(end, segments.startTimeMs(k) + KaraokeFrame.sweepWindowMs(display.text, segments, k, next));
             }
             if (next != Long.MAX_VALUE && end > next) lyricsLineHoldEnd[i] = end;
-        }
-        // Scroll groups (chains): a line joins the one before it when it starts before that
-        // line, or any earlier line of its chain, has ended, background vocals included. A line
-        // whose end is not known forms no group and keeps the pre-roll.
-        lyricsGroupStart = new int[lines];
-        lyricsGroupLast = new int[lines];
-        lyricsGroupEnd = new long[lines];
-        java.util.Arrays.fill(lyricsGroupStart, -1);
-        java.util.Arrays.fill(lyricsGroupEnd, Long.MIN_VALUE);
-        int group = -1;
-        for (int i = 0; i < lines; i++) {
-            final SyncedLyricsController.Line source = currentLyrics.lines.get(i);
-            if (!source.timed) continue;
-            final SyncedLyricsController.Line display = lyricsDisplayLines[i];
-            final boolean known = display != null && display.timed && display.segments != null
-                    && display.segments.size() > 0 && !TextUtils.isEmpty(source.text);
-            if (!known) {
-                group = -1;
-                continue;
-            }
-            final long next = nextLyricsLineTimeMs(i);
-            long end = Long.MIN_VALUE;
-            final SyncedLyricsController.Segments segments = display.segments;
-            for (int k = 0; k < segments.size(); k++) {
-                end = Math.max(end, segments.startTimeMs(k) + KaraokeFrame.sweepWindowMs(display.text, segments, k, next));
-            }
-            if (group >= 0 && source.timeMs < lyricsGroupEnd[group]) {
-                lyricsGroupStart[i] = group;
-                lyricsGroupLast[group] = i;
-                lyricsGroupEnd[group] = Math.max(lyricsGroupEnd[group], end);
-            } else {
-                group = i;
-                lyricsGroupStart[i] = i;
-                lyricsGroupLast[i] = i;
-                lyricsGroupEnd[i] = end;
+            // A line whose end is not known (or a blank) takes no part and keeps the pre-roll.
+            if (source.timed && !TextUtils.isEmpty(source.text)) {
+                ends[i] = end;
+                known[i] = true;
             }
         }
-    }
-
-    /** The first line of {@code line}'s group, or -1 when it has none. */
-    private int lyricsGroupOf(int line) {
-        return line >= 0 && line < lyricsGroupStart.length ? lyricsGroupStart[line] : -1;
+        lyricsOverlap = new LyricsOverlap(ends, known, untimed, nextTimed);
     }
 
     /**
-     * The line the list moves to once {@code group} (a line, or a chain) has ended, background
-     * vocals included; -1 while it has not, when nothing follows, or when an instrumental gap
-     * follows (its dots take the anchor instead).
+     * Whether {@code line} may take the anchor once the lines before it have ended: not a blank, on
+     * a row, and not preceded by an instrumental gap (its dots take the anchor instead).
      */
-    private int lyricsGroupAfter(int group, long position) {
-        if (group < 0 || lyricsGroupEnd[group] == Long.MIN_VALUE || position < lyricsGroupEnd[group]) return -1;
-        final int next = nextTimedLyricsLine(lyricsGroupLast[group]);
-        if (next < 0 || TextUtils.isEmpty(currentLyrics.lines.get(next).text)) return -1;
-        if (rowForLyricsLine(next) == RecyclerView.NO_POSITION) return -1;
-        final long nextStart = currentLyrics.lines.get(next).timeMs;
+    private boolean canLyricsLineFollow(int line) {
+        if (line < 0 || currentLyrics == null || line >= currentLyrics.lines.size()) return false;
+        if (TextUtils.isEmpty(currentLyrics.lines.get(line).text)) return false;
+        if (rowForLyricsLine(line) == RecyclerView.NO_POSITION) return false;
+        final long start = currentLyrics.lines.get(line).timeMs;
         for (int i = 0; i < lyricsInterludeEnd.length; i++) {
-            if (lyricsInterludeEnd[i] == nextStart) return -1;
+            if (lyricsInterludeEnd[i] == start) return false;
         }
-        return next;
+        return true;
     }
 
     /** The next document line with a time, or -1. */
@@ -5556,6 +5520,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         private long[] wordEmphasisEndMs = new long[8];
         /** When the line stops being active; lifts reverse from there. */
         private long lineActiveEndMs = Long.MAX_VALUE;
+        /** When the line's last sound ends and the list moves on; a long note's glow is gone from there (LyricsGlow). */
+        private long lineGlowEndMs = Long.MAX_VALUE;
         private long wordClockMs;
         /** False until the first clock of this bind, so a fresh row never blends from nothing. */
         private boolean wordClockSet;
@@ -5629,6 +5595,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             wordsMapped = false;
             pieceCount = 0;
             lineActiveEndMs = Long.MAX_VALUE;
+            lineGlowEndMs = Long.MAX_VALUE;
             wordClockSet = false;
             blendStartNanos = 0;
             blendWeight = 1f;
@@ -5692,10 +5659,11 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
          * last syllable's end - the stated end, or the derived fill window for start-only timing.
          * {@code activeEndMs} is when the line stops being active, which is when lifts reverse.
          */
-        void setWordTiming(SyncedLyricsController.Line line, long activeEndMs, long nextLineTimeMs) {
+        void setWordTiming(SyncedLyricsController.Line line, long activeEndMs, long glowEndMs, long nextLineTimeMs) {
             wordCount = 0;
             wordsMapped = false;
             lineActiveEndMs = activeEndMs;
+            lineGlowEndMs = glowEndMs;
             // Draw pieces are cut at word boundaries: the next geometry pass rebuilds them.
             clusterLayout = null;
             pieceCount = 0;
@@ -6581,7 +6549,10 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 emphasisAt(w, i, wordClockMs, emphasisA);
                 if (blending) {
                     emphasisAt(w, i, blendFromMs, emphasisB);
+                    final float glowTo = emphasisA[3];
                     for (int k = 0; k < 4; k++) emphasisA[k] = lerp(emphasisB[k], emphasisA[k], blendWeight);
+                    // A seek onto a finished line shows no glow, not one fading out across the blend.
+                    emphasisA[3] = LyricsGlow.blendedGlow(emphasisB[3], glowTo, blendWeight, wordClockMs, lineGlowEndMs);
                 }
                 final float scale = emphasisA[0];
                 // Logical order: in an RTL word the first grapheme is on the right.
@@ -6655,7 +6626,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             out[1] = t * (position - 0.5f) * 2f * swell * LyricsTuning.EMPHASIS_SPREAD * em;
             out[2] = t * swell / LyricsTuning.EMPHASIS_RISE_REF_SWELL * LyricsTuning.EMPHASIS_RISE_BOX
                     * (fillMetrics.descent - fillMetrics.ascent) + floatUp;
-            out[3] = t * wordGlow[w];
+            // The glow ends with the line's singing (LyricsGlow), not with the word's own envelope.
+            out[3] = LyricsGlow.glow(t, wordGlow[w], now, lineGlowEndMs);
         }
 
         /** Returns the row to plain, uniformly coloured text, clearing any long-note emphasis. */
@@ -7116,12 +7088,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 long activeEnd = Math.min(Math.min(nextLineMs, lyricsEndMs), singingEnd);
                 // Background vocals sung over the next line keep the line active until they end.
                 if (line < lyricsLineHoldEnd.length && lyricsLineHoldEnd[line] > activeEnd) activeEnd = lyricsLineHoldEnd[line];
-                // A line in a chain stays active until the whole chain has ended.
-                final int group = lyricsGroupOf(line);
-                if (group >= 0 && lyricsGroupLast[group] != group && lyricsGroupEnd[group] > activeEnd) {
-                    activeEnd = lyricsGroupEnd[group];
-                }
-                textView.setWordTiming(lyricLine, activeEnd, nextLineMs);
+                textView.setWordTiming(lyricLine, activeEnd, LyricsGlow.glowEnd(activeEnd, lyricsOverlap.endOf(line)), nextLineMs);
             }
             boolean stanzaSpace = !synced && TextUtils.isEmpty(lyricLine.text);
             // ONE typography for the whole large player. Normal lyrics, ordinary line-synced

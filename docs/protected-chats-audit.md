@@ -34,8 +34,10 @@ notifications, widgets, popups, car) regardless of temporary authorization. Iden
   restored on cancel) are the app lock's code.
 * Layout: the full-screen `PasscodeView.onMeasure` derives everything from the display size. In chat mode it asks
   `ChatLockLayout` (pure, tested) for metrics from the height the popup is offered: roomy layout with the lock icon
-  (406dp), otherwise the icon is dropped and keypad buttons step down (56 -> 36dp). Title and digits share one band.
-  Nothing is scaled; the full-screen layout code path is untouched.
+  (414dp: 24dp clear under the bottom row), otherwise the icon is dropped and keypad buttons step down (56 -> 36dp).
+  Title and digits share one band. The keypad frame and the popup are summed in pixels the way the keys are placed
+  (every `dp()` term rounds up on its own, so a frame sized by the dp total cut the bottom off the "0" key at some
+  densities). Nothing is scaled; the full-screen layout code path is untouched.
 * PIN input state is `PasscodeInputBuffer` (pure, tested). No selected digit: delete removes the latest digit.
 * Settings: Passcode Lock = Change Passcode, Fingerprint, then `App Lock` and `Protected Chats` rows
   (`NotificationsCheckCell`: switch end toggles, body opens details; `SwitchRowHitTest`). App Lock details: Auto-lock,
