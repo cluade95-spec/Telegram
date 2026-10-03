@@ -495,7 +495,8 @@ public class NotificationsController extends BaseController implements Notificat
                 MessageObject messageObject = pushMessages.get(a);
                 long dialog_id = messageObject.getDialogId();
                 if (messageObject.messageOwner.mentioned && messageObject.messageOwner.action instanceof TLRPC.TL_messageActionPinMessage ||
-                        DialogObject.isEncryptedDialog(dialog_id) || messageObject.messageOwner.peer_id.channel_id != 0 && !messageObject.isSupergroup()) {
+                        DialogObject.isEncryptedDialog(dialog_id) || messageObject.messageOwner.peer_id.channel_id != 0 && !messageObject.isSupergroup() ||
+                        ProtectedChats.isProtected(currentAccount, dialog_id)) {
                     continue;
                 }
                 popupArray.add(0, messageObject);
@@ -929,6 +930,7 @@ public class NotificationsController extends BaseController implements Notificat
 
     private int addToPopupMessages(ArrayList<MessageObject> popupArrayAdd, MessageObject messageObject, long dialogId, boolean isChannel, SharedPreferences preferences) {
         if (messageObject.isStoryReactionPush) return 0;
+        if (ProtectedChats.isProtected(currentAccount, messageObject.getDialogId())) return 0;
         int popup = 0;
         if (!DialogObject.isEncryptedDialog(dialogId)) {
             if (preferences.getBoolean("custom_" + dialogId, false)) {
@@ -1809,7 +1811,7 @@ public class NotificationsController extends BaseController implements Notificat
             preview[0] = true;
         }
         SharedPreferences preferences = getAccountInstance().getNotificationsSettings();
-        boolean dialogPreviewEnabled = preferences.getBoolean("content_preview_" + dialogId, true);
+        boolean dialogPreviewEnabled = preferences.getBoolean("content_preview_" + dialogId, true) && !ProtectedChats.shouldHideNotificationContent(currentAccount, messageObject.getDialogId());
         if (messageObject.isFcmMessage()) {
             if (chat_id == 0 && fromId != 0) {
                 if (Build.VERSION.SDK_INT > Build.VERSION_CODES.O_MR1) {
@@ -1917,7 +1919,7 @@ public class NotificationsController extends BaseController implements Notificat
             return LocaleController.getString(R.string.NotificationHiddenMessage);
         } else {
             boolean isChannel = ChatObject.isChannel(chat) && !chat.megagroup;
-            if (messageObject.messageOwner != null && messageObject.messageOwner.rich_message != null) {
+            if (messageObject.messageOwner != null && messageObject.messageOwner.rich_message != null && !ProtectedChats.shouldHideNotificationContent(currentAccount, messageObject.getDialogId())) {
                 return messageObject.messageText.toString();
             }
             if (dialogPreviewEnabled && (chat_id == 0 && fromId != 0 && preferences.getBoolean("EnablePreviewAll", true) || chat_id != 0 && (!isChannel && preferences.getBoolean("EnablePreviewGroup", true) || isChannel && preferences.getBoolean("EnablePreviewChannel", true)))) {
@@ -2502,7 +2504,7 @@ public class NotificationsController extends BaseController implements Notificat
             chatId = fromId < 0 ? -fromId : 0;
         }
         SharedPreferences preferences = getAccountInstance().getNotificationsSettings();
-        boolean dialogPreviewEnabled = preferences.getBoolean("content_preview_" + dialogId, true);
+        boolean dialogPreviewEnabled = preferences.getBoolean("content_preview_" + dialogId, true) && !ProtectedChats.shouldHideNotificationContent(currentAccount, messageObject.getDialogId());
         if (messageObject.isFcmMessage()) {
             if (chatId == 0 && fromId != 0) {
                 if (!dialogPreviewEnabled || !preferences.getBoolean("EnablePreviewAll", true)) {
@@ -4746,7 +4748,7 @@ public class NotificationsController extends BaseController implements Notificat
                 }
             }
 
-            if (!hasCallback && Build.VERSION.SDK_INT < 24 && SharedConfig.passcodeHash.length() == 0 && hasMessagesToReply()) {
+            if (!hasCallback && Build.VERSION.SDK_INT < 24 && !SharedConfig.isAppLockEnabled() && !ProtectedChats.hasAnyProtectedChat() && hasMessagesToReply()) {
                 Intent replyIntent = new Intent(ApplicationLoader.applicationContext, PopupReplyReceiver.class);
                 replyIntent.putExtra("currentAccount", currentAccount);
                 if (Build.VERSION.SDK_INT <= 19) {
@@ -4911,7 +4913,7 @@ public class NotificationsController extends BaseController implements Notificat
 
         long selfUserId = getUserConfig().getClientUserId();
         boolean waitingForPasscode = AndroidUtilities.needShowPasscode() || SharedConfig.isWaitingForPasscodeEnter;
-        boolean passcode = SharedConfig.passcodeHash.length() > 0;
+        boolean passcode = SharedConfig.isAppLockEnabled();
         FileLog.d("showExtraNotifications: passcode="+passcode+" waitingForPasscode=" + waitingForPasscode + " selfUserId=" + selfUserId + " useSummaryNotification=" + useSummaryNotification);
 
         int maxCount = 7;
@@ -5134,7 +5136,7 @@ public class NotificationsController extends BaseController implements Notificat
 
             NotificationCompat.Action wearReplyAction = null;
 
-            if ((!isChannel || isSupergroup) && canReply && !SharedConfig.isWaitingForPasscodeEnter && selfUserId != dialogId && !UserObject.isReplyUser(dialogId) && MessagesController.getInstance(currentAccount).getSendPaidMessagesStars(dialogId) <= 0) {
+            if ((!isChannel || isSupergroup) && canReply && !SharedConfig.isWaitingForPasscodeEnter && !ProtectedChats.isProtected(currentAccount, dialogId) && selfUserId != dialogId && !UserObject.isReplyUser(dialogId) && MessagesController.getInstance(currentAccount).getSendPaidMessagesStars(dialogId) <= 0) {
                 Intent replyIntent = new Intent(ApplicationLoader.applicationContext, WearReplyReceiver.class);
                 replyIntent.putExtra("dialog_id", dialogId);
                 replyIntent.putExtra("max_id", maxId);

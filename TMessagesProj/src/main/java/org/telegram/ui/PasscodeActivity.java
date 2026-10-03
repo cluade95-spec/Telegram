@@ -51,6 +51,8 @@ import org.telegram.messenger.ApplicationLoader;
 import org.telegram.messenger.FileLog;
 import org.telegram.messenger.LocaleController;
 import org.telegram.messenger.NotificationCenter;
+import org.telegram.messenger.ProtectedChats;
+import org.telegram.messenger.ProtectedChatsState;
 import org.telegram.messenger.R;
 import org.telegram.messenger.SharedConfig;
 import org.telegram.messenger.UserConfig;
@@ -142,6 +144,14 @@ public class PasscodeActivity extends BaseFragment implements NotificationCenter
     private int captureHeaderRow;
     private int captureRow;
     private int captureDetailRow;
+
+    private int appLockRow;
+    private int appLockDetailRow;
+    private int chatProtectionHeaderRow;
+    private int chatProtectionRow;
+    private int chatHidePreviewRow;
+    private int chatRelockRow;
+    private int chatProtectionDetailRow;
 
     @Keep
     private int disablePasscodeRow;
@@ -275,14 +285,20 @@ public class PasscodeActivity extends BaseFragment implements NotificationCenter
                         return;
                     }
                     if (position == disablePasscodeRow) {
+                        final int protectedChats = ProtectedChats.getState().protectedCount();
                         AlertDialog alertDialog = new AlertDialog.Builder(getParentActivity())
                                 .setTitle(LocaleController.getString(R.string.DisablePasscode))
-                                .setMessage(LocaleController.getString(R.string.DisablePasscodeConfirmMessage))
+                                .setMessage(protectedChats > 0
+                                        ? LocaleController.formatString(R.string.ChatProtectionPasscodeOffMessage, protectedChats)
+                                        : LocaleController.getString(R.string.DisablePasscodeConfirmMessage))
                                 .setNegativeButton(LocaleController.getString(R.string.Cancel), null)
                                 .setPositiveButton(LocaleController.getString(R.string.DisablePasscodeTurnOff), (dialog, which) -> {
+                                    // Explicit credential removal: nothing may keep depending on it afterwards.
                                     SharedConfig.passcodeHash = "";
                                     SharedConfig.appLocked = false;
+                                    SharedConfig.appLockEnabled = true;
                                     SharedConfig.saveConfig();
+                                    ProtectedChats.onCredentialRemoved();
                                     getMediaDataController().buildShortcuts();
                                     int count = listView.getChildCount();
                                     for (int a = 0; a < count; a++) {
@@ -352,6 +368,15 @@ public class PasscodeActivity extends BaseFragment implements NotificationCenter
                             UserConfig.getInstance(currentAccount).saveConfig(false);
                         });
                         showDialog(builder.create());
+                    } else if (position == appLockRow) {
+                        toggleAppLock();
+                    } else if (position == chatProtectionRow) {
+                        toggleChatProtection();
+                    } else if (position == chatHidePreviewRow) {
+                        ProtectedChats.setHidePreviewWhenLocked(!ProtectedChats.getState().isHidePreviewWhenLocked());
+                        ((TextCheckCell) view).setChecked(ProtectedChats.getState().isHidePreviewWhenLocked());
+                    } else if (position == chatRelockRow) {
+                        showChatRelockDialog(position);
                     } else if (position == fingerprintRow) {
                         SharedConfig.useFingerprintLock = !SharedConfig.useFingerprintLock;
                         UserConfig.getInstance(currentAccount).saveConfig(false);
@@ -733,6 +758,79 @@ public class PasscodeActivity extends BaseFragment implements NotificationCenter
         return new ActionIntroActivity(ActionIntroActivity.ACTION_TYPE_SET_PASSCODE);
     }
 
+    private void toggleAppLock() {
+        final boolean enable = !SharedConfig.appLockEnabled;
+        SharedConfig.appLockEnabled = enable;
+        SharedConfig.appLocked = false;
+        SharedConfig.lastPauseTime = 0;
+        SharedConfig.saveConfig();
+        getMediaDataController().buildShortcuts();
+        NotificationCenter.getGlobalInstance().postNotificationName(NotificationCenter.didSetPasscode);
+        updateRows();
+        listAdapter.notifyDataSetChanged();
+    }
+
+    private void toggleChatProtection() {
+        if (!ProtectedChats.isFeatureEnabled()) {
+            ProtectedChats.enableFeature();
+            updateRows();
+            listAdapter.notifyDataSetChanged();
+            return;
+        }
+        final int count = ProtectedChats.getState().protectedCount();
+        if (count == 0) {
+            ProtectedChats.disableFeatureRemovingAllProtection();
+            updateRows();
+            listAdapter.notifyDataSetChanged();
+            return;
+        }
+        // Turning the feature off removes every protection in one deliberate step.
+        AlertDialog alertDialog = new AlertDialog.Builder(getParentActivity())
+                .setTitle(LocaleController.getString(R.string.ChatProtectionDisableTitle))
+                .setMessage(LocaleController.formatString(R.string.ChatProtectionDisableMessage, count))
+                .setNegativeButton(LocaleController.getString(R.string.Cancel), null)
+                .setPositiveButton(LocaleController.getString(R.string.ChatProtectionDisableConfirm), (dialog, which) -> {
+                    ProtectedChats.disableFeatureRemovingAllProtection();
+                    updateRows();
+                    listAdapter.notifyDataSetChanged();
+                }).create();
+        alertDialog.show();
+        ((TextView) alertDialog.getButton(Dialog.BUTTON_POSITIVE)).setTextColor(Theme.getColor(Theme.key_text_RedBold));
+    }
+
+    private String relockValue(int seconds) {
+        if (seconds == 0) {
+            return LocaleController.getString(R.string.ChatProtectionRelockImmediately);
+        } else if (seconds < 60 * 60) {
+            return LocaleController.formatString("AutoLockInTime", R.string.AutoLockInTime, LocaleController.formatPluralString("Minutes", seconds / 60));
+        }
+        return LocaleController.formatString("AutoLockInTime", R.string.AutoLockInTime, LocaleController.formatPluralString("Hours", seconds / 60 / 60));
+    }
+
+    private void showChatRelockDialog(int position) {
+        if (getParentActivity() == null) {
+            return;
+        }
+        final int[] choices = ProtectedChatsState.RELOCK_CHOICES;
+        AlertDialog.Builder builder = new AlertDialog.Builder(getParentActivity());
+        builder.setTitle(LocaleController.getString(R.string.ChatProtectionRelock));
+        final NumberPicker numberPicker = new NumberPicker(getParentActivity());
+        numberPicker.setMinValue(0);
+        numberPicker.setMaxValue(choices.length - 1);
+        for (int i = 0; i < choices.length; i++) {
+            if (choices[i] == ProtectedChats.getState().getRelockSeconds()) {
+                numberPicker.setValue(i);
+            }
+        }
+        numberPicker.setFormatter(value -> relockValue(choices[value]));
+        builder.setView(numberPicker);
+        builder.setNegativeButton(LocaleController.getString(R.string.Done), (dialog, which) -> {
+            ProtectedChats.getState().setRelockSeconds(choices[numberPicker.getValue()]);
+            listAdapter.notifyItemChanged(position);
+        });
+        showDialog(builder.create());
+    }
+
     private void animateSuccessAnimation(Runnable callback) {
         if (!isPinCode()) {
             callback.run();
@@ -802,10 +900,24 @@ public class PasscodeActivity extends BaseFragment implements NotificationCenter
 
     private void updateRows() {
         fingerprintRow = -1;
+        appLockRow = -1;
+        appLockDetailRow = -1;
+        autoLockRow = -1;
+        autoLockDetailRow = -1;
+        captureHeaderRow = -1;
+        captureRow = -1;
+        captureDetailRow = -1;
+        chatProtectionHeaderRow = -1;
+        chatProtectionRow = -1;
+        chatHidePreviewRow = -1;
+        chatRelockRow = -1;
+        chatProtectionDetailRow = -1;
         rowCount = 0;
         utyanRow = rowCount++;
         hintRow = rowCount++;
         changePasscodeRow = rowCount++;
+        appLockRow = rowCount++;
+        appLockDetailRow = rowCount++;
         try {
             if (Build.VERSION.SDK_INT >= 23) {
                 if (
@@ -818,11 +930,20 @@ public class PasscodeActivity extends BaseFragment implements NotificationCenter
         } catch (Throwable e) {
             FileLog.e(e);
         }
-        autoLockRow = rowCount++;
-        autoLockDetailRow = rowCount++;
-        captureHeaderRow = rowCount++;
-        captureRow = rowCount++;
-        captureDetailRow = rowCount++;
+        if (SharedConfig.appLockEnabled) {
+            autoLockRow = rowCount++;
+            autoLockDetailRow = rowCount++;
+            captureHeaderRow = rowCount++;
+            captureRow = rowCount++;
+            captureDetailRow = rowCount++;
+        }
+        chatProtectionHeaderRow = rowCount++;
+        chatProtectionRow = rowCount++;
+        if (ProtectedChats.isFeatureEnabled()) {
+            chatHidePreviewRow = rowCount++;
+            chatRelockRow = rowCount++;
+        }
+        chatProtectionDetailRow = rowCount++;
         disablePasscodeRow = rowCount++;
     }
 
@@ -959,6 +1080,9 @@ public class PasscodeActivity extends BaseFragment implements NotificationCenter
             }
             SharedConfig.allowScreenCapture = true;
             SharedConfig.passcodeType = currentPasswordType;
+            if (isFirst) {
+                SharedConfig.appLockEnabled = true;
+            }
             SharedConfig.saveConfig();
 
             passwordEditText.clearFocus();
@@ -1075,7 +1199,8 @@ public class PasscodeActivity extends BaseFragment implements NotificationCenter
         public boolean isEnabled(RecyclerView.ViewHolder holder) {
             int position = holder.getAdapterPosition();
             return position == fingerprintRow || position == autoLockRow || position == captureRow ||
-                    position == changePasscodeRow || position == disablePasscodeRow;
+                    position == changePasscodeRow || position == disablePasscodeRow ||
+                    position == appLockRow || position == chatProtectionRow || position == chatHidePreviewRow || position == chatRelockRow;
         }
 
         @Override
@@ -1118,6 +1243,12 @@ public class PasscodeActivity extends BaseFragment implements NotificationCenter
                         textCell.setTextAndCheck(LocaleController.getString(R.string.UnlockFingerprint), SharedConfig.useFingerprintLock, false);
                     } else if (position == captureRow) {
                         textCell.setTextAndCheck(LocaleController.getString(R.string.ScreenCaptureShowContent), SharedConfig.allowScreenCapture, false);
+                    } else if (position == appLockRow) {
+                        textCell.setTextAndCheck(LocaleController.getString(R.string.AppLockToggle), SharedConfig.appLockEnabled, false);
+                    } else if (position == chatProtectionRow) {
+                        textCell.setTextAndCheck(LocaleController.getString(R.string.ChatProtectionEnable), ProtectedChats.isFeatureEnabled(), chatHidePreviewRow != -1);
+                    } else if (position == chatHidePreviewRow) {
+                        textCell.setTextAndCheck(LocaleController.getString(R.string.ChatProtectionHidePreview), ProtectedChats.getState().isHidePreviewWhenLocked(), true);
                     }
                     break;
                 }
@@ -1146,6 +1277,10 @@ public class PasscodeActivity extends BaseFragment implements NotificationCenter
                         textCell.setTextAndValue(LocaleController.getString(R.string.AutoLock), val, true);
                         textCell.setTag(Theme.key_windowBackgroundWhiteBlackText);
                         textCell.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText));
+                    } else if (position == chatRelockRow) {
+                        textCell.setTextAndValue(LocaleController.getString(R.string.ChatProtectionRelock), relockValue(ProtectedChats.getState().getRelockSeconds()), false);
+                        textCell.setTag(Theme.key_windowBackgroundWhiteBlackText);
+                        textCell.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText));
                     } else if (position == disablePasscodeRow) {
                         textCell.setText(LocaleController.getString(R.string.DisablePasscode), false);
                         textCell.setTag(Theme.key_text_RedBold);
@@ -1158,6 +1293,8 @@ public class PasscodeActivity extends BaseFragment implements NotificationCenter
                     cell.setHeight(46);
                     if (position == captureHeaderRow) {
                         cell.setText(LocaleController.getString(R.string.ScreenCaptureHeader));
+                    } else if (position == chatProtectionHeaderRow) {
+                        cell.setText(LocaleController.getString(R.string.ChatProtectionHeader));
                     }
                     break;
                 }
@@ -1176,6 +1313,13 @@ public class PasscodeActivity extends BaseFragment implements NotificationCenter
                     } else if (position == autoLockDetailRow) {
                         cell.setText(LocaleController.getString(R.string.AutoLockInfo));
                         cell.getTextView().setGravity(LocaleController.isRTL ? Gravity.RIGHT : Gravity.LEFT);
+                    } else if (position == appLockDetailRow) {
+                        cell.setText(LocaleController.getString(R.string.AppLockToggleInfo));
+                        cell.getTextView().setGravity(LocaleController.isRTL ? Gravity.RIGHT : Gravity.LEFT);
+                    } else if (position == chatProtectionDetailRow) {
+                        cell.setText(LocaleController.getString(R.string.ChatProtectionEnableInfo)
+                                + (ProtectedChats.isFeatureEnabled() ? "\n\n" + LocaleController.getString(R.string.ChatProtectionHidePreviewInfo) + "\n\n" + LocaleController.getString(R.string.ChatProtectionRelockInfo) : ""));
+                        cell.getTextView().setGravity(LocaleController.isRTL ? Gravity.RIGHT : Gravity.LEFT);
                     } else if (position == captureDetailRow) {
                         cell.setText(LocaleController.getString(R.string.ScreenCaptureInfo));
                         cell.getTextView().setGravity(LocaleController.isRTL ? Gravity.RIGHT : Gravity.LEFT);
@@ -1187,13 +1331,13 @@ public class PasscodeActivity extends BaseFragment implements NotificationCenter
 
         @Override
         public int getItemViewType(int position) {
-            if (position == fingerprintRow || position == captureRow) {
+            if (position == fingerprintRow || position == captureRow || position == appLockRow || position == chatProtectionRow || position == chatHidePreviewRow) {
                 return VIEW_TYPE_CHECK;
-            } else if (position == changePasscodeRow || position == autoLockRow || position == disablePasscodeRow) {
+            } else if (position == changePasscodeRow || position == autoLockRow || position == disablePasscodeRow || position == chatRelockRow) {
                 return VIEW_TYPE_SETTING;
-            } else if (position == autoLockDetailRow || position == captureDetailRow || position == hintRow) {
+            } else if (position == autoLockDetailRow || position == captureDetailRow || position == hintRow || position == appLockDetailRow || position == chatProtectionDetailRow) {
                 return VIEW_TYPE_INFO;
-            } else if (position == captureHeaderRow) {
+            } else if (position == captureHeaderRow || position == chatProtectionHeaderRow) {
                 return VIEW_TYPE_HEADER;
             } else if (position == utyanRow) {
                 return VIEW_TYPE_UTYAN;

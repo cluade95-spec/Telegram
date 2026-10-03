@@ -64,6 +64,7 @@ import org.telegram.ui.Components.Bulletin;
 import org.telegram.ui.Components.BulletinFactory;
 import org.telegram.ui.Components.LayoutHelper;
 import org.telegram.ui.LaunchActivity;
+import org.telegram.ui.ProtectedChatGate;
 import org.telegram.ui.Stories.StoryViewer;
 import org.telegram.ui.bots.BotWebViewAttachedSheet;
 
@@ -72,6 +73,9 @@ import java.util.ArrayList;
 public abstract class BaseFragment {
 
     public boolean isFinished;
+    /** Dialog registered with ProtectedChatGate for this fragment, 0 if none. */
+    public long protectedGateDialogId;
+    public int protectedGateAccount;
     protected boolean finishing;
     public Dialog visibleDialog;
     protected int currentAccount = UserConfig.selectedAccount;
@@ -492,6 +496,7 @@ public abstract class BaseFragment {
 
     @CallSuper
     public void onFragmentDestroy() {
+        ProtectedChatGate.onFragmentDestroyed(this);
         getConnectionsManager().cancelRequestsForGuid(classGuid);
         getMessagesStorage().cancelTasksForGuid(classGuid);
         isFinished = true;
@@ -977,6 +982,9 @@ public abstract class BaseFragment {
 
     public INavigationLayout[] showAsSheet(BaseFragment fragment, BottomSheetParams params) {
         if (getParentActivity() == null) {
+            return null;
+        }
+        if (ProtectedChatGate.block(fragment, getParentActivity(), () -> showAsSheet(fragment, params))) {
             return null;
         }
         BottomSheet[] bottomSheet = new BottomSheet[1];

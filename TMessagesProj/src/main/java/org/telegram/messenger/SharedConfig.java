@@ -229,6 +229,11 @@ public class SharedConfig {
     public static int badPasscodeTries;
     public static byte[] passcodeSalt = new byte[0];
     public static boolean appLocked;
+    /**
+     * Whether the passcode credential also locks the whole app. The credential itself
+     * (passcodeHash) may exist while this is false, e.g. when it is only used for protected chats.
+     */
+    public static boolean appLockEnabled = true;
     public static int autoLockIn = 60 * 60;
 
     public static boolean saveIncomingPhotos;
@@ -435,6 +440,7 @@ public class SharedConfig {
                 editor.putString("passcodeHash1", passcodeHash);
                 editor.putString("passcodeSalt", passcodeSalt.length > 0 ? Base64.encodeToString(passcodeSalt, Base64.DEFAULT) : "");
                 editor.putBoolean("appLocked", appLocked);
+                editor.putBoolean("appLockEnabled", appLockEnabled);
                 editor.putInt("passcodeType", passcodeType);
                 editor.putLong("passcodeRetryInMs", passcodeRetryInMs);
                 editor.putLong("lastUptimeMillis", lastUptimeMillis);
@@ -513,6 +519,7 @@ public class SharedConfig {
             saveIncomingPhotos = preferences.getBoolean("saveIncomingPhotos", false);
             passcodeHash = preferences.getString("passcodeHash1", "");
             appLocked = preferences.getBoolean("appLocked", false);
+            appLockEnabled = preferences.getBoolean("appLockEnabled", true);
             passcodeType = preferences.getInt("passcodeType", 0);
             passcodeRetryInMs = preferences.getLong("passcodeRetryInMs", 0);
             lastUptimeMillis = preferences.getLong("lastUptimeMillis", 0);
@@ -823,6 +830,16 @@ public class SharedConfig {
         return true;
     }
 
+    /** True when a passcode credential exists (used by the app lock and/or protected chats). */
+    public static boolean hasPasscode() {
+        return passcodeHash.length() > 0;
+    }
+
+    /** True when the passcode locks the whole app. */
+    public static boolean isAppLockEnabled() {
+        return PasscodeLockPolicy.isAppLockEnabled(passcodeHash.length() > 0, appLockEnabled);
+    }
+
     public static boolean checkPasscode(String passcode) {
         if (passcodeSalt.length == 0) {
             boolean result = Utilities.MD5(passcode).equals(passcodeHash);
@@ -859,8 +876,10 @@ public class SharedConfig {
     }
 
     public static void clearConfig() {
+        ProtectedChats.onCredentialRemoved();
         saveIncomingPhotos = false;
         appLocked = false;
+        appLockEnabled = true;
         passcodeType = PASSCODE_TYPE_PIN;
         passcodeRetryInMs = 0;
         lastUptimeMillis = 0;
