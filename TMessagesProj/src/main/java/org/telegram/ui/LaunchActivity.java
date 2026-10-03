@@ -6202,18 +6202,13 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
     public boolean didSelectDialogs(DialogsActivity dialogsFragment, ArrayList<MessagesStorage.TopicKey> dids, CharSequence message, boolean param, boolean _notify, int _scheduleDate, int scheduleRepeatPeriod, TopicsFragment topicsFragment) {
         final int account = dialogsFragment != null ? dialogsFragment.getCurrentAccount() : currentAccount;
 
-        // Content shared from outside (share sheet, Direct Share shortcut, share picker) is sent into the
-        // chat without opening it, so a locked protected chat needs the same authentication that opening
-        // it needs. After it the same selection goes through again.
-        for (int i = 0; i < dids.size(); i++) {
-            final long lockedDialogId = dids.get(i).dialogId;
-            if (ProtectedChats.isLockedProtected(account, lockedDialogId)) {
-                if (!org.telegram.ui.Components.ProtectedChatAuthSheet.isShowing()) {
-                    ProtectedChatGate.authenticate(this, null, account, lockedDialogId, org.telegram.ui.Components.ProtectedChatAuthSheet.Mode.UNLOCK,
-                            () -> didSelectDialogs(dialogsFragment, dids, message, param, _notify, _scheduleDate, scheduleRepeatPeriod, topicsFragment));
-                }
-                return false;
-            }
+        // Content shared from outside (share sheet, Direct Share shortcut, share picker) lands in the
+        // chat it is sent to, so a locked protected chat needs the same authentication that opening it
+        // needs, Saved Messages included (unlike an in-app forward, a share opens its chat). After the
+        // unlock the same selection goes through again, once.
+        if (ProtectedChatGate.holdForDestinations(this, account, dids, false,
+                () -> didSelectDialogs(dialogsFragment, dids, message, param, _notify, _scheduleDate, scheduleRepeatPeriod, topicsFragment))) {
+            return false;
         }
 
         if (exportingChatUri != null) {

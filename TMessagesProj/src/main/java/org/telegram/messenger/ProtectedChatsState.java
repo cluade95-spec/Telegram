@@ -101,7 +101,18 @@ public final class ProtectedChatsState {
         boolean pausedWhileOpen;
         /** Short window after authentication in which the chat must be opened (see GRACE_MS). */
         long graceUntil;
+        /** Forward hold (HOLD_*): the chat started a forward on its own authorization. */
+        int hold;
+        /** The chat was covered while the forward picker was open; the countdown starts if it ends without a deposit. */
+        boolean leaveDeferred;
+        long deferredLeftAt;
     }
+
+    private static final int HOLD_NONE = 0;
+    /** The forward picker the open chat started is on top of it. */
+    private static final int HOLD_PICKER = 1;
+    /** The forward went to the user's own Saved Messages; Telegram is showing its success and tag interaction. */
+    private static final int HOLD_COMPLETING = 2;
 
     private final Storage storage;
     private final Clock clock;
@@ -476,21 +487,113 @@ public final class ProtectedChatsState {
         if (auth != null && isUnlocked(accountKey, dialogId)) {
             auth.active = true;
             auth.graceUntil = 0;
+            auth.leaveDeferred = false;
         }
     }
 
     public synchronized void chatLeft(long accountKey, long dialogId) {
         Auth auth = authorized.get(key(accountKey, dialogId));
         if (auth != null && auth.active) {
+            if (auth.hold == HOLD_PICKER) {
+                // The forward picker the chat itself opened covers it. That is not the user leaving:
+                // remember when it happened and settle when the picker is gone (forwardPickerClosed).
+                if (!auth.leaveDeferred) {
+                    auth.leaveDeferred = true;
+                    auth.deferredLeftAt = clock.elapsedMs();
+                }
+                return;
+            }
+            // Anything else that covers the chat, also while Telegram completes a forward, is
+            // unrelated navigation: the hold ends and the normal countdown starts.
+            auth.hold = HOLD_NONE;
             auth.active = false;
             auth.leftAt = clock.elapsedMs();
         }
+    }
+
+    // ------------------------------------------------------------- forward hold
+
+    /**
+     * The open, authorized chat starts a forward: its forward picker is about to cover it. For as
+     * long as the picker is on top, the chat is not counted as left, so Immediate Auto-lock does not
+     * close it before the forward completes. Only a chat that is protected, authorized and open
+     * right now can hold; nothing else is authorized and nothing is extended: the hold ends with the
+     * picker (see {@link #forwardPickerClosed}), with the success interaction, with any other
+     * navigation and with the app going to the background.
+     *
+     * @return true if the hold started
+     */
+    public synchronized boolean beginForwardHold(long accountKey, long dialogId) {
+        if (!isProtected(accountKey, dialogId)) {
+            return false;
+        }
+        Auth auth = authorized.get(key(accountKey, dialogId));
+        if (auth == null || !auth.active || auth.hold != HOLD_NONE) {
+            return false;
+        }
+        auth.hold = HOLD_PICKER;
+        auth.leaveDeferred = false;
+        return true;
+    }
+
+    /**
+     * The picker is gone without a deposit into Saved Messages (cancelled, or another destination
+     * was chosen): the countdown the cover would have started starts now, from when the chat was
+     * covered, exactly as without a hold. Does nothing once the forward went to Saved Messages.
+     */
+    public synchronized void forwardPickerClosed(long accountKey, long dialogId) {
+        Auth auth = authorized.get(key(accountKey, dialogId));
+        if (auth == null || auth.hold != HOLD_PICKER) {
+            return;
+        }
+        auth.hold = HOLD_NONE;
+        if (auth.leaveDeferred) {
+            auth.leaveDeferred = false;
+            auth.active = false;
+            auth.leftAt = auth.deferredLeftAt;
+        }
+    }
+
+    /**
+     * The picker's forward goes to the user's own Saved Messages and Telegram is about to finish it
+     * and show its success interaction (the tag emojis) on this chat. The authorization is kept
+     * until that interaction ends, but never beyond the chat being on screen.
+     */
+    public synchronized void forwardToSavedMessagesCompleting(long accountKey, long dialogId) {
+        Auth auth = authorized.get(key(accountKey, dialogId));
+        if (auth != null && auth.hold == HOLD_PICKER) {
+            auth.hold = HOLD_COMPLETING;
+        }
+    }
+
+    /** Telegram's success / tag interaction ended (dismissed, timed out, tag chosen): the hold is over. */
+    public synchronized void forwardCompletionEnded(long accountKey, long dialogId) {
+        Auth auth = authorized.get(key(accountKey, dialogId));
+        if (auth == null || auth.hold != HOLD_COMPLETING) {
+            return;
+        }
+        auth.hold = HOLD_NONE;
+        if (auth.leaveDeferred) {
+            // The chat never came back on screen: the countdown it would have had starts now.
+            auth.leaveDeferred = false;
+            auth.active = false;
+            auth.leftAt = auth.deferredLeftAt;
+        }
+    }
+
+    /** Whether a forward hold exists for the chat. */
+    public synchronized boolean isForwardHoldActive(long accountKey, long dialogId) {
+        Auth auth = authorized.get(key(accountKey, dialogId));
+        return auth != null && auth.hold != HOLD_NONE;
     }
 
     /** App moved to the background: open chats start their re-lock countdown. */
     public synchronized void appPaused() {
         long now = clock.elapsedMs();
         for (Auth auth : authorized.values()) {
+            // A forward hold never survives the app going to the background.
+            auth.hold = HOLD_NONE;
+            auth.leaveDeferred = false;
             if (auth.active) {
                 auth.active = false;
                 auth.leftAt = now;

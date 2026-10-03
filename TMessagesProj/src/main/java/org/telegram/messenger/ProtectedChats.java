@@ -257,6 +257,24 @@ public class ProtectedChats {
         }
     }
 
+    // ------------------------------------------------------------- forward hold (see ProtectedChatsState)
+
+    public static boolean beginForwardHold(int account, long dialogId) {
+        return state().beginForwardHold(accountKey(account), dialogId);
+    }
+
+    public static void forwardPickerClosed(int account, long dialogId) {
+        state().forwardPickerClosed(accountKey(account), dialogId);
+    }
+
+    public static void forwardToSavedMessagesCompleting(int account, long dialogId) {
+        state().forwardToSavedMessagesCompleting(accountKey(account), dialogId);
+    }
+
+    public static void forwardCompletionEnded(int account, long dialogId) {
+        state().forwardCompletionEnded(accountKey(account), dialogId);
+    }
+
     public static void onAppPaused() {
         if (state().protectedCount() > 0) {
             state().appPaused();

@@ -3082,6 +3082,9 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
     @Override
     public void onFragmentDestroy() {
         super.onFragmentDestroy();
+        // The picker is gone: whatever it held for the chat that opened it ends with it.
+        ProtectedChatGate.forwardPickerClosed(protectedForwardSource);
+        protectedForwardSource = null;
         if (observersGroup != null) {
             observersGroup.removeAllObservers();
             observersGroup = null;
@@ -4982,7 +4985,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
                     for (int i = 0; i < selectedDialogs.size(); i++) {
                         topicKeys.add(MessagesStorage.TopicKey.of(selectedDialogs.get(i), 0));
                     }
-                    delegate.didSelectDialogs(DialogsActivity.this, topicKeys, message, false, notify, scheduleDate, scheduleRepeatPeriod, null);
+                    notifyDelegate(topicKeys, message, false, notify, scheduleDate, scheduleRepeatPeriod, null, false);
                 }
 
                 @Override
@@ -5158,7 +5161,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
                 for (int i = 0; i < selectedDialogs.size(); i++) {
                     topicKeys.add(MessagesStorage.TopicKey.of(selectedDialogs.get(i), 0));
                 }
-                delegate.didSelectDialogs(DialogsActivity.this, topicKeys, commentView.getFieldText(), false, notify, scheduleDate, scheduleRepeatPeriod, null);
+                notifyDelegate(topicKeys, commentView.getFieldText(), false, notify, scheduleDate, scheduleRepeatPeriod, null, false);
             });
             writeButton.setOnLongClickListener(this::onSendLongClick);
             writeButton.setVisibility(View.GONE);
@@ -11723,7 +11726,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
                         topicKeys.add(MessagesStorage.TopicKey.of(selectedDialogs.get(i), 0));
                     }
                     PhotoViewer.getInstance().closePhoto(true, false);
-                    delegate.didSelectDialogs(DialogsActivity.this, topicKeys, commentView.getFieldText(), false, notify, scheduleDate, scheduleRepeatPeriod, null);
+                    notifyDelegate(topicKeys, commentView.getFieldText(), false, notify, scheduleDate, scheduleRepeatPeriod, null, false);
                     return;
                 }
                 PhotoViewer.getInstance().closePhoto(true, false);
@@ -11864,6 +11867,37 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
             }
         }
         return true;
+    }
+
+    /** The chat that opened this forward picker over itself (see ProtectedChatsState.beginForwardHold). */
+    private BaseFragment protectedForwardSource;
+
+    public void setProtectedForwardSource(BaseFragment source) {
+        protectedForwardSource = source;
+    }
+
+    /**
+     * Every forward picker hands its selection to the delegate here. A destination that is protected
+     * and locked asks for authentication first, except the user's own Saved Messages, which only
+     * receives (it is neither unlocked nor opened). After a successful unlock the same selection,
+     * with the same messages, destinations (topics included) and options, goes to the delegate again,
+     * once; a cancelled unlock sends nothing and leaves the picker as it was.
+     *
+     * @param resetWhenHandled the delegate is dropped once it reports the selection handled
+     */
+    private boolean notifyDelegate(ArrayList<MessagesStorage.TopicKey> dids, CharSequence message, boolean param, boolean notify, int scheduleDate, int scheduleRepeatPeriod, TopicsFragment topicsFragment, boolean resetWhenHandled) {
+        if (initialDialogsType == DIALOGS_TYPE_FORWARD && ProtectedChatGate.holdForDestinations(getParentActivity(), currentAccount, dids, true, () -> {
+            if (delegate != null && !isFinished) {
+                notifyDelegate(dids, message, param, notify, scheduleDate, scheduleRepeatPeriod, topicsFragment, resetWhenHandled);
+            }
+        })) {
+            return false;
+        }
+        final boolean handled = delegate.didSelectDialogs(DialogsActivity.this, dids, message, param, notify, scheduleDate, scheduleRepeatPeriod, topicsFragment);
+        if (handled && resetWhenHandled && resetDelegate) {
+            delegate = null;
+        }
+        return handled;
     }
 
     public void didSelectResult(final long dialogId, long topicId, boolean useAlert, final boolean param) {
@@ -12024,10 +12058,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
             if (delegate != null) {
                 ArrayList<MessagesStorage.TopicKey> dids = new ArrayList<>();
                 dids.add(MessagesStorage.TopicKey.of(dialogId, topicId));
-                boolean res = delegate.didSelectDialogs(DialogsActivity.this, dids, null, param, notify, scheduleDate, scheduleRepeatPeriod, topicsFragment);
-                if (res && resetDelegate) {
-                    delegate = null;
-                }
+                notifyDelegate(dids, null, param, notify, scheduleDate, scheduleRepeatPeriod, topicsFragment, true);
             } else {
                 finishFragment();
             }
@@ -12108,7 +12139,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
                 final ArrayList<MessagesStorage.TopicKey> topicKeys = new ArrayList<>();
                 for (int i = 0; i < selectedDialogs.size(); i++)
                     topicKeys.add(MessagesStorage.TopicKey.of(selectedDialogs.get(i), 0));
-                delegate.didSelectDialogs(DialogsActivity.this, topicKeys, commentView.getFieldText(), false, notify, scheduleDate, scheduleRepeatPeriod, null);
+                notifyDelegate(topicKeys, commentView.getFieldText(), false, notify, scheduleDate, scheduleRepeatPeriod, null, false);
             })
             .addIf(canSchedule, R.drawable.msg_calendar2, LocaleController.getString(R.string.ScheduleMessage), () -> {
                 AlertsCreator.createScheduleDatePickerDialog(getParentActivity(), onlyMyselfFinal ? getUserConfig().getClientUserId() : -1, new AlertsCreator.ScheduleDatePickerDelegate() {
@@ -12123,7 +12154,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
                         for (int i = 0; i < selectedDialogs.size(); i++) {
                             topicKeys.add(MessagesStorage.TopicKey.of(selectedDialogs.get(i), 0));
                         }
-                        delegate.didSelectDialogs(DialogsActivity.this, topicKeys, commentView.getFieldText(), false, notify, scheduleDate, scheduleRepeatPeriod, null);
+                        notifyDelegate(topicKeys, commentView.getFieldText(), false, notify, scheduleDate, scheduleRepeatPeriod, null, false);
                     }
                 }, getResourceProvider());
             })

@@ -6,7 +6,9 @@ import android.os.Bundle;
 import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.DialogObject;
 import org.telegram.messenger.LocaleController;
+import org.telegram.messenger.ForwardDestinations;
 import org.telegram.messenger.MessagesController;
+import org.telegram.messenger.MessagesStorage;
 import org.telegram.messenger.ProtectedChats;
 import org.telegram.messenger.ProtectedDialogIds;
 import org.telegram.messenger.ProtectedChatsState;
@@ -95,6 +97,9 @@ public final class ProtectedChatGate {
         }
         final int account = fragment.protectedGateAccount;
         final long dialogId = fragment.protectedGateDialogId;
+        // Back on screen: the forward picker it opened over itself is gone. If it did not deposit
+        // into Saved Messages the cover counts as leaving, exactly as without the picker.
+        ProtectedChats.forwardPickerClosed(account, dialogId);
         if (ProtectedChats.isLockedProtected(account, dialogId)) {
             AndroidUtilities.runOnUIThread(() -> {
                 if (!fragment.isFinished && ProtectedChats.isLockedProtected(account, dialogId)) {
@@ -110,6 +115,9 @@ public final class ProtectedChatGate {
     public static void onFragmentDestroyed(BaseFragment fragment) {
         if (fragment.protectedGateDialogId != 0) {
             long dialogId = fragment.protectedGateDialogId;
+            // A chat that is gone holds nothing.
+            ProtectedChats.forwardPickerClosed(fragment.protectedGateAccount, dialogId);
+            ProtectedChats.forwardCompletionEnded(fragment.protectedGateAccount, dialogId);
             fragment.protectedGateDialogId = 0;
             if (fragment.protectedGateVisible) {
                 fragment.protectedGateVisible = false;
@@ -151,9 +159,78 @@ public final class ProtectedChatGate {
         return true;
     }
 
+    /**
+     * Destination rule of a forward or a share (see {@link ForwardDestinations}). If a destination
+     * is protected and locked the authentication sheet is shown and true is returned: the caller
+     * stops, and {@code resume} (the original operation with its original arguments) runs once
+     * after a successful unlock, never after a cancel. False: nothing is locked and the caller
+     * continues inline.
+     *
+     * @param ownSavedMessagesExempt a forward never asks to deposit into the user's own Saved
+     *                               Messages (it neither unlocks nor opens it); a share does, since
+     *                               it opens the chat it lands in.
+     */
+    public static boolean holdForDestinations(Activity activity, int account, java.util.List<MessagesStorage.TopicKey> dids, boolean ownSavedMessagesExempt, Runnable resume) {
+        final java.util.ArrayList<Long> ids = new java.util.ArrayList<>();
+        for (int i = 0; i < dids.size(); i++) {
+            ids.add(dids.get(i).dialogId);
+        }
+        final long own = UserConfig.getInstance(account).getClientUserId();
+        final ForwardDestinations.Locks locks = dialogId -> ProtectedChats.isLockedProtected(account, dialogId);
+        if (activity == null) {
+            // No way to ask: a locked destination stays closed (secure failure).
+            return ForwardDestinations.firstLocked(ids, own, ownSavedMessagesExempt, locks) != 0;
+        }
+        return ForwardDestinations.holdUntilUnlocked(ids, own, ownSavedMessagesExempt, locks, (dialogId, onUnlocked, onCancelled) ->
+                AndroidUtilities.runOnUIThread(() -> authenticate(activity, null, account, dialogId, ProtectedChatAuthSheet.Mode.UNLOCK, onUnlocked, onCancelled)), resume);
+    }
+
+    // ------------------------------------------------------------------ forward hold
+
+    /** The chat is about to open its forward picker over itself (see ProtectedChatsState.beginForwardHold). */
+    public static void beginForwardHold(BaseFragment source) {
+        if (source == null || source.protectedGateDialogId == 0 || !source.protectedGateVisible) {
+            return;
+        }
+        ProtectedChats.beginForwardHold(source.protectedGateAccount, source.protectedGateDialogId);
+    }
+
+    /** The picker is gone (or never opened) without a deposit into Saved Messages. */
+    public static void forwardPickerClosed(BaseFragment source) {
+        if (source != null && source.protectedGateDialogId != 0) {
+            ProtectedChats.forwardPickerClosed(source.protectedGateAccount, source.protectedGateDialogId);
+        }
+    }
+
+    /** The forward goes into the own Saved Messages and Telegram is about to show its success and tag interaction. */
+    public static void forwardToSavedMessagesCompleting(BaseFragment source) {
+        if (source != null && source.protectedGateDialogId != 0) {
+            ProtectedChats.forwardToSavedMessagesCompleting(source.protectedGateAccount, source.protectedGateDialogId);
+        }
+    }
+
+    /** Telegram's success and tag interaction ended. */
+    public static void forwardCompletionEnded(BaseFragment source) {
+        if (source != null && source.protectedGateDialogId != 0) {
+            ProtectedChats.forwardCompletionEnded(source.protectedGateAccount, source.protectedGateDialogId);
+        }
+    }
+
     /** Shows the floating prompt for a dialog and runs {@code onSuccess} after the matching state transition. */
     public static void authenticate(Activity activity, org.telegram.ui.ActionBar.Theme.ResourcesProvider resourcesProvider, int account, long dialogId, ProtectedChatAuthSheet.Mode mode, Runnable onSuccess) {
+        authenticate(activity, resourcesProvider, account, dialogId, mode, onSuccess, null);
+    }
+
+    /** Like above; {@code onCancelled} runs when the prompt was dismissed without authenticating. */
+    public static void authenticate(Activity activity, org.telegram.ui.ActionBar.Theme.ResourcesProvider resourcesProvider, int account, long dialogId, ProtectedChatAuthSheet.Mode mode, Runnable onSuccess, Runnable onCancelled) {
         ProtectedChatAuthSheet.show(activity, resourcesProvider, mode, getTitle(account, dialogId), new ProtectedChatAuthSheet.Callback() {
+            @Override
+            public void onCancelled() {
+                if (onCancelled != null) {
+                    onCancelled.run();
+                }
+            }
+
             @Override
             public void onAuthenticated(ProtectedChatsState.AuthProof proof) {
                 ProtectedChatsState.Result result;
@@ -168,8 +245,12 @@ public final class ProtectedChatGate {
                         result = ProtectedChats.unlock(account, dialogId, proof);
                         break;
                 }
-                if (result == ProtectedChatsState.Result.OK && onSuccess != null) {
-                    onSuccess.run();
+                if (result == ProtectedChatsState.Result.OK) {
+                    if (onSuccess != null) {
+                        onSuccess.run();
+                    }
+                } else if (onCancelled != null) {
+                    onCancelled.run();
                 }
             }
         });

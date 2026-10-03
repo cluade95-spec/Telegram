@@ -69,3 +69,31 @@ keeps its normal structure for every peer (own profile, users, groups, channels,
 * Gate: opening the profile of another protected dialog still goes through `ProtectedChatGate`, because that profile
   hosts the protected shared media. The own profile is never gated as a whole.
 * App Lock state, the credential and the locked/unlocked state never decide whether an unrelated profile feature is shown.
+
+## Forwarding and sharing
+
+**Destination rule** (`ForwardDestinations`, one rule for every kind of destination: users, bots, groups, supergroups,
+channels, topics, secret chats): a destination that is protected and locked asks for authentication before anything is
+sent. The only exception is the user's own Saved Messages: a forward into it is write-only, so it neither asks nor unlocks
+nor opens Saved Messages, and its history stays behind its own lock. A destination that is already unlocked is not asked
+again. In-app forward pickers (`DialogsActivity`, type forward: chat forward, quote and reply pickers, photo viewer,
+media, search, music, share contact) and the in-app share sheet (`ShareAlert`) apply it where the selection is handed
+over. The system share sheet, Direct Share and the share picker (`LaunchActivity.didSelectDialogs`) apply it too, but
+without the exception: a share opens the chat it lands in.
+
+**Continuation**: the pending operation is the original selection handed over again with the arguments it had (messages
+in order, destinations with their topics, comment, send options). Nothing is consumed before the destinations are open.
+After a successful unlock it runs once; a cancelled or failed unlock drops it and it can never run later.
+Lost-forward root cause (build #80): `ChatActivity.didSelectDialogs` cleared the selection and the forwarded message
+first, then opened the destination chat; the chat gate blocked that open, the picker was closed, and after the unlock
+the gate only reopened the bare destination chat, so the forward panel was never created.
+
+**Source side** (`ProtectedChatsState.beginForwardHold`): a forward picker covers the chat that opened it. With
+Immediate Auto-lock the covered chat was locked and then closed when the picker returned to it, before Telegram's success
+message and tag emojis for a forward to Saved Messages could finish. While the picker is on top the cover is not counted
+as leaving (the time it happened is kept). If the picker ends without a deposit into Saved Messages (Back, another
+destination) the countdown the cover would have started is applied from that time: the old behaviour. A deposit into
+Saved Messages moves the hold to the completion interaction, which ends when Telegram's bulletin (tag emojis) or undo view
+hides. The hold concerns only the chat that was authorized and open when it began, never authorizes anything else, and
+ends at once on any other navigation away from that chat, on the app going to the background, on a manual lock and when
+the chat is destroyed. There is no timer.
