@@ -13,8 +13,8 @@ Three separate notions exist now:
 | `LaunchActivity` onCreate / `onActivityResult` / `onPasscodePause` / `ExternalActionActivity` / `BubbleActivity` lock timers | auto-lock bookkeeping | app lock | app lock only. Protected chats use their own `appPaused/appResumed` calls |
 | `DialogsActivity` header lock icon | "lock the app now" | app lock | action locks the app |
 | `TelegramMediaSession` | hide car/media metadata while app is locked | app lock | app lock |
-| `MediaDataController` launcher shortcuts | do not list frequent chats while a passcode lock is on | app lock **and** never list protected chats | identity of protected chats is kept out of the launcher; rebuilt whenever protection changes |
-| `NotificationsController` pre-API-24 popup reply action | no reply from notifications while locked | app lock; protected dialogs are filtered per dialog (`hasMessagesToReply`, popup list, wear action, receiver) | unrelated chats keep their reply paths |
+| `MediaDataController` launcher shortcuts | do not list frequent chats while a passcode lock is on | app lock (as on master); protected chats are listed like any other | a shortcut holds a chat's name and avatar, never its messages; opening one goes through the protected-chat gate. Hiding it removed a Telegram feature without protecting any message content |
+| `NotificationsController` pre-API-24 popup reply action, popup list, bubble, wear reply (`WearReplyReceiver`), car home (`HomeScreen`) | no reply from notifications while locked | app lock; per dialog `ProtectedChats.shouldHideContent` (a protected chat with "Hide Message Previews" on) | these surfaces show or act on message text, so they follow the same "hide previews" setting as the notification text itself; unrelated chats keep their paths |
 | `NotificationsController` `passcode` log variable | log only | app lock | no behavior |
 | FLAG_SECURE / screenshots: `LaunchActivity`, `BubbleActivity`, `ExternalActionActivity`, `PaymentFormActivity`, `AndroidUtilities.allowScreenCapture` | block screenshots / task-switcher content whenever a passcode exists | **credential** (reverted to the original property) | the "show app content" switch is a credential-level setting; its rows are shown whenever a credential exists |
 | `EditWidgetActivity` note | "passcode ignored for widgets" | credential | text is about the passcode in general |
@@ -43,3 +43,19 @@ notifications, widgets, popups, car) regardless of temporary authorization. Iden
   (`NotificationsCheckCell`: switch end toggles, body opens details; `SwitchRowHitTest`). App Lock details: Auto-lock,
   App Content in Task Switcher. Protected Chats details: Hide Message Previews, Auto-lock, Chats (count) ->
   management list (identity only rows, remove needs the passcode). Switches animate themselves; no list rebuilds.
+
+## Profiles and shared media (device QA regression pass)
+
+Protected Chats protects a protected chat and its message content. It does not remove Telegram features, so a profile
+keeps its normal structure for every peer (own profile, users, groups, channels, bots, Saved Messages, secret chats).
+
+* Never touched by protection: Stories, Gifts (profile gifts), Common Groups, Similar Channels/Bots, Members, Storage,
+  profile actions, account rows, and every other row of `ProfileActivity`.
+* Withheld only while the chat is locked (`ProfileContentPolicy`, applied in `SharedMediaLayout`, the preloader and
+  `ProfileActivity`): the tabs derived from the messages of the protected dialog (Media, Files, Music, Voice, Links, GIFs,
+  Posts) and their counts. Counts are masked when read, so unlocking needs no reload.
+* Saved Messages: only the Saved Messages content (messages and the Saved Messages / Saved Dialogs tabs) is withheld
+  while Saved Messages is locked. The own profile is no longer cut down; its Stories and Gifts tabs stay.
+* Gate: opening the profile of another protected dialog still goes through `ProtectedChatGate`, because that profile
+  hosts the protected shared media. The own profile is never gated as a whole.
+* App Lock state, the credential and the locked/unlocked state never decide whether an unrelated profile feature is shown.

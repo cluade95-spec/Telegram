@@ -376,6 +376,8 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
     private StickerEmptyView emptyView;
     private boolean sharedMediaLayoutAttached;
     private SharedMediaLayout.SharedMediaPreloader sharedMediaPreloader;
+    /** Message content of a locked protected dialog is withheld from this profile now (see refreshProtectedContent). */
+    private boolean protectedContentWithheld;
     private boolean preloadedChannelEmojiStatuses;
     private StarRatingView ratingView;
 
@@ -9042,14 +9044,31 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
         isInLandscapeMode = size.x > size.y;
     }
 
+    /**
+     * Protection changed (a chat locked, unlocked, protected or unprotected). Only message content
+     * appears or disappears (ProfileContentPolicy): the profile keeps all its rows and sections,
+     * Stories and Gifts included. Does nothing unless the content withheld has changed.
+     */
+    private void refreshProtectedContent() {
+        final boolean withheld = sharedMediaPreloader != null && sharedMediaPreloader.isContentWithheld();
+        if (withheld == protectedContentWithheld) {
+            return;
+        }
+        protectedContentWithheld = withheld;
+        if (listAdapter != null) {
+            updateRowsIds();
+            listAdapter.notifyDataSetChanged();
+        }
+        if (sharedMediaLayout != null && sharedMediaPreloader != null) {
+            sharedMediaLayout.setNewMediaCounts(sharedMediaPreloader.getLastMediaCount());
+        }
+    }
+
     @SuppressWarnings("unchecked")
     @Override
     public void didReceivedNotification(int id, int account, final Object... args) {
         if (id == NotificationCenter.protectedChatsChanged) {
-            if (myProfile && listAdapter != null) {
-                updateRowsIds();
-                listAdapter.notifyDataSetChanged();
-            }
+            refreshProtectedContent();
             return;
         }
         if (id == NotificationCenter.uploadStoryEnd || id == NotificationCenter.chatWasBoostedByUser) {
@@ -10583,7 +10602,7 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
                 }
             }
             if (!hasMedia) {
-                hasMedia = sharedMediaPreloader.hasSavedMessages;
+                hasMedia = sharedMediaPreloader.hasSavedMessages();
             }
             if (!hasMedia) {
                 hasMedia = sharedMediaPreloader.hasPreviews;
@@ -10601,11 +10620,12 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
         if (!hasMedia && chatInfo != null) {
             hasMedia = chatInfo.stories_pinned_available;
         }
-        // Saved Messages media must not be reachable through the own profile while that dialog is locked.
-        final boolean savedMessagesLocked = userId != 0 && userId == getUserConfig().getClientUserId() && ProtectedChats.isLockedProtected(currentAccount, userId);
-        if (savedMessagesLocked) {
-            hasMedia = false;
-        }
+        // While Saved Messages is locked its messages are withheld: the media counts and the Saved
+        // Messages tab already come without them from the preloader. Stories, Gifts and everything
+        // else stay. Only an own profile whose section would then hold nothing but those messages
+        // has no section.
+        protectedContentWithheld = sharedMediaPreloader != null && sharedMediaPreloader.isContentWithheld();
+        final boolean savedMessagesLocked = myProfile && userId != 0 && userId == getUserConfig().getClientUserId() && ProtectedChats.isLockedProtected(currentAccount, userId);
         if (!hasMedia) {
             if (chatId != 0 && MessagesController.ChannelRecommendations.hasRecommendations(currentAccount, -chatId)) {
                 hasMedia = true;

@@ -477,7 +477,7 @@ public class NotificationsController extends BaseController implements Notificat
             if (messageObject.isReactionPush ||
                 messageObject.messageOwner.mentioned && messageObject.messageOwner.action instanceof TLRPC.TL_messageActionPinMessage ||
                 DialogObject.isEncryptedDialog(dialog_id) ||
-                ProtectedChats.isProtected(currentAccount, dialog_id) ||
+                ProtectedChats.shouldHideContent(currentAccount, dialog_id) ||
                 messageObject.messageOwner.peer_id.channel_id != 0 && !messageObject.isSupergroup() ||
                 dialog_id == UserObject.VERIFY ||
                 dialog_id == UserObject.OAUTH
@@ -497,7 +497,7 @@ public class NotificationsController extends BaseController implements Notificat
                 long dialog_id = messageObject.getDialogId();
                 if (messageObject.messageOwner.mentioned && messageObject.messageOwner.action instanceof TLRPC.TL_messageActionPinMessage ||
                         DialogObject.isEncryptedDialog(dialog_id) || messageObject.messageOwner.peer_id.channel_id != 0 && !messageObject.isSupergroup() ||
-                        ProtectedChats.isProtected(currentAccount, dialog_id)) {
+                        ProtectedChats.shouldHideContent(currentAccount, dialog_id)) {
                     continue;
                 }
                 popupArray.add(0, messageObject);
@@ -931,7 +931,8 @@ public class NotificationsController extends BaseController implements Notificat
 
     private int addToPopupMessages(ArrayList<MessageObject> popupArrayAdd, MessageObject messageObject, long dialogId, boolean isChannel, SharedPreferences preferences) {
         if (messageObject.isStoryReactionPush) return 0;
-        if (ProtectedChats.isProtected(currentAccount, messageObject.getDialogId())) return 0;
+        // The popup shows the message itself, so it is not shown for a chat whose content is hidden.
+        if (ProtectedChats.shouldHideContent(currentAccount, messageObject.getDialogId())) return 0;
         int popup = 0;
         if (!DialogObject.isEncryptedDialog(dialogId)) {
             if (preferences.getBoolean("custom_" + dialogId, false)) {
@@ -3646,7 +3647,7 @@ public class NotificationsController extends BaseController implements Notificat
             } else {
                 icon = IconCompat.createWithResource(ApplicationLoader.applicationContext, R.drawable.book_group);
             }
-            if (supportsBubble && !ProtectedChats.isProtected(currentAccount, did)) {
+            if (supportsBubble && !ProtectedChats.shouldHideContent(currentAccount, did)) {
                 NotificationCompat.BubbleMetadata.Builder bubbleBuilder =
                         new NotificationCompat.BubbleMetadata.Builder(
                                 PendingIntent.getActivity(ApplicationLoader.applicationContext, 0, intent, PendingIntent.FLAG_MUTABLE | PendingIntent.FLAG_UPDATE_CURRENT),
@@ -5137,7 +5138,7 @@ public class NotificationsController extends BaseController implements Notificat
 
             NotificationCompat.Action wearReplyAction = null;
 
-            if ((!isChannel || isSupergroup) && canReply && !SharedConfig.isWaitingForPasscodeEnter && !ProtectedChats.isProtected(currentAccount, dialogId) && selfUserId != dialogId && !UserObject.isReplyUser(dialogId) && MessagesController.getInstance(currentAccount).getSendPaidMessagesStars(dialogId) <= 0) {
+            if ((!isChannel || isSupergroup) && canReply && !SharedConfig.isWaitingForPasscodeEnter && !ProtectedChats.shouldHideContent(currentAccount, dialogId) && selfUserId != dialogId && !UserObject.isReplyUser(dialogId) && MessagesController.getInstance(currentAccount).getSendPaidMessagesStars(dialogId) <= 0) {
                 Intent replyIntent = new Intent(ApplicationLoader.applicationContext, WearReplyReceiver.class);
                 replyIntent.putExtra("dialog_id", dialogId);
                 replyIntent.putExtra("max_id", maxId);

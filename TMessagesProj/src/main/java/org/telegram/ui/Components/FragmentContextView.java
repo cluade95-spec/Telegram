@@ -2030,10 +2030,12 @@ public class FragmentContextView extends FrameLayout implements NotificationCent
         SyncedLyricsController.Lyrics lyrics = SyncedLyricsController.getInstance(lastMessageObject.currentAccount).getLyrics(lastMessageObject);
         long position = SyncedLyricsController.positionMs(lastMessageObject);
         final boolean paused = MediaController.getInstance().isMessagePaused();
-        // The bar shows the active lyric, or the title and artist when there is none: an
+        // The bar shows the title and artist whenever playback is paused, wherever it is paused.
+        // While playing it shows the active lyric, or the title and artist when there is none: an
         // instrumental gap at any point of the song, the time before the first line, a blank, the
         // end of the song. Decided from the position and the play state alone (LyricsActivity), the
-        // same way whether the song just started, was sought or the bar was only just opened.
+        // same way whether the song just started, was sought, resumed or the bar was only just
+        // opened; every path that updates the bar (progress, play state, a new player) comes here.
         final LyricsActivity activity = lyricsActivityOf(lyrics);
         final int line = lyrics.lineAt(position);
         final int shown = activity.compactLine(position, !paused, LYRIC_ROLL_DURATION);

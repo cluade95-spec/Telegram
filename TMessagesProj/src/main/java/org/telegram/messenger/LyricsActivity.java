@@ -148,15 +148,21 @@ public final class LyricsActivity {
 
     /**
      * The line the compact player bar shows at {@code position}, or -1 for the song's title and
-     * artist: the active lyric if there is one, else nothing. While playing, the next lyric rolls in
-     * a little before its time (at most {@code rollMs}, at most half the gap to it), so the bar is
-     * already on it when it starts. A pure function of the position and the play state, never of how
-     * the song got there.
+     * artist.
+     *
+     * <p>While paused it is always the title and artist, wherever playback is paused (inside a lyric,
+     * in a gap, before the first line, after the last one, after a seek), so a lyric is never left
+     * on the bar merely because it was active when playback stopped. While playing it is the active
+     * lyric if there is one, else the title and artist; the next lyric rolls in a little before its
+     * time (at most {@code rollMs}, at most half the gap to it), so the bar is already on it when it
+     * starts. A pure function of the position and the play state, never of how the song got there
+     * or of any earlier call: resuming derives the playing state afresh.
      */
     public int compactLine(long position, boolean playing, long rollMs) {
+        if (!playing) return -1;
         final int line = lineAt(position);
         int shown = activeLine(position);
-        if (synced && playing && line + 1 < lines) {
+        if (synced && line + 1 < lines) {
             final long untilNext = document.timeMs(line + 1) - position;
             final long previousTime = line < 0 ? 0 : document.timeMs(line);
             final long gap = Math.max(1, document.timeMs(line + 1) - previousTime);

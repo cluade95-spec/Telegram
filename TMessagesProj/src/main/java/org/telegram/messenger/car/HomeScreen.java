@@ -177,7 +177,7 @@ public class HomeScreen extends Screen
             long dialogId = mo.getDialogId();
             if (DialogObject.isEncryptedDialog(dialogId)) continue;
             if (UserObject.isReplyUser(dialogId)) continue;
-            if (ProtectedChats.isProtected(currentAccount, dialogId)) continue;
+            if (ProtectedChats.shouldHideContent(currentAccount, dialogId)) continue;
             ArrayList<MessageObject> bucket = grouped.get(dialogId);
             if (bucket == null) {
                 bucket = new ArrayList<>();

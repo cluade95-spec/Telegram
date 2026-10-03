@@ -7,9 +7,10 @@ import static org.junit.Assert.assertTrue;
 import org.junit.Test;
 
 /**
- * The compact player shows the active lyric or, when there is none, the song's title and artist,
- * from the position and the play state alone: at the start, in a gap in the middle of the song, after
- * seeking, paused or playing, and when it is opened mid-song.
+ * The compact player shows the title and artist whenever playback is paused, and while playing the
+ * active lyric or, when there is none, the title and artist. Everything is derived from the position
+ * and the play state alone: at the start, in a gap in the middle of the song, after seeking,
+ * paused or playing, on resume, and when the bar is opened mid-song.
  */
 public class LyricsActivityTest {
 
@@ -77,153 +78,242 @@ public class LyricsActivityTest {
 
     private static final long SHOWS_TITLE = -1;
 
-    private static long shown(LyricsActivity a, long position, boolean playing) {
-        return a.compactLine(position, playing, ROLL);
+    /** What the compact bar shows while playing. */
+    private static int playing(LyricsActivity a, long position) {
+        return a.compactLine(position, true, ROLL);
     }
+
+    /** What the compact bar shows while paused. */
+    private static int paused(LyricsActivity a, long position) {
+        return a.compactLine(position, false, ROLL);
+    }
+
+    // ---- playing ------------------------------------------------------------------------------
 
     @Test
     public void atTheStartOfTheSongThereIsNoLyric() {
         LyricsActivity a = song();
-        assertEquals(SHOWS_TITLE, shown(a, 0, true));
-        assertEquals(SHOWS_TITLE, shown(a, 0, false));
-        assertEquals(SHOWS_TITLE, shown(a, 5_000, true));
+        assertEquals(SHOWS_TITLE, playing(a, 0));
+        assertEquals(SHOWS_TITLE, playing(a, 5_000));
     }
 
     @Test
     public void aLyricBecomesActiveAtItsTimeAndTheBarIsOnItBefore() {
         LyricsActivity a = song();
-        assertEquals(0, shown(a, 10_000, true));
-        assertEquals(0, shown(a, 12_000, false));
-        // Playing: rolled in a little early; paused: waits for its time.
-        assertEquals(0, shown(a, 9_700, true));
-        assertEquals(SHOWS_TITLE, shown(a, 9_700, false));
+        assertEquals(0, playing(a, 10_000));
+        assertEquals(0, playing(a, 12_000));
+        // Rolled in a little early while playing.
+        assertEquals(0, playing(a, 9_700));
+        assertEquals(SHOWS_TITLE, playing(a, 9_000));
     }
 
     @Test
     public void inAGapInTheMiddleOfTheSongThereIsNoLyric() {
         LyricsActivity a = song();
         // Line 1 ended at 19 s and line 2 starts at 30 s: no stale lyric for the break.
-        assertEquals(1, shown(a, 18_999, true));
-        assertEquals(SHOWS_TITLE, shown(a, 19_000, true));
-        assertEquals(SHOWS_TITLE, shown(a, 24_000, true));
-        assertEquals(SHOWS_TITLE, shown(a, 24_000, false));
-        assertEquals(SHOWS_TITLE, shown(a, 29_000, true));
+        assertEquals(1, playing(a, 18_999));
+        assertEquals(SHOWS_TITLE, playing(a, 19_000));
+        assertEquals(SHOWS_TITLE, playing(a, 24_000));
+        assertEquals(SHOWS_TITLE, playing(a, 29_000));
     }
 
     @Test
     public void theLyricReturnsWhenOneBecomesActiveAgain() {
         LyricsActivity a = song();
-        assertEquals(2, shown(a, 29_700, true));   // rolled in
-        assertEquals(SHOWS_TITLE, shown(a, 29_700, false));
-        assertEquals(2, shown(a, 30_000, true));
-        assertEquals(2, shown(a, 30_000, false));
-        assertEquals(2, shown(a, 31_000, false));
-    }
-
-    @Test
-    public void seekingIntoAGapShowsTheTitleWhetherPlayingOrPaused() {
-        LyricsActivity a = song();
-        for (long target : new long[] {19_000, 20_000, 25_000, 29_000}) {
-            assertEquals("playing at " + target, SHOWS_TITLE, shown(a, target, true));
-            assertEquals("paused at " + target, SHOWS_TITLE, shown(a, target, false));
-        }
-    }
-
-    @Test
-    public void seekingOutOfAGapIntoALyricShowsIt() {
-        LyricsActivity a = song();
-        assertEquals(SHOWS_TITLE, shown(a, 25_000, false));
-        assertEquals(0, shown(a, 12_000, false));
-        assertEquals(SHOWS_TITLE, shown(a, 25_000, true));
-        assertEquals(3, shown(a, 36_000, true));
-    }
-
-    @Test
-    public void pausingInAGapAndResumingKeepsTheTitleUntilTheNextLyric() {
-        LyricsActivity a = song();
-        assertEquals(SHOWS_TITLE, shown(a, 22_000, true));
-        assertEquals(SHOWS_TITLE, shown(a, 22_000, false));   // paused
-        assertEquals(SHOWS_TITLE, shown(a, 22_000, true));    // resumed
-        assertEquals(SHOWS_TITLE, shown(a, 25_000, true));
-        assertEquals(2, shown(a, 30_000, true));
-    }
-
-    @Test
-    public void pausingInsideALyricKeepsItAndPausingAtTheEndOfItShowsTheTitle() {
-        LyricsActivity a = song();
-        assertEquals(1, shown(a, 16_000, false));
-        assertEquals(1, shown(a, 16_000, true));
-        assertEquals(SHOWS_TITLE, shown(a, 19_200, false));
-    }
-
-    @Test
-    public void seekingWhilePausedLandsOnTheSameStateAsPlayingThere() {
-        LyricsActivity a = song();
-        for (long target = 0; target <= 42_000; target += 100) {
-            int paused = a.compactLine(target, false, ROLL);
-            int playing = a.compactLine(target, true, ROLL);
-            // Playing differs only by the roll-in just before a line starts.
-            if (paused != playing) {
-                int next = a.lineAt(target) + 1;
-                assertEquals("only the roll-in differs at " + target, next, playing);
-            }
-        }
-    }
-
-    @Test
-    public void openingThePresentationMidSongGivesTheSameAnswerAsHavingPlayedThere() {
-        // A fresh object, asked cold at positions in all kinds of states.
-        long[] positions = {500, 9_999, 10_000, 15_000, 19_000, 26_000, 30_500, 34_100, 38_999, 39_000, 45_000};
-        for (long position : positions) {
-            int cold = song().compactLine(position, true, ROLL);
-            LyricsActivity played = song();
-            int warm = -2;
-            for (long p = 0; p <= position; p += 250) warm = played.compactLine(p, true, ROLL);
-            warm = played.compactLine(position, true, ROLL);
-            assertEquals("position " + position, cold, warm);
-        }
+        assertEquals(2, playing(a, 29_700));   // rolled in
+        assertEquals(2, playing(a, 30_000));
+        assertEquals(2, playing(a, 31_000));
     }
 
     @Test
     public void afterTheLastWordHasEndedThereIsNoLyric() {
         LyricsActivity a = song();
-        assertEquals(3, shown(a, 38_999, false));
-        assertEquals(SHOWS_TITLE, shown(a, 39_000, false));
-        assertEquals(SHOWS_TITLE, shown(a, 60_000, true));
+        assertEquals(3, playing(a, 38_999));
+        assertEquals(SHOWS_TITLE, playing(a, 39_000));
+        assertEquals(SHOWS_TITLE, playing(a, 60_000));
     }
+
+    // ---- paused: always the title and artist ---------------------------------------------------
+
+    @Test
+    public void pauseDuringAnActiveLyricShowsTheTitleAndArtist() {
+        LyricsActivity a = song();
+        assertEquals(1, playing(a, 16_000));          // the lyric while playing
+        assertEquals(SHOWS_TITLE, paused(a, 16_000)); // the same position, paused
+        assertEquals(SHOWS_TITLE, paused(a, 10_000));
+        assertEquals(SHOWS_TITLE, paused(a, 18_999));
+        assertEquals(SHOWS_TITLE, paused(a, 35_000));
+    }
+
+    @Test
+    public void pauseDuringAGapShowsTheTitleAndArtist() {
+        LyricsActivity a = song();
+        assertEquals(SHOWS_TITLE, playing(a, 24_000));
+        assertEquals(SHOWS_TITLE, paused(a, 24_000));
+        assertEquals(SHOWS_TITLE, paused(a, 19_000));
+        assertEquals(SHOWS_TITLE, paused(a, 29_999));
+    }
+
+    @Test
+    public void pauseBeforeTheFirstLyricShowsTheTitleAndArtist() {
+        LyricsActivity a = song();
+        assertEquals(SHOWS_TITLE, paused(a, 0));
+        assertEquals(SHOWS_TITLE, paused(a, 5_000));
+        // Even where the next lyric would already have rolled in while playing.
+        assertEquals(0, playing(a, 9_700));
+        assertEquals(SHOWS_TITLE, paused(a, 9_700));
+    }
+
+    @Test
+    public void pauseAfterTheFinalLyricShowsTheTitleAndArtist() {
+        LyricsActivity a = song();
+        assertEquals(3, playing(a, 38_000));
+        assertEquals(SHOWS_TITLE, paused(a, 38_000));
+        assertEquals(SHOWS_TITLE, paused(a, 39_000));
+        assertEquals(SHOWS_TITLE, paused(a, 120_000));
+    }
+
+    @Test
+    public void seekWhilePausedIntoAnActiveLyricShowsTheTitleAndArtist() {
+        LyricsActivity a = song();
+        // Paused in a gap, then seeking into lyrics: nothing but the title and artist, at each target.
+        for (long target : new long[] {10_000, 12_000, 16_000, 31_000, 36_000}) {
+            assertTrue("a lyric is active at " + target, a.activeLine(target) >= 0);
+            assertEquals("paused at " + target, SHOWS_TITLE, paused(a, target));
+        }
+    }
+
+    @Test
+    public void seekWhilePausedIntoAGapShowsTheTitleAndArtist() {
+        LyricsActivity a = song();
+        for (long target : new long[] {19_000, 20_000, 25_000, 29_000}) {
+            assertEquals("no lyric is active at " + target, -1, a.activeLine(target));
+            assertEquals("paused at " + target, SHOWS_TITLE, paused(a, target));
+        }
+    }
+
+    @Test
+    public void enteringTheCompactPlayerWhilePausedShowsTheTitleAndArtist() {
+        // A fresh object (the bar opened or restored mid-song), asked cold while paused.
+        for (long position : new long[] {0, 9_999, 10_000, 15_000, 19_000, 26_000, 30_500, 38_999, 39_000, 45_000}) {
+            assertEquals("opened paused at " + position, SHOWS_TITLE, paused(song(), position));
+        }
+    }
+
+    @Test
+    public void pausedIsTheTitleAndArtistAtEveryPositionOfTheSong() {
+        LyricsActivity a = song();
+        for (long position = 0; position < 45_000; position += 7) {
+            assertEquals("paused at " + position, SHOWS_TITLE, paused(a, position));
+        }
+    }
+
+    // ---- resume --------------------------------------------------------------------------------
+
+    @Test
+    public void resumeIntoAnActiveLyricShowsItAtOnce() {
+        LyricsActivity a = song();
+        // Paused inside lyric 1, then resumed at the same position: derived afresh, not remembered.
+        assertEquals(SHOWS_TITLE, paused(a, 16_000));
+        assertEquals(1, playing(a, 16_000));
+        // Paused in a gap, sought into a lyric while paused, then resumed there.
+        assertEquals(SHOWS_TITLE, paused(a, 24_000));
+        assertEquals(SHOWS_TITLE, paused(a, 33_000));
+        assertEquals(2, playing(a, 33_000));
+        // Resumed into the last lyric.
+        assertEquals(3, playing(a, 36_000));
+    }
+
+    @Test
+    public void resumeIntoAGapShowsTheTitleAndArtist() {
+        LyricsActivity a = song();
+        assertEquals(SHOWS_TITLE, paused(a, 24_000));
+        assertEquals(SHOWS_TITLE, playing(a, 24_000));
+        // Paused inside a lyric, sought into the gap while paused, resumed there.
+        assertEquals(SHOWS_TITLE, paused(a, 16_000));
+        assertEquals(SHOWS_TITLE, paused(a, 22_000));
+        assertEquals(SHOWS_TITLE, playing(a, 22_000));
+        // And the lyric returns when playback reaches the next one.
+        assertEquals(2, playing(a, 29_700));
+        assertEquals(2, playing(a, 30_000));
+    }
+
+    @Test
+    public void resumingNeverKeepsAnythingFromBeforeThePause() {
+        LyricsActivity a = song();
+        // Pause/resume at awkward places in any order: each answer depends only on its own position and state.
+        long[] positions = {16_000, 24_000, 12_000, 36_000, 9_700, 19_000, 38_999, 39_000, 30_000};
+        for (long position : positions) {
+            int expectedPlaying = song().compactLine(position, true, ROLL);
+            assertEquals(SHOWS_TITLE, paused(a, position));
+            assertEquals("resumed at " + position, expectedPlaying, playing(a, position));
+            assertEquals(SHOWS_TITLE, paused(a, position));
+        }
+    }
+
+    @Test
+    public void whilePlayingTheBarMatchesTheActiveLyricExceptForTheRollIn() {
+        LyricsActivity a = song();
+        for (long target = 0; target <= 42_000; target += 100) {
+            int shown = playing(a, target);
+            int active = a.activeLine(target);
+            // Playing differs from the active lyric only by the roll-in just before a line starts.
+            if (shown != active) {
+                int next = a.lineAt(target) + 1;
+                assertEquals("only the roll-in differs at " + target, next, shown);
+            }
+        }
+    }
+
+    @Test
+    public void openingThePlayingBarMidSongGivesTheSameAnswerAsHavingPlayedThere() {
+        long[] positions = {500, 9_999, 10_000, 15_000, 19_000, 26_000, 30_500, 34_100, 38_999, 39_000, 45_000};
+        for (long position : positions) {
+            int cold = playing(song(), position);
+            LyricsActivity played = song();
+            int warm = -2;
+            for (long p = 0; p <= position; p += 250) warm = playing(played, p);
+            warm = playing(played, position);
+            assertEquals("position " + position, cold, warm);
+        }
+    }
+
+    // ---- other documents -----------------------------------------------------------------------
 
     @Test
     public void aShortBreakBetweenLinesKeepsTheLyricLikeTheLargePlayer() {
         // 3 s between the end of one line and the next is less than an instrumental gap: no dots,
-        // no title.
+        // no title while playing.
         LyricsActivity a = document(true, sung(0, 2_000, 4_000), sung(7_000, 9_000, 11_000));
-        assertEquals(0, shown(a, 5_500, false));
-        assertEquals(0, shown(a, 6_900, false));
-        assertEquals(1, shown(a, 7_000, false));
+        assertEquals(0, playing(a, 5_500));
+        assertEquals(0, playing(a, 6_300));
+        assertEquals(1, playing(a, 7_000));
+        // Paused: the title and artist, as everywhere.
+        assertEquals(SHOWS_TITLE, paused(a, 5_500));
     }
 
     @Test
     public void aLineThatStatesNoEndNeverStartsAGap() {
         LyricsActivity a = document(true, plainLine(0), plainLine(20_000), plainLine(60_000));
-        assertEquals(0, shown(a, 10_000, false));
-        assertEquals(1, shown(a, 40_000, false));
-        assertEquals(2, shown(a, 100_000, false));
+        assertEquals(0, playing(a, 10_000));
+        assertEquals(1, playing(a, 40_000));
+        assertEquals(2, playing(a, 100_000));
     }
 
     @Test
     public void aTimedBlankHasNoLyricAndAnIntroOfSevenSecondsIsAGap() {
         LyricsActivity a = document(true, plainLine(8_000), blank(20_000), plainLine(40_000));
-        assertEquals(SHOWS_TITLE, shown(a, 3_000, false));   // before the first line
-        assertEquals(0, shown(a, 12_000, false));
-        assertEquals(SHOWS_TITLE, shown(a, 20_000, false));  // blank
-        assertEquals(SHOWS_TITLE, shown(a, 30_000, false));  // blank, also an interlude (singing ended at the blank)
-        assertEquals(2, shown(a, 40_000, false));
+        assertEquals(SHOWS_TITLE, playing(a, 3_000));   // before the first line
+        assertEquals(0, playing(a, 12_000));
+        assertEquals(SHOWS_TITLE, playing(a, 20_000));  // blank
+        assertEquals(SHOWS_TITLE, playing(a, 30_000));  // blank, also an interlude (singing ended at the blank)
+        assertEquals(2, playing(a, 40_000));
     }
 
     @Test
     public void unsyncedLyricsNeverHaveAnActiveLine() {
         LyricsActivity a = document(false, plainLine(0), plainLine(1_000));
-        assertEquals(SHOWS_TITLE, shown(a, 500, true));
+        assertEquals(SHOWS_TITLE, playing(a, 500));
         assertEquals(-1, a.lineAt(500));
         assertFalse(a.isIdle(500));
     }
@@ -231,7 +321,7 @@ public class LyricsActivityTest {
     @Test
     public void lineSyncedLyricsHaveNoEndOfSong() {
         LyricsActivity a = document(true, plainLine(0), plainLine(5_000));
-        assertEquals(1, shown(a, 600_000, false));
+        assertEquals(1, playing(a, 600_000));
     }
 
     @Test
