@@ -101,18 +101,45 @@ public final class ProtectedChatsState {
         boolean pausedWhileOpen;
         /** Short window after authentication in which the chat must be opened (see GRACE_MS). */
         long graceUntil;
-        /** Forward hold (HOLD_*): the chat started a forward on its own authorization. */
-        int hold;
-        /** The chat was covered while the forward picker was open; the countdown starts if it ends without a deposit. */
+        /** Forward transaction (see {@link ForwardPhase}): the chat started a forward on its own authorization. */
+        ForwardPhase hold = ForwardPhase.NONE;
+        /** The chat was covered while its forward transaction was open; the countdown starts if it ends with the chat still covered. */
         boolean leaveDeferred;
         long deferredLeftAt;
     }
 
-    private static final int HOLD_NONE = 0;
-    /** The forward picker the open chat started is on top of it. */
-    private static final int HOLD_PICKER = 1;
-    /** The forward went to the user's own Saved Messages; Telegram is showing its success and tag interaction. */
-    private static final int HOLD_COMPLETING = 2;
+    /**
+     * Where the forward the chat started is, from the chat's point of view. The picker, the
+     * authentication sheet of a destination, the destination chat that the forward opened and
+     * Telegram's success interaction are all part of the forward: none of them is the user leaving the
+     * chat. The transaction ends when the chat is shown again (Back from the picker, Back from the
+     * destination, the forward came back to it), or when the user navigates to something that is not
+     * part of the forward, or when the app goes to the background.
+     */
+    public enum ForwardPhase {
+        /** No forward in progress. A chat that is shown and authorized is simply "source visible". */
+        NONE,
+        /** The forward picker is on top of the chat (a destination's authentication sheet is only a layer over it). */
+        PICKER,
+        /** The picker has handed its selection to the delegate and the delegate is running. */
+        HANDING_OVER,
+        /** The forward opened a destination chat over this chat. Back from it returns to this chat. */
+        DESTINATION,
+        /** The forward came back to this chat and Telegram's success / tag interaction is on it. */
+        COMPLETING
+    }
+
+    /** What the picker's delegate did with the selection. */
+    public enum ForwardOutcome {
+        /** It did not complete (a confirmation is pending, an error): the picker goes on. */
+        PICKER_REMAINS,
+        /** It finished by returning to the source chat (Saved Messages deposit, same chat, several chats). */
+        SOURCE_RETURNED,
+        /** It opened a destination chat over the source. */
+        DESTINATION_OPENED,
+        /** The picker is gone and nothing that belongs to the forward is on top of the source. */
+        ABANDONED
+    }
 
     private final Storage storage;
     private final Clock clock;
@@ -494,9 +521,11 @@ public final class ProtectedChatsState {
     public synchronized void chatLeft(long accountKey, long dialogId) {
         Auth auth = authorized.get(key(accountKey, dialogId));
         if (auth != null && auth.active) {
-            if (auth.hold == HOLD_PICKER) {
-                // The forward picker the chat itself opened covers it. That is not the user leaving:
-                // remember when it happened and settle when the picker is gone (forwardPickerClosed).
+            if (auth.hold == ForwardPhase.PICKER || auth.hold == ForwardPhase.HANDING_OVER || auth.hold == ForwardPhase.DESTINATION) {
+                // The forward the chat itself started covers it (its picker, then the destination it
+                // opened). That is not the user leaving: remember when it happened. If the chat is
+                // shown again the cover never counts (chatEntered); if the forward ends with the chat
+                // still covered it counts from now (releaseHold).
                 if (!auth.leaveDeferred) {
                     auth.leaveDeferred = true;
                     auth.deferredLeftAt = clock.elapsedMs();
@@ -505,7 +534,7 @@ public final class ProtectedChatsState {
             }
             // Anything else that covers the chat, also while Telegram completes a forward, is
             // unrelated navigation: the hold ends and the normal countdown starts.
-            auth.hold = HOLD_NONE;
+            auth.hold = ForwardPhase.NONE;
             auth.active = false;
             auth.leftAt = clock.elapsedMs();
         }
@@ -515,11 +544,12 @@ public final class ProtectedChatsState {
 
     /**
      * The open, authorized chat starts a forward: its forward picker is about to cover it. For as
-     * long as the picker is on top, the chat is not counted as left, so Immediate Auto-lock does not
-     * close it before the forward completes. Only a chat that is protected, authorized and open
-     * right now can hold; nothing else is authorized and nothing is extended: the hold ends with the
-     * picker (see {@link #forwardPickerClosed}), with the success interaction, with any other
-     * navigation and with the app going to the background.
+     * long as the forward (picker, destination it opens, completion) is the only thing on top of
+     * the chat, the chat is not counted as left, so Immediate Auto-lock does not close it while the
+     * forward runs, and Back from the picker or from the destination finds it as it was. Only a chat
+     * that is protected, authorized and open right now can hold; nothing else is authorized and
+     * nothing is extended: the hold ends when the chat is shown again, with unrelated navigation,
+     * and with the app going to the background.
      *
      * @return true if the hold started
      */
@@ -528,11 +558,11 @@ public final class ProtectedChatsState {
             return false;
         }
         Auth auth = authorized.get(key(accountKey, dialogId));
-        // One picker at a time. A new forward supersedes the completion of an earlier one.
-        if (auth == null || !auth.active || auth.hold == HOLD_PICKER) {
+        // One forward at a time. A new forward supersedes the completion or the destination of an earlier one.
+        if (auth == null || !auth.active || auth.hold == ForwardPhase.PICKER || auth.hold == ForwardPhase.HANDING_OVER) {
             return false;
         }
-        auth.hold = HOLD_PICKER;
+        auth.hold = ForwardPhase.PICKER;
         auth.leaveDeferred = false;
         return true;
     }
@@ -551,66 +581,86 @@ public final class ProtectedChatsState {
     }
 
     /**
-     * The picker is gone without a deposit into Saved Messages (cancelled, or another destination
-     * was chosen): the countdown the cover would have started starts now, from when the chat was
-     * covered, exactly as without a hold. Does nothing once the forward went to Saved Messages.
+     * The picker was destroyed. While it was still the picker (Back, the system or gesture back, the
+     * toolbar back, any other way of cancelling) this ends the forward: if the source is shown again
+     * (chatEntered cleared the deferral) nothing else happens, and the source keeps its authorization
+     * exactly as it was. If the source is still covered by something else the cover counts as
+     * leaving, from when it began. Once the picker handed its selection over, its destruction is part
+     * of that hand-over and changes nothing.
      */
     public synchronized void forwardPickerClosed(long accountKey, long dialogId) {
         Auth auth = authorized.get(key(accountKey, dialogId));
-        if (auth == null || auth.hold != HOLD_PICKER) {
+        if (auth == null || auth.hold != ForwardPhase.PICKER) {
             return;
         }
-        auth.hold = HOLD_NONE;
-        if (auth.leaveDeferred) {
-            auth.leaveDeferred = false;
-            auth.active = false;
-            auth.leftAt = auth.deferredLeftAt;
+        releaseHold(auth);
+    }
+
+    /** The picker is handing its selection to the delegate, which may finish the picker or open a chat. */
+    public synchronized void forwardHandOver(long accountKey, long dialogId) {
+        Auth auth = authorized.get(key(accountKey, dialogId));
+        if (auth != null && auth.hold == ForwardPhase.PICKER) {
+            auth.hold = ForwardPhase.HANDING_OVER;
+        }
+    }
+
+    /** The delegate returned: the transaction continues in the phase that matches what it did. */
+    public synchronized void forwardSettled(long accountKey, long dialogId, ForwardOutcome outcome) {
+        Auth auth = authorized.get(key(accountKey, dialogId));
+        if (auth == null || auth.hold != ForwardPhase.HANDING_OVER) {
+            return;
+        }
+        switch (outcome) {
+            case PICKER_REMAINS:
+                auth.hold = ForwardPhase.PICKER;
+                break;
+            case SOURCE_RETURNED:
+                auth.hold = ForwardPhase.COMPLETING;
+                break;
+            case DESTINATION_OPENED:
+                auth.hold = ForwardPhase.DESTINATION;
+                break;
+            default:
+                releaseHold(auth);
+                break;
         }
     }
 
     /**
-     * The picker is handing its selection over and Telegram is about to finish it and return to the
-     * source (a deposit into Saved Messages with its success message and tag emojis, a forward into
-     * the same chat, a send to several chats). The authorization is kept until that interaction
-     * ends, but never beyond the chat being on screen.
+     * The destination chat the forward opened over the source was left or destroyed. Back from it
+     * shows the source again first (the source is entered before the destination pauses), so nothing
+     * changes for the source. Anything else that took the user away from the destination while the
+     * source is still covered ends the forward, and the source's cover counts from when it began.
      */
-    public synchronized void forwardReturnsToSource(long accountKey, long dialogId) {
+    public synchronized void forwardDestinationLeft(long accountKey, long dialogId) {
         Auth auth = authorized.get(key(accountKey, dialogId));
-        if (auth != null && auth.hold == HOLD_PICKER) {
-            auth.hold = HOLD_COMPLETING;
+        if (auth == null || auth.hold != ForwardPhase.DESTINATION) {
+            return;
         }
-    }
-
-    /** The selection was not completed after all (an error, a confirmation pending): the picker goes on. */
-    public synchronized void forwardReturnAborted(long accountKey, long dialogId) {
-        Auth auth = authorized.get(key(accountKey, dialogId));
-        if (auth != null && auth.hold == HOLD_COMPLETING) {
-            auth.hold = HOLD_PICKER;
-        }
-    }
-
-    /**
-     * After the delegate handled the selection: if it did not complete, the picker goes on; if it
-     * completed but the source is not on screen (a destination chat was opened over it), the cover
-     * counts as leaving after all, from the time it began.
-     */
-    public synchronized void forwardSettled(long accountKey, long dialogId, boolean handled, boolean sourceOnScreen) {
-        if (!handled) {
-            forwardReturnAborted(accountKey, dialogId);
-        } else if (!sourceOnScreen) {
-            forwardCompletionEnded(accountKey, dialogId);
-        }
+        releaseHold(auth);
     }
 
     /** Telegram's success / tag interaction ended (dismissed, timed out, tag chosen): the hold is over. */
     public synchronized void forwardCompletionEnded(long accountKey, long dialogId) {
         Auth auth = authorized.get(key(accountKey, dialogId));
-        if (auth == null || auth.hold != HOLD_COMPLETING) {
+        if (auth == null || auth.hold != ForwardPhase.COMPLETING) {
             return;
         }
-        auth.hold = HOLD_NONE;
+        releaseHold(auth);
+    }
+
+    /** The source chat itself is gone: whatever it held ends with it. */
+    public synchronized void forwardSourceGone(long accountKey, long dialogId) {
+        Auth auth = authorized.get(key(accountKey, dialogId));
+        if (auth != null) {
+            releaseHold(auth);
+        }
+    }
+
+    /** Ends the forward; a cover that was only deferred counts as a departure from when it began. */
+    private static void releaseHold(Auth auth) {
+        auth.hold = ForwardPhase.NONE;
         if (auth.leaveDeferred) {
-            // The chat never came back on screen: the countdown it would have had starts now.
             auth.leaveDeferred = false;
             auth.active = false;
             auth.leftAt = auth.deferredLeftAt;
@@ -619,17 +669,22 @@ public final class ProtectedChatsState {
 
     /** Whether a forward hold exists for the chat. */
     public synchronized boolean isForwardHoldActive(long accountKey, long dialogId) {
+        return getForwardPhase(accountKey, dialogId) != ForwardPhase.NONE;
+    }
+
+    public synchronized ForwardPhase getForwardPhase(long accountKey, long dialogId) {
         Auth auth = authorized.get(key(accountKey, dialogId));
-        return auth != null && auth.hold != HOLD_NONE;
+        return auth == null ? ForwardPhase.NONE : auth.hold;
     }
 
     /** App moved to the background: open chats start their re-lock countdown. */
     public synchronized void appPaused() {
         long now = clock.elapsedMs();
         for (Auth auth : authorized.values()) {
-            // A forward hold never survives the app going to the background.
-            auth.hold = HOLD_NONE;
-            auth.leaveDeferred = false;
+            // A forward hold never survives the app going to the background. A chat that was only
+            // covered by its own forward counts as left from when it was covered, so it is not
+            // revived by a return from a system activity.
+            releaseHold(auth);
             if (auth.active) {
                 auth.active = false;
                 auth.leftAt = now;

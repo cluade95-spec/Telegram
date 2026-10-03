@@ -90,7 +90,7 @@ public class ProtectedChats {
         return state();
     }
 
-    private static long accountKey(int account) {
+    public static long accountKey(int account) {
         return UserConfig.getInstance(account).getClientUserId();
     }
 
@@ -228,59 +228,18 @@ public class ProtectedChats {
         }
     }
 
-    private static final java.util.HashMap<String, Integer> openCounts = new java.util.HashMap<>();
+    private static ProtectedGateLifecycle lifecycle;
 
-    /** A fragment showing this dialog (chat, profile, topics) was opened; reference counted. */
-    public static void enter(int account, long dialogId) {
-        String k = accountKey(account) + ":" + dialogId;
-        Integer c = openCounts.get(k);
-        openCounts.put(k, c == null ? 1 : c + 1);
-        state().chatEntered(accountKey(account), dialogId);
-    }
-
-    /** The last fragment showing the dialog was closed: the re-lock countdown starts. */
-    public static void leave(int account, long dialogId) {
-        String k = accountKey(account) + ":" + dialogId;
-        Integer c = openCounts.get(k);
-        if (c == null || c <= 1) {
-            openCounts.remove(k);
-            // Fragment transitions pause one fragment and resume/create the next in the same pass;
-            // decide after they settled so moving between fragments of one chat never re-locks it.
-            final long key = accountKey(account);
-            AndroidUtilities.runOnUIThread(() -> {
-                if (!openCounts.containsKey(key + ":" + dialogId)) {
-                    state().chatLeft(key, dialogId);
-                }
-            });
-        } else {
-            openCounts.put(k, c - 1);
+    /**
+     * What a fragment pause, resume or destroy means for a protected dialog, including the forward
+     * the open chat started (see {@link ProtectedGateLifecycle}); {@code ProtectedChatGate} is its
+     * Android adapter.
+     */
+    public static synchronized ProtectedGateLifecycle lifecycle() {
+        if (lifecycle == null) {
+            lifecycle = new ProtectedGateLifecycle(state(), AndroidUtilities::runOnUIThread);
         }
-    }
-
-    // ------------------------------------------------------------- forward hold (see ProtectedChatsState)
-
-    public static boolean beginForwardHold(int account, long dialogId) {
-        return state().beginForwardHold(accountKey(account), dialogId);
-    }
-
-    public static void forwardPickerClosed(int account, long dialogId) {
-        state().forwardPickerClosed(accountKey(account), dialogId);
-    }
-
-    public static boolean beginForwardHoldOver(int account, long shownProtectedDialogId, boolean onScreen) {
-        return state().beginForwardHoldOver(accountKey(account), shownProtectedDialogId, onScreen);
-    }
-
-    public static void forwardReturnsToSource(int account, long dialogId) {
-        state().forwardReturnsToSource(accountKey(account), dialogId);
-    }
-
-    public static void forwardSettled(int account, long dialogId, boolean handled, boolean sourceOnScreen) {
-        state().forwardSettled(accountKey(account), dialogId, handled, sourceOnScreen);
-    }
-
-    public static void forwardCompletionEnded(int account, long dialogId) {
-        state().forwardCompletionEnded(accountKey(account), dialogId);
+        return lifecycle;
     }
 
     public static void onAppPaused() {

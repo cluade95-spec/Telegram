@@ -12,6 +12,7 @@ import org.telegram.messenger.MessagesStorage;
 import org.telegram.messenger.ProtectedChats;
 import org.telegram.messenger.ProtectedDialogIds;
 import org.telegram.messenger.ProtectedChatsState;
+import org.telegram.messenger.ProtectedGateLifecycle;
 import org.telegram.messenger.UserConfig;
 import org.telegram.messenger.UserObject;
 import org.telegram.messenger.R;
@@ -70,13 +71,10 @@ public final class ProtectedChatGate {
     /** The fragment passed the gate and is now part of a navigation stack. */
     public static void onFragmentCreated(BaseFragment fragment) {
         long dialogId = getDialogId(fragment);
-        if (dialogId == 0 || fragment.protectedGateDialogId != 0 || !ProtectedChats.isProtected(fragment.getCurrentAccount(), dialogId)) {
+        if (dialogId == 0 || fragment.protectedGate.isRegistered() || !ProtectedChats.isProtected(fragment.getCurrentAccount(), dialogId)) {
             return;
         }
-        fragment.protectedGateDialogId = dialogId;
-        fragment.protectedGateAccount = fragment.getCurrentAccount();
-        fragment.protectedGateVisible = true;
-        ProtectedChats.enter(fragment.protectedGateAccount, dialogId);
+        ProtectedChats.lifecycle().created(fragment.protectedGate, ProtectedChats.accountKey(fragment.getCurrentAccount()), dialogId);
     }
 
     /**
@@ -84,45 +82,21 @@ public final class ProtectedChatGate {
      * the re-lock countdown of its dialog starts once no fragment of it is visible.
      */
     public static void onFragmentPaused(BaseFragment fragment) {
-        if (fragment.protectedGateDialogId != 0 && fragment.protectedGateVisible) {
-            fragment.protectedGateVisible = false;
-            ProtectedChats.leave(fragment.protectedGateAccount, fragment.protectedGateDialogId);
+        if (!fragment.protectedGate.isIdle()) {
+            ProtectedChats.lifecycle().paused(fragment.protectedGate);
         }
     }
 
     /** Back on screen: if the authorization ended while it was covered, it must not show again. */
     public static void onFragmentResumed(BaseFragment fragment) {
-        if (fragment.protectedGateDialogId == 0 || fragment.protectedGateVisible) {
-            return;
+        if (fragment.protectedGate.isRegistered()) {
+            ProtectedChats.lifecycle().resumed(fragment.protectedGate, fragment::removeSelfFromStack);
         }
-        final int account = fragment.protectedGateAccount;
-        final long dialogId = fragment.protectedGateDialogId;
-        // Back on screen: the forward picker it opened over itself is gone. If it did not deposit
-        // into Saved Messages the cover counts as leaving, exactly as without the picker.
-        ProtectedChats.forwardPickerClosed(account, dialogId);
-        if (ProtectedChats.isLockedProtected(account, dialogId)) {
-            AndroidUtilities.runOnUIThread(() -> {
-                if (!fragment.isFinished && ProtectedChats.isLockedProtected(account, dialogId)) {
-                    fragment.removeSelfFromStack();
-                }
-            });
-            return;
-        }
-        fragment.protectedGateVisible = true;
-        ProtectedChats.enter(account, dialogId);
     }
 
     public static void onFragmentDestroyed(BaseFragment fragment) {
-        if (fragment.protectedGateDialogId != 0) {
-            long dialogId = fragment.protectedGateDialogId;
-            // A chat that is gone holds nothing.
-            ProtectedChats.forwardPickerClosed(fragment.protectedGateAccount, dialogId);
-            ProtectedChats.forwardCompletionEnded(fragment.protectedGateAccount, dialogId);
-            fragment.protectedGateDialogId = 0;
-            if (fragment.protectedGateVisible) {
-                fragment.protectedGateVisible = false;
-                ProtectedChats.leave(fragment.protectedGateAccount, dialogId);
-            }
+        if (!fragment.protectedGate.isIdle()) {
+            ProtectedChats.lifecycle().destroyed(fragment.protectedGate);
         }
     }
 
@@ -185,48 +159,56 @@ public final class ProtectedChatGate {
                 AndroidUtilities.runOnUIThread(() -> authenticate(activity, null, account, dialogId, ProtectedChatAuthSheet.Mode.UNLOCK, onUnlocked, onCancelled)), resume);
     }
 
-    // ------------------------------------------------------------------ forward hold
+    // ------------------------------------------------------------------ forward transaction
 
     /**
-     * A forward picker is being presented over {@code below}. Whatever screen that is (a chat, a
-     * profile or its shared media, the chat behind a viewer), if it shows a protected dialog that is
-     * authorized and open right now, that authorization is held while the picker is on top (see
-     * ProtectedChatsState.beginForwardHold). The picker remembers the source it belongs to.
+     * A forward picker is being presented over {@code below} (called by the navigation layout for
+     * every presented fragment; it ignores everything that is not a forward picker). Whatever screen
+     * {@code below} is, if it shows a protected dialog that is authorized and visible right now, that
+     * authorization is held while the forward runs. This is the only place the layout is involved: it
+     * starts the transaction. Everything after it (Back, a destination, completion) is decided by
+     * the fragment lifecycle callbacks above, see {@link ProtectedGateLifecycle}.
      */
     public static void onForwardPickerPresented(BaseFragment picker, BaseFragment below) {
-        if (!(picker instanceof DialogsActivity) || !((DialogsActivity) picker).isForwardPicker() || below == null) {
+        if (below == null || !below.protectedGate.isRegistered() || !(picker instanceof DialogsActivity) || !((DialogsActivity) picker).isForwardPicker()) {
             return;
         }
-        if (ProtectedChats.beginForwardHoldOver(below.protectedGateAccount, below.protectedGateDialogId, below.protectedGateVisible)) {
-            ((DialogsActivity) picker).setProtectedForwardSource(below);
+        ProtectedChats.lifecycle().pickerPresented(picker.protectedGate, below.protectedGate);
+    }
+
+    /** What the picker remembers between handing its selection over and the delegate returning. */
+    public static final class Handover {
+        private final ProtectedGateLifecycle.Node source;
+        private final INavigationLayout layout;
+
+        private Handover(ProtectedGateLifecycle.Node source, INavigationLayout layout) {
+            this.source = source;
+            this.layout = layout;
         }
     }
 
-    /** The picker is gone (or never opened) without a deposit into Saved Messages. */
-    public static void forwardPickerClosed(BaseFragment source) {
-        if (source != null && source.protectedGateDialogId != 0) {
-            ProtectedChats.forwardPickerClosed(source.protectedGateAccount, source.protectedGateDialogId);
+    /** The picker hands its selection to the delegate. Null when the picker tracks no protected source. */
+    public static Handover forwardHandOver(BaseFragment picker) {
+        if (!picker.protectedGate.hasForwardSource()) {
+            return null;
         }
+        final ProtectedGateLifecycle.Node source = ProtectedChats.lifecycle().handOver(picker.protectedGate);
+        return source == null ? null : new Handover(source, picker.getParentLayout());
     }
 
-    /** The picker hands its selection over; Telegram may return to the source and show its success interaction. */
-    public static void forwardReturnsToSource(BaseFragment source) {
-        if (source != null && source.protectedGateDialogId != 0) {
-            ProtectedChats.forwardReturnsToSource(source.protectedGateAccount, source.protectedGateDialogId);
+    /** The delegate returned (handled or not): the forward continues in the phase that matches. */
+    public static void forwardSettled(BaseFragment picker, Handover handover, boolean handled) {
+        if (handover == null) {
+            return;
         }
-    }
-
-    /** The delegate has handled the selection (or not): see ProtectedChatsState.forwardSettled. */
-    public static void forwardSettled(BaseFragment source, boolean handled) {
-        if (source != null && source.protectedGateDialogId != 0) {
-            ProtectedChats.forwardSettled(source.protectedGateAccount, source.protectedGateDialogId, handled, source.protectedGateVisible);
-        }
+        final BaseFragment top = handover.layout != null ? handover.layout.getLastFragment() : null;
+        ProtectedChats.lifecycle().settled(picker.protectedGate, handover.source, handled, top != null ? top.protectedGate : null);
     }
 
     /** Telegram's success and tag interaction ended. */
     public static void forwardCompletionEnded(BaseFragment source) {
-        if (source != null && source.protectedGateDialogId != 0) {
-            ProtectedChats.forwardCompletionEnded(source.protectedGateAccount, source.protectedGateDialogId);
+        if (source.protectedGate.isRegistered()) {
+            ProtectedChats.lifecycle().completionEnded(source.protectedGate);
         }
     }
 

@@ -101,22 +101,22 @@ public class ForwardSourceContextTest {
         request.onUnlocked.run();
     }
 
-    /** What DialogsActivity.notifyDelegate does for a selection, with a delegate that sends and comes back to the source. */
+    /** What DialogsActivity.notifyDelegate does for a selection, with a delegate that sends and comes back to the source (or opens a destination). */
     private boolean notifyDelegate(List<Long> destinations, boolean delegateHandles, boolean sourceOnScreenAfter) {
         if (ForwardDestinations.holdUntilUnlocked(destinations, SAVED, true, locks, sheet, () -> notifyDelegate(destinations, delegateHandles, sourceOnScreenAfter))) {
             return false;
         }
-        state.forwardReturnsToSource(ACCOUNT, SOURCE);
+        state.forwardHandOver(ACCOUNT, SOURCE);
         if (delegateHandles) {
             sentTo.add(new ArrayList<>(destinations));
         }
-        state.forwardSettled(ACCOUNT, SOURCE, delegateHandles, sourceOnScreenAfter);
+        state.forwardSettled(ACCOUNT, SOURCE, !delegateHandles ? ProtectedChatsState.ForwardOutcome.PICKER_REMAINS
+                : sourceOnScreenAfter ? ProtectedChatsState.ForwardOutcome.SOURCE_RETURNED : ProtectedChatsState.ForwardOutcome.DESTINATION_OPENED);
         return delegateHandles;
     }
 
-    /** ProtectedChatGate.onFragmentResumed for the source. */
+    /** ProtectedGateLifecycle.resumed for the source: shown again unless its authorization ended while it was covered. */
     private boolean sourceResumes() {
-        state.forwardPickerClosed(ACCOUNT, SOURCE);
         final boolean isLocked = locked(SOURCE);
         if (!isLocked) {
             state.chatEntered(ACCOUNT, SOURCE);
@@ -328,15 +328,35 @@ public class ForwardSourceContextTest {
     // ---- how a selection settles --------------------------------------------------------------------
 
     @Test
-    public void aSelectionThatOpensAnotherChatSettlesAsAnOrdinaryCover() {
+    public void aSelectionThatOpensAnotherChatMakesThatChatPartOfTheForward() {
         protect(SOURCE);
         openAuthorized(SOURCE);
         assertTrue(pickerOver(SOURCE, true));
 
         // A single other destination: the delegate opens that chat over the source.
         assertTrue(notifyDelegate(Arrays.asList(NOBODY), true, false));
+        assertEquals(ProtectedChatsState.ForwardPhase.DESTINATION, state.getForwardPhase(ACCOUNT, SOURCE));
+        assertFalse("covered by the forward's destination, not left", locked(SOURCE));
+
+        // Back from the destination: the source is shown again first, the destination goes after.
+        assertTrue(sourceResumes());
+        state.forwardDestinationLeft(ACCOUNT, SOURCE);
+        assertFalse(state.isForwardHoldActive(ACCOUNT, SOURCE));
+        assertFalse("no stale lock", locked(SOURCE));
+    }
+
+    @Test
+    public void leavingTheDestinationForSomethingElseCountsFromWhenTheSourceWasCovered() {
+        protect(SOURCE);
+        openAuthorized(SOURCE);
+        assertTrue(pickerOver(SOURCE, true));
+        assertTrue(notifyDelegate(Arrays.asList(NOBODY), true, false));
+
+        // The user opens something else from the destination while the source is still covered.
+        state.forwardDestinationLeft(ACCOUNT, SOURCE);
         assertFalse(state.isForwardHoldActive(ACCOUNT, SOURCE));
         assertTrue("under Immediate Auto-lock the covered source is locked, as always", locked(SOURCE));
+        assertFalse(sourceResumes());
     }
 
     @Test
@@ -346,11 +366,14 @@ public class ForwardSourceContextTest {
         assertTrue(pickerOver(SOURCE, true));
 
         assertFalse("an error alert, the picker stays", notifyDelegate(Arrays.asList(SAVED), false, true));
-        assertTrue(state.isForwardHoldActive(ACCOUNT, SOURCE));
+        assertEquals(ProtectedChatsState.ForwardPhase.PICKER, state.getForwardPhase(ACCOUNT, SOURCE));
         assertFalse(locked(SOURCE));
 
-        // The user then cancels the picker: the old behaviour.
-        assertFalse(sourceResumes());
+        // The user then cancels the picker: the source is shown again exactly as it was.
+        assertTrue(sourceResumes());
+        state.forwardPickerClosed(ACCOUNT, SOURCE);
+        assertFalse(state.isForwardHoldActive(ACCOUNT, SOURCE));
+        assertFalse(locked(SOURCE));
     }
 
     @Test

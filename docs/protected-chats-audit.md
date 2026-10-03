@@ -88,24 +88,43 @@ Lost-forward root cause (build #80): `ChatActivity.didSelectDialogs` cleared the
 first, then opened the destination chat; the chat gate blocked that open, the picker was closed, and after the unlock
 the gate only reopened the bare destination chat, so the forward panel was never created.
 
-**Source side** (`ProtectedChatsState.beginForwardHold`): a forward picker covers the screen that started it. With
-Immediate Auto-lock the covered protected chat was locked and then closed when the picker returned to it, before
-Telegram's success message and tag emojis for a forward to Saved Messages could finish. The hold does not depend on the
-screen type: `ActionBarLayout.presentFragment` tells `ProtectedChatGate.onForwardPickerPresented` which fragment a forward
-picker is presented over, and any fragment that shows a protected dialog which is authorized and open right now (a chat,
-a profile with its shared media, the chat behind the photo viewer) holds it. A screen that is not
-gated (`MediaActivity`) shows no protected dialog, so it can neither hold nor manufacture an authorization; the chat and
-profile under it were already covered, so under Immediate Auto-lock there is nothing of theirs left to lock.
-While the picker is on top the cover is not counted as leaving (the time it happened is kept). When the picker hands its
-selection over (`DialogsActivity.notifyDelegate`) the source is marked as returning; right after the delegate returns the
-hold is settled: if the selection was not completed the picker goes on, if a destination chat was opened over the source
-the countdown the cover would have started is applied from the time of the cover (the old behaviour), otherwise the source
-is back on screen with its authorization, for a deposit into Saved Messages (success message and tag emojis), a forward
-into the same chat, or a send to several chats. A picker that ends without a selection (Back) settles the same way as an
-ordinary cover. In the completion phase Telegram's own bulletin (tags) or undo view hiding ends the hold for a chat's
-forward to Saved Messages; for the other sources the phase has no effect while the source is on screen and ends with the
-next navigation away from it, the next forward, the app going to the background, a manual lock or the chat being
-destroyed. The hold concerns only the chat that was authorized and open when the picker was presented, never authorizes
-another chat or Saved Messages, and uses no timer. Destination authentication is unchanged: a selection of several chats
-asks for each locked protected destination in turn, remembers what the user unlocked for it while its own restart runs, and
-sends once; a cancel sends nothing.
+**Source side: the forward is a transaction of the chat that started it** (`ProtectedChatsState.ForwardPhase`,
+driven by `ProtectedGateLifecycle`, which `ProtectedChatGate` adapts to fragments). The picker, a destination's
+authentication sheet, the destination chat the forward opens and Telegram's success interaction are all part of the
+forward; none of them is the user leaving the source chat. Phases, per source dialog:
+
+| Phase | Source chat | Starts | Ends |
+| --- | --- | --- | --- |
+| `NONE` (source visible, or no forward) | shown or covered by ordinary navigation | - | - |
+| `PICKER` (`FORWARD_PICKER_OPEN`; a destination's `FORWARD_AUTH_OPEN` sheet is only a layer over it) | covered by the picker, not left | `ActionBarLayout.presentFragment` -> `ProtectedChatGate.onForwardPickerPresented`, only for a forward picker over a protected dialog that is authorized and visible | picker destroyed (`CANCELLED` when the source was shown again first: Back, system/toolbar/gesture back), source destroyed, app paused, manual lock |
+| `HANDING_OVER` (`RETURNING_TO_SOURCE`) | covered | `DialogsActivity.notifyDelegate` before `didSelectDialogs` | the delegate returns (`forwardSettled`, in a `finally`) |
+| `DESTINATION` (`DESTINATION_OPENED`) | covered by the destination chat | settle: a chat is on top of the source | destination paused or destroyed, source destroyed, app paused, manual lock |
+| `COMPLETING` (`FORWARD_COMPLETION_UI`) | shown again, success/tag UI on it | settle: the picker returned to the source | bulletin/undo view hidden, any navigation away, next forward, app paused, source destroyed |
+
+Why a cancel is not special: coming back on screen is itself the event that makes the cover not count. The cover is
+only *deferred* while the forward runs (`chatLeft` records when it happened); showing the source again
+(`chatEntered`) discards the deferral, so Back from the picker, Back from the destination and a forward that returns to the
+source all find the chat as it was. Nothing is decided at resume time: build #82 resolved the hold when the source resumed
+(`ProtectedChatGate.onFragmentResumed` called `forwardPickerClosed`), which applied the Immediate Auto-lock, and the chat
+gate then closed the freshly resumed source with `removeSelfFromStack` while the Back animation was still running
+(`ActionBarLayout.removeFragmentFromStack` completes the running transition, then closes the chat); and it abandoned the
+hold as soon as a destination opened, so Back from the destination met a locked source.
+
+The deferral is applied (the cover counts as leaving, from when it began) only when the forward ends with the source still
+covered: the picker destroyed while something else is on top, the destination left for unrelated navigation (a profile, another
+chat), the app going to the background. A chat that was only covered by its forward is not revived by a return from a
+system activity. The swipe-back preview resumes the source when the swipe starts and pauses it again when the swipe is given
+up: the deferral is discarded and recorded again, and the phase is untouched until the picker or destination is actually
+destroyed.
+
+The hold does not depend on the screen type: any fragment that shows a protected dialog which is authorized and visible
+right now (a chat, a profile with its shared media, the chat behind the photo viewer) can start it. A screen that is not gated
+(`MediaActivity`) shows no protected dialog, so it can neither hold nor manufacture an authorization. Source and destination
+are different fragments with different dialogs: the picker points to its source node, the destination points back to the
+source dialog, every transition is addressed to one dialog, a destination's own gate and authorization are never touched, and
+there is no global "current forward chat". The hold never authorizes another chat or Saved Messages and uses no timer.
+Destination authentication is unchanged: a selection of several chats asks for each locked protected destination in turn,
+remembers what the user unlocked for it while its own restart runs, and sends once; a cancel sends nothing; Saved Messages
+stays write-only and the tag-emoji completion is kept. `ActionBarLayout.presentFragment` is involved only to *start* the
+transaction (it knows which fragment a picker is presented over); Back, destination and completion are decided by the fragment
+lifecycle callbacks every kind of back navigation goes through (`closeLastFragment`, the swipe-back animation).

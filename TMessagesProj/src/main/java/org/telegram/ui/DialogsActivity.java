@@ -3082,9 +3082,6 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
     @Override
     public void onFragmentDestroy() {
         super.onFragmentDestroy();
-        // The picker is gone: whatever it held for the chat that opened it ends with it.
-        ProtectedChatGate.forwardPickerClosed(protectedForwardSource);
-        protectedForwardSource = null;
         if (observersGroup != null) {
             observersGroup.removeAllObservers();
             observersGroup = null;
@@ -11869,13 +11866,6 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
         return true;
     }
 
-    /** The chat that opened this forward picker over itself (see ProtectedChatsState.beginForwardHold). */
-    private BaseFragment protectedForwardSource;
-
-    public void setProtectedForwardSource(BaseFragment source) {
-        protectedForwardSource = source;
-    }
-
     /** A picker whose selection is forwarded (or shared) into the chosen chats. */
     public boolean isForwardPicker() {
         return onlySelect && initialDialogsType == DIALOGS_TYPE_FORWARD;
@@ -11898,15 +11888,18 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
         })) {
             return false;
         }
-        // The selection may finish by returning to the chat that opened this picker (a deposit into
-        // Saved Messages with its success and tag interaction, a forward into the same chat, a send
-        // to several chats). That chat's authorization, held while the picker covered it, must be
-        // there when it comes back; if the selection ends up opening another chat instead, or is not
-        // completed, the hold is settled right after (ProtectedChatsState.forwardSettled).
-        final BaseFragment source = isForwardPicker() ? protectedForwardSource : null;
-        ProtectedChatGate.forwardReturnsToSource(source);
-        final boolean handled = delegate.didSelectDialogs(DialogsActivity.this, dids, message, param, notify, scheduleDate, scheduleRepeatPeriod, topicsFragment);
-        ProtectedChatGate.forwardSettled(source, handled);
+        // The forward belongs to the chat that opened this picker (see ProtectedGateLifecycle). While
+        // the delegate runs the picker may finish itself, return to that chat (a deposit into Saved
+        // Messages with its success and tag interaction, a forward into the same chat, a send to
+        // several chats) or open a destination chat over it; what it did decides how the chat's
+        // authorization continues, and Back from the destination returns to the chat.
+        final ProtectedChatGate.Handover handover = isForwardPicker() ? ProtectedChatGate.forwardHandOver(this) : null;
+        boolean handled = false;
+        try {
+            handled = delegate.didSelectDialogs(DialogsActivity.this, dids, message, param, notify, scheduleDate, scheduleRepeatPeriod, topicsFragment);
+        } finally {
+            ProtectedChatGate.forwardSettled(this, handover, handled);
+        }
         if (handled && resetWhenHandled && resetDelegate) {
             delegate = null;
         }

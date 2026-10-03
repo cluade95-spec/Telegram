@@ -57,6 +57,7 @@ import org.telegram.messenger.NotificationsController;
 import org.telegram.messenger.SecretChatHelper;
 import org.telegram.messenger.SendMessagesHelper;
 import org.telegram.messenger.UserConfig;
+import org.telegram.messenger.ProtectedGateLifecycle;
 import org.telegram.messenger.utils.LeakDetector;
 import org.telegram.tgnet.ConnectionsManager;
 import org.telegram.ui.ArticleViewer;
@@ -73,11 +74,8 @@ import java.util.ArrayList;
 public abstract class BaseFragment {
 
     public boolean isFinished;
-    /** Dialog registered with ProtectedChatGate for this fragment, 0 if none. */
-    public long protectedGateDialogId;
-    public int protectedGateAccount;
-    /** The fragment currently counts as visible for the protected chat re-lock countdown. */
-    public boolean protectedGateVisible;
+    /** What ProtectedChatGate knows about this fragment: its protected dialog, whether it counts as visible, its forward. */
+    public final ProtectedGateLifecycle.Node protectedGate = new ProtectedGateLifecycle.Node();
     protected boolean finishing;
     public Dialog visibleDialog;
     protected int currentAccount = UserConfig.selectedAccount;
