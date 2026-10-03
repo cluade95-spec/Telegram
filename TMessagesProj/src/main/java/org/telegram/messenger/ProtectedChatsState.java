@@ -528,12 +528,26 @@ public final class ProtectedChatsState {
             return false;
         }
         Auth auth = authorized.get(key(accountKey, dialogId));
-        if (auth == null || !auth.active || auth.hold != HOLD_NONE) {
+        // One picker at a time. A new forward supersedes the completion of an earlier one.
+        if (auth == null || !auth.active || auth.hold == HOLD_PICKER) {
             return false;
         }
         auth.hold = HOLD_PICKER;
         auth.leaveDeferred = false;
         return true;
+    }
+
+    /**
+     * The forward picker is presented over a fragment. The fragment says which protected dialog it
+     * shows (0 when it is not about one) and whether it is on screen. Which kind of screen it is
+     * (chat, profile, shared media, a viewer's chat) does not matter: only a protected dialog that
+     * is authorized and open right now can hold, and the hold only keeps that authorization.
+     */
+    public synchronized boolean beginForwardHoldOver(long accountKey, long shownProtectedDialogId, boolean onScreen) {
+        if (shownProtectedDialogId == 0 || !onScreen) {
+            return false;
+        }
+        return beginForwardHold(accountKey, shownProtectedDialogId);
     }
 
     /**
@@ -555,14 +569,36 @@ public final class ProtectedChatsState {
     }
 
     /**
-     * The picker's forward goes to the user's own Saved Messages and Telegram is about to finish it
-     * and show its success interaction (the tag emojis) on this chat. The authorization is kept
-     * until that interaction ends, but never beyond the chat being on screen.
+     * The picker is handing its selection over and Telegram is about to finish it and return to the
+     * source (a deposit into Saved Messages with its success message and tag emojis, a forward into
+     * the same chat, a send to several chats). The authorization is kept until that interaction
+     * ends, but never beyond the chat being on screen.
      */
-    public synchronized void forwardToSavedMessagesCompleting(long accountKey, long dialogId) {
+    public synchronized void forwardReturnsToSource(long accountKey, long dialogId) {
         Auth auth = authorized.get(key(accountKey, dialogId));
         if (auth != null && auth.hold == HOLD_PICKER) {
             auth.hold = HOLD_COMPLETING;
+        }
+    }
+
+    /** The selection was not completed after all (an error, a confirmation pending): the picker goes on. */
+    public synchronized void forwardReturnAborted(long accountKey, long dialogId) {
+        Auth auth = authorized.get(key(accountKey, dialogId));
+        if (auth != null && auth.hold == HOLD_COMPLETING) {
+            auth.hold = HOLD_PICKER;
+        }
+    }
+
+    /**
+     * After the delegate handled the selection: if it did not complete, the picker goes on; if it
+     * completed but the source is not on screen (a destination chat was opened over it), the cover
+     * counts as leaving after all, from the time it began.
+     */
+    public synchronized void forwardSettled(long accountKey, long dialogId, boolean handled, boolean sourceOnScreen) {
+        if (!handled) {
+            forwardReturnAborted(accountKey, dialogId);
+        } else if (!sourceOnScreen) {
+            forwardCompletionEnded(accountKey, dialogId);
         }
     }
 

@@ -2002,6 +2002,7 @@ public class ActionBarLayout extends FrameLayout implements INavigationLayout, F
         boolean needAnimation = preview || !forceWithoutAnimation && MessagesController.getGlobalMainSettings().getBoolean("view_animations", true);
 
         final BaseFragment currentFragment = !fragmentsStack.isEmpty() ? fragmentsStack.get(fragmentsStack.size() - 1) : null;
+        ProtectedChatGate.onForwardPickerPresented(fragment, currentFragment);
 
         fragment.setParentLayout(this);
         View fragmentView = fragment.fragmentView;

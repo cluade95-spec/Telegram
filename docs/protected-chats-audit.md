@@ -88,12 +88,24 @@ Lost-forward root cause (build #80): `ChatActivity.didSelectDialogs` cleared the
 first, then opened the destination chat; the chat gate blocked that open, the picker was closed, and after the unlock
 the gate only reopened the bare destination chat, so the forward panel was never created.
 
-**Source side** (`ProtectedChatsState.beginForwardHold`): a forward picker covers the chat that opened it. With
-Immediate Auto-lock the covered chat was locked and then closed when the picker returned to it, before Telegram's success
-message and tag emojis for a forward to Saved Messages could finish. While the picker is on top the cover is not counted
-as leaving (the time it happened is kept). If the picker ends without a deposit into Saved Messages (Back, another
-destination) the countdown the cover would have started is applied from that time: the old behaviour. A deposit into
-Saved Messages moves the hold to the completion interaction, which ends when Telegram's bulletin (tag emojis) or undo view
-hides. The hold concerns only the chat that was authorized and open when it began, never authorizes anything else, and
-ends at once on any other navigation away from that chat, on the app going to the background, on a manual lock and when
-the chat is destroyed. There is no timer.
+**Source side** (`ProtectedChatsState.beginForwardHold`): a forward picker covers the screen that started it. With
+Immediate Auto-lock the covered protected chat was locked and then closed when the picker returned to it, before
+Telegram's success message and tag emojis for a forward to Saved Messages could finish. The hold does not depend on the
+screen type: `ActionBarLayout.presentFragment` tells `ProtectedChatGate.onForwardPickerPresented` which fragment a forward
+picker is presented over, and any fragment that shows a protected dialog which is authorized and open right now (a chat,
+a profile with its shared media, the chat behind the photo viewer) holds it. A screen that is not
+gated (`MediaActivity`) shows no protected dialog, so it can neither hold nor manufacture an authorization; the chat and
+profile under it were already covered, so under Immediate Auto-lock there is nothing of theirs left to lock.
+While the picker is on top the cover is not counted as leaving (the time it happened is kept). When the picker hands its
+selection over (`DialogsActivity.notifyDelegate`) the source is marked as returning; right after the delegate returns the
+hold is settled: if the selection was not completed the picker goes on, if a destination chat was opened over the source
+the countdown the cover would have started is applied from the time of the cover (the old behaviour), otherwise the source
+is back on screen with its authorization, for a deposit into Saved Messages (success message and tag emojis), a forward
+into the same chat, or a send to several chats. A picker that ends without a selection (Back) settles the same way as an
+ordinary cover. In the completion phase Telegram's own bulletin (tags) or undo view hiding ends the hold for a chat's
+forward to Saved Messages; for the other sources the phase has no effect while the source is on screen and ends with the
+next navigation away from it, the next forward, the app going to the background, a manual lock or the chat being
+destroyed. The hold concerns only the chat that was authorized and open when the picker was presented, never authorizes
+another chat or Saved Messages, and uses no timer. Destination authentication is unchanged: a selection of several chats
+asks for each locked protected destination in turn, remembers what the user unlocked for it while its own restart runs, and
+sends once; a cancel sends nothing.

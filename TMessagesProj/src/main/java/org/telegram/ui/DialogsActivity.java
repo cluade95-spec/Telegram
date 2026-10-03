@@ -11876,6 +11876,11 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
         protectedForwardSource = source;
     }
 
+    /** A picker whose selection is forwarded (or shared) into the chosen chats. */
+    public boolean isForwardPicker() {
+        return onlySelect && initialDialogsType == DIALOGS_TYPE_FORWARD;
+    }
+
     /**
      * Every forward picker hands its selection to the delegate here. A destination that is protected
      * and locked asks for authentication first, except the user's own Saved Messages, which only
@@ -11893,7 +11898,15 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
         })) {
             return false;
         }
+        // The selection may finish by returning to the chat that opened this picker (a deposit into
+        // Saved Messages with its success and tag interaction, a forward into the same chat, a send
+        // to several chats). That chat's authorization, held while the picker covered it, must be
+        // there when it comes back; if the selection ends up opening another chat instead, or is not
+        // completed, the hold is settled right after (ProtectedChatsState.forwardSettled).
+        final BaseFragment source = isForwardPicker() ? protectedForwardSource : null;
+        ProtectedChatGate.forwardReturnsToSource(source);
         final boolean handled = delegate.didSelectDialogs(DialogsActivity.this, dids, message, param, notify, scheduleDate, scheduleRepeatPeriod, topicsFragment);
+        ProtectedChatGate.forwardSettled(source, handled);
         if (handled && resetWhenHandled && resetDelegate) {
             delegate = null;
         }

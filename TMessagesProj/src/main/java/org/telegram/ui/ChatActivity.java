@@ -3555,7 +3555,7 @@ public class ChatActivity extends BaseFragment implements
                     args.putBoolean("canSelectTopics", true);
                     DialogsActivity fragment = new DialogsActivity(args);
                     fragment.setDelegate(chatActivity);
-                    chatActivity.presentForwardPicker(fragment);
+                    chatActivity.presentFragment(fragment);
                 } else {
                     if (chatActivity.actionBar != null && chatActivity.actionBar.isActionModeShowed()) {
                         chatActivity.clearSelectionMode();
@@ -5082,7 +5082,7 @@ public class ChatActivity extends BaseFragment implements
                             args.putBoolean("canSelectTopics", true);
                             final DialogsActivity fragment = new DialogsActivity(args);
                             fragment.setDelegate(ChatActivity.this);
-                            presentForwardPicker(fragment);
+                            presentFragment(fragment);
                         } else {
                             showFieldPanelForReply(getSlidingMessageObject());
                         }
@@ -11101,7 +11101,7 @@ public class ChatActivity extends BaseFragment implements
                     args.putBoolean("canSelectTopics", true);
                     final DialogsActivity fragment = new DialogsActivity(args);
                     fragment.setDelegate(ChatActivity.this);
-                    ChatActivity.this.presentForwardPicker(fragment);
+                    presentFragment(fragment);
                 }
             }
 
@@ -12305,7 +12305,7 @@ public class ChatActivity extends BaseFragment implements
         args.putBoolean("canSelectTopics", true);
         DialogsActivity fragment = new DialogsActivity(args);
         fragment.setDelegate(ChatActivity.this);
-        presentForwardPicker(fragment);
+        presentFragment(fragment);
     }
 
     public void showBottomOverlayProgress(boolean show, boolean animated) {
@@ -33356,7 +33356,7 @@ public class ChatActivity extends BaseFragment implements
                 args.putBoolean("canSelectTopics", true);
                 DialogsActivity fragment = new DialogsActivity(args);
                 fragment.setDelegate(this);
-                presentForwardPicker(fragment);
+                presentFragment(fragment);
                 break;
             }
             case OPTION_COPY: {
@@ -33621,7 +33621,7 @@ public class ChatActivity extends BaseFragment implements
                     args.putBoolean("canSelectTopics", true);
                     DialogsActivity fragment = new DialogsActivity(args);
                     fragment.setDelegate(this);
-                    presentForwardPicker(fragment);
+                    presentFragment(fragment);
                 } else {
                     showFieldPanelForReply(selectedObject);
                 }
@@ -34355,20 +34355,6 @@ public class ChatActivity extends BaseFragment implements
         }
     }
 
-    /**
-     * Presents a forward (or quote) picker over this chat. The picker covers the chat, but the user
-     * is still in it: a protected, open chat keeps its authorization while the picker is on top
-     * (ProtectedChatsState.beginForwardHold) and settles when the picker is gone.
-     */
-    private void presentForwardPicker(DialogsActivity picker) {
-        ProtectedChatGate.beginForwardHold(this);
-        picker.setProtectedForwardSource(this);
-        if (!presentFragment(picker)) {
-            picker.setProtectedForwardSource(null);
-            ProtectedChatGate.forwardPickerClosed(this);
-        }
-    }
-
     @Override
     public boolean didSelectDialogs(DialogsActivity fragment, ArrayList<MessagesStorage.TopicKey> dids, CharSequence message, boolean param, boolean notify, int scheduleDate, int scheduleRepeatPeriod, TopicsFragment topicsFragment) {
         if ((messagePreviewParams == null && (!fragment.isQuote || replyingMessageObject == null) || fragment.isQuote && replyingMessageObject == null) && forwardingMessage == null && selectedMessagesIds[0].size() == 0 && selectedMessagesIds[1].size() == 0) {
@@ -34446,13 +34432,10 @@ public class ChatActivity extends BaseFragment implements
                     getSendMessagesHelper().sendMessage(fmessages, did, false, false, notify, scheduleDate, scheduleRepeatPeriod, null, -1, price == null ? 0 : price, getSendMonoForumPeerId(), getSendMessageSuggestionParams());
                 }
                 // Into the user's own Saved Messages Telegram shows its success message with the tag
-                // emojis on this chat. If this chat is protected and open it stays open until that
-                // interaction ends (ProtectedChatsState.forwardToSavedMessagesCompleting); Saved
-                // Messages itself is only written to, never unlocked or opened.
+                // emojis on this chat. A protected, open chat stays open until that interaction ends
+                // (the picker handed its selection over as returning to its source, see
+                // DialogsActivity.notifyDelegate); Saved Messages itself is only written to.
                 final boolean intoSavedMessages = dids.size() == 1 && dids.get(0).dialogId == getUserConfig().getClientUserId();
-                if (intoSavedMessages) {
-                    ProtectedChatGate.forwardToSavedMessagesCompleting(ChatActivity.this);
-                }
                 fragment.finishFragment();
                 createUndoView();
                 if (intoSavedMessages && undoView == null) {

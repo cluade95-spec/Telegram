@@ -267,8 +267,16 @@ public class ProtectedChats {
         state().forwardPickerClosed(accountKey(account), dialogId);
     }
 
-    public static void forwardToSavedMessagesCompleting(int account, long dialogId) {
-        state().forwardToSavedMessagesCompleting(accountKey(account), dialogId);
+    public static boolean beginForwardHoldOver(int account, long shownProtectedDialogId, boolean onScreen) {
+        return state().beginForwardHoldOver(accountKey(account), shownProtectedDialogId, onScreen);
+    }
+
+    public static void forwardReturnsToSource(int account, long dialogId) {
+        state().forwardReturnsToSource(accountKey(account), dialogId);
+    }
+
+    public static void forwardSettled(int account, long dialogId, boolean handled, boolean sourceOnScreen) {
+        state().forwardSettled(accountKey(account), dialogId, handled, sourceOnScreen);
     }
 
     public static void forwardCompletionEnded(int account, long dialogId) {

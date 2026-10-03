@@ -106,7 +106,7 @@ public class ProtectedChatsForwardHoldTest {
         state.chatLeft(ACCOUNT, SOURCE);                       // the picker covers it
         assertFalse("not locked while the picker is up", locked(SOURCE));
 
-        state.forwardToSavedMessagesCompleting(ACCOUNT, SOURCE);   // Saved Messages was chosen
+        state.forwardReturnsToSource(ACCOUNT, SOURCE);   // Saved Messages was chosen
         assertTrue("the picker finishes and the source is back: not kicked out", sourceResumes());
         assertTrue("Telegram's success and tag interaction runs on an open chat", state.isForwardHoldActive(ACCOUNT, SOURCE));
         assertFalse(locked(SOURCE));
@@ -119,7 +119,7 @@ public class ProtectedChatsForwardHoldTest {
         openAuthorized(SOURCE);
         state.beginForwardHold(ACCOUNT, SOURCE);
         state.chatLeft(ACCOUNT, SOURCE);
-        state.forwardToSavedMessagesCompleting(ACCOUNT, SOURCE);
+        state.forwardReturnsToSource(ACCOUNT, SOURCE);
         assertTrue(sourceResumes());
 
         // The tag emojis are up.
@@ -134,7 +134,7 @@ public class ProtectedChatsForwardHoldTest {
         openAuthorized(SOURCE);
         state.beginForwardHold(ACCOUNT, SOURCE);
         state.chatLeft(ACCOUNT, SOURCE);
-        state.forwardToSavedMessagesCompleting(ACCOUNT, SOURCE);
+        state.forwardReturnsToSource(ACCOUNT, SOURCE);
         assertTrue(sourceResumes());
 
         state.forwardCompletionEnded(ACCOUNT, SOURCE);
@@ -152,7 +152,7 @@ public class ProtectedChatsForwardHoldTest {
         openAuthorized(SOURCE);
         state.beginForwardHold(ACCOUNT, SOURCE);
         state.chatLeft(ACCOUNT, SOURCE);
-        state.forwardToSavedMessagesCompleting(ACCOUNT, SOURCE);
+        state.forwardReturnsToSource(ACCOUNT, SOURCE);
         assertTrue(sourceResumes());
 
         // The user opens something else over the chat while the tags are up.
@@ -168,7 +168,7 @@ public class ProtectedChatsForwardHoldTest {
         openAuthorized(SOURCE);
         state.beginForwardHold(ACCOUNT, SOURCE);
         state.chatLeft(ACCOUNT, SOURCE);
-        state.forwardToSavedMessagesCompleting(ACCOUNT, SOURCE);
+        state.forwardReturnsToSource(ACCOUNT, SOURCE);
         assertTrue(sourceResumes());
 
         state.appPaused();
@@ -198,7 +198,7 @@ public class ProtectedChatsForwardHoldTest {
         openAuthorized(SOURCE);
         assertTrue(state.beginForwardHold(ACCOUNT, SOURCE));
         state.chatLeft(ACCOUNT, SOURCE);
-        state.forwardToSavedMessagesCompleting(ACCOUNT, SOURCE);
+        state.forwardReturnsToSource(ACCOUNT, SOURCE);
         assertTrue(sourceResumes());
 
         assertTrue("another protected chat stays locked", locked(OTHER));
@@ -216,7 +216,7 @@ public class ProtectedChatsForwardHoldTest {
         assertFalse("authorized but not opened yet", state.beginForwardHold(ACCOUNT, SOURCE));
         state.chatEntered(ACCOUNT, SOURCE);
         assertTrue(state.beginForwardHold(ACCOUNT, SOURCE));
-        assertFalse("one hold at a time", state.beginForwardHold(ACCOUNT, SOURCE));
+        assertFalse("one picker at a time", state.beginForwardHold(ACCOUNT, SOURCE));
         assertFalse("a chat that is not protected holds nothing", state.beginForwardHold(ACCOUNT, 5555L));
     }
 
@@ -258,7 +258,7 @@ public class ProtectedChatsForwardHoldTest {
         openAuthorized(SOURCE);
         state.beginForwardHold(ACCOUNT, SOURCE);
         state.chatLeft(ACCOUNT, SOURCE);
-        state.forwardToSavedMessagesCompleting(ACCOUNT, SOURCE);
+        state.forwardReturnsToSource(ACCOUNT, SOURCE);
         // The source is never shown again (something else stays on top) and the interaction ends.
         state.forwardCompletionEnded(ACCOUNT, SOURCE);
         assertTrue("no authorization is left behind a chat that is not on screen", locked(SOURCE));
@@ -280,7 +280,7 @@ public class ProtectedChatsForwardHoldTest {
         openAuthorized(SOURCE);
         state.beginForwardHold(ACCOUNT, SOURCE);
         state.chatLeft(ACCOUNT, SOURCE);
-        state.forwardToSavedMessagesCompleting(ACCOUNT, SOURCE);
+        state.forwardReturnsToSource(ACCOUNT, SOURCE);
         assertTrue(sourceResumes());
         state.forwardCompletionEnded(ACCOUNT, SOURCE);
 

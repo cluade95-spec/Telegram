@@ -187,12 +187,19 @@ public final class ProtectedChatGate {
 
     // ------------------------------------------------------------------ forward hold
 
-    /** The chat is about to open its forward picker over itself (see ProtectedChatsState.beginForwardHold). */
-    public static void beginForwardHold(BaseFragment source) {
-        if (source == null || source.protectedGateDialogId == 0 || !source.protectedGateVisible) {
+    /**
+     * A forward picker is being presented over {@code below}. Whatever screen that is (a chat, a
+     * profile or its shared media, the chat behind a viewer), if it shows a protected dialog that is
+     * authorized and open right now, that authorization is held while the picker is on top (see
+     * ProtectedChatsState.beginForwardHold). The picker remembers the source it belongs to.
+     */
+    public static void onForwardPickerPresented(BaseFragment picker, BaseFragment below) {
+        if (!(picker instanceof DialogsActivity) || !((DialogsActivity) picker).isForwardPicker() || below == null) {
             return;
         }
-        ProtectedChats.beginForwardHold(source.protectedGateAccount, source.protectedGateDialogId);
+        if (ProtectedChats.beginForwardHoldOver(below.protectedGateAccount, below.protectedGateDialogId, below.protectedGateVisible)) {
+            ((DialogsActivity) picker).setProtectedForwardSource(below);
+        }
     }
 
     /** The picker is gone (or never opened) without a deposit into Saved Messages. */
@@ -202,10 +209,17 @@ public final class ProtectedChatGate {
         }
     }
 
-    /** The forward goes into the own Saved Messages and Telegram is about to show its success and tag interaction. */
-    public static void forwardToSavedMessagesCompleting(BaseFragment source) {
+    /** The picker hands its selection over; Telegram may return to the source and show its success interaction. */
+    public static void forwardReturnsToSource(BaseFragment source) {
         if (source != null && source.protectedGateDialogId != 0) {
-            ProtectedChats.forwardToSavedMessagesCompleting(source.protectedGateAccount, source.protectedGateDialogId);
+            ProtectedChats.forwardReturnsToSource(source.protectedGateAccount, source.protectedGateDialogId);
+        }
+    }
+
+    /** The delegate has handled the selection (or not): see ProtectedChatsState.forwardSettled. */
+    public static void forwardSettled(BaseFragment source, boolean handled) {
+        if (source != null && source.protectedGateDialogId != 0) {
+            ProtectedChats.forwardSettled(source.protectedGateAccount, source.protectedGateDialogId, handled, source.protectedGateVisible);
         }
     }
 

@@ -1,6 +1,8 @@
 package org.telegram.messenger;
 
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 /**
  * Which destinations of a forward (or share) must be unlocked first, and the continuation that
@@ -44,10 +46,21 @@ public final class ForwardDestinations {
         return locks.isLockedProtected(dialogId);
     }
 
+    /**
+     * Destinations the user has just authenticated for the operation that is running right now. The
+     * operation starts again from the top (it is the original selection), and it must not ask again
+     * for what was unlocked a moment ago for it, however long the other prompts took.
+     */
+    private static final ThreadLocal<Set<Long>> RESUMING = new ThreadLocal<>();
+
     /** The first destination that must be unlocked, or 0 when none. */
     public static long firstLocked(List<Long> dialogIds, long ownSavedMessagesId, boolean ownSavedMessagesExempt, Locks locks) {
+        final Set<Long> resuming = RESUMING.get();
         for (int i = 0; i < dialogIds.size(); i++) {
             final long id = dialogIds.get(i);
+            if (resuming != null && resuming.contains(id)) {
+                continue;
+            }
             if (needsAuthentication(id, ownSavedMessagesId, ownSavedMessagesExempt, locks)) {
                 return id;
             }
@@ -59,6 +72,7 @@ public final class ForwardDestinations {
     public static final class Pending {
         private Runnable operation;
         private boolean finished;
+        private final Set<Long> unlockedForThis = new HashSet<>();
 
         private Pending(Runnable operation) {
             this.operation = operation;
@@ -76,7 +90,13 @@ public final class ForwardDestinations {
             finished = true;
             final Runnable toRun = operation;
             operation = null;
-            toRun.run();
+            final Set<Long> before = RESUMING.get();
+            RESUMING.set(unlockedForThis);
+            try {
+                toRun.run();
+            } finally {
+                RESUMING.set(before);
+            }
             return true;
         }
 
@@ -102,13 +122,24 @@ public final class ForwardDestinations {
         return true;
     }
 
+    private static long firstLockedFor(Pending pending, List<Long> dialogIds, long own, boolean exempt, Locks locks) {
+        final Set<Long> before = RESUMING.get();
+        RESUMING.set(pending.unlockedForThis);
+        try {
+            return firstLocked(dialogIds, own, exempt, locks);
+        } finally {
+            RESUMING.set(before);
+        }
+    }
+
     private static void authenticate(Pending pending, long dialogId, List<Long> dialogIds, long own, boolean exempt, Locks locks, Authenticator authenticator) {
         authenticator.authenticate(dialogId, () -> {
             if (!pending.isOpen()) {
                 return;
             }
+            pending.unlockedForThis.add(dialogId);
             // Look again: the next locked destination asks in its turn, then the operation runs.
-            final long next = firstLocked(dialogIds, own, exempt, locks);
+            final long next = firstLockedFor(pending, dialogIds, own, exempt, locks);
             if (next == 0) {
                 pending.run();
             } else {
