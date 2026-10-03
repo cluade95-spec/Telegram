@@ -438,7 +438,7 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
      * parenthesised parts are joined with one space.
      */
     public static Line splitBackgroundVocals(Line line) {
-        if (line == null || TextUtils.isEmpty(line.text)) return line;
+        if (line == null || isEmptyText(line.text)) return line;
         final String text = line.text;
         if (text.indexOf('(') < 0 && text.indexOf('\uFF08') < 0) return line;
         final int length = text.length();
@@ -1056,7 +1056,7 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
             Matcher matcher = TIMESTAMP.matcher(sourceLine);
             ArrayList<Long> times = new ArrayList<>();
             int end = 0;
-            while (matcher.find() && (matcher.start() == end || TextUtils.isEmpty(sourceLine.substring(end, matcher.start()).trim()))) {
+            while (matcher.find() && (matcher.start() == end || isEmptyText(sourceLine.substring(end, matcher.start()).trim()))) {
                 try {
                     long minutes = Long.parseLong(matcher.group(1));
                     long seconds = Long.parseLong(matcher.group(2));
@@ -1126,9 +1126,14 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
         }
     }
 
+    /** {@code TextUtils.isEmpty}, kept local so parsing needs nothing from the platform (and runs in a plain JVM test). */
+    private static boolean isEmptyText(CharSequence text) {
+        return text == null || text.length() == 0;
+    }
+
     private static boolean hasValidLeadingTimestamp(String sourceLine) {
         Matcher timestamp = TIMESTAMP.matcher(sourceLine);
-        if (!timestamp.find() || !TextUtils.isEmpty(sourceLine.substring(0, timestamp.start()).trim())) return false;
+        if (!timestamp.find() || !isEmptyText(sourceLine.substring(0, timestamp.start()).trim())) return false;
         try {
             return Long.parseLong(timestamp.group(2)) < 60;
         } catch (RuntimeException ignore) {
@@ -1281,12 +1286,14 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
             final long time = candidate.times[a];
             // Stated out of its own line's interval, or running backwards: not this line's timing.
             // Lines may overlap (Apple Music's lyrics often do: an echo in parentheses, or the
-            // end of a line, sung over the start of the next one), so a word may start after the
-            // next line has started, but never after the one after it. Main words and background
-            // words are each in time order on their own; a background part may start before the
-            // main words written ahead of it have.
+            // end of a line, sung over the start of the next one), so a main word may start after
+            // the next line has started, but never after the one after it. Main words and
+            // background words are two independent timed parts, each in time order on its own; a
+            // background part may start before the main words written ahead of it have, and,
+            // being an echo that can be sung over any number of later lines, it is not bounded by
+            // the lines that follow (a word of one may start after the line after next has).
             final boolean background = isBackgroundVocalAt(text, candidate.offsets[a]);
-            if (time < lineTimeMs || time >= afterNextTimeMs) return null;
+            if (time < lineTimeMs || !background && time >= afterNextTimeMs) return null;
             if (background ? time < lastBackground : time < lastMain) return null;
             if (background) lastBackground = time;
             else lastMain = time;
@@ -1310,12 +1317,14 @@ public final class SyncedLyricsController implements NotificationCenter.Notifica
             endOffsets[kept] = end;
             startTimes[kept] = candidate.times[a];
             // Only a stated end survives: TTML's own end attribute, or an end tag right after
-            // the word. It must be after the word's start and no later than the line after next
-            // (a line may run on over the start of the next one). Anything else is "not stated"
-            // rather than repaired, because a repaired end would be an invented one.
+            // the word. It must be after the word's start and, for a main word, no later than the
+            // line after next (a line may run on over the start of the next one); a background
+            // word's part is unbounded like its starts. Anything else is "not stated" rather than
+            // repaired, because a repaired end would be an invented one.
             long stated = candidate.ends != null ? candidate.ends[a] : -1;
             if (a + 1 < count && endTag[a + 1]) stated = candidate.times[a + 1];
-            final boolean usable = stated > candidate.times[a] && stated <= afterNextTimeMs;
+            final boolean usable = stated > candidate.times[a]
+                    && (stated <= afterNextTimeMs || isBackgroundVocalAt(text, start));
             endTimes[kept] = usable ? stated : -1;
             anyEnd |= usable;
             kept++;

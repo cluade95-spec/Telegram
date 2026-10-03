@@ -4,15 +4,20 @@ package org.telegram.messenger;
  * Which lines of word-timed lyrics the list keeps on screen while the singing of neighbouring
  * lines overlaps (a line, or its background vocals, still sung when the next line starts).
  *
- * <p>Every line retires on its own. At a position the list keeps the OLDEST line that has started
- * and is not finished yet, and the lines after it, so a pair that overlaps stays together until the
- * older one ends; then the older one scrolls out and the other stays. A chain of overlaps is not one
- * block: line A overlapping B, and B overlapping C, keeps A and B while A sings, then B and C while
- * B sings, then C. A line overlapping its neighbour never keeps the line before it alive: only its
- * own end does.
+ * <p>The list changes what it keeps when a lyric line STARTS, not when a line's own end is
+ * reached. At each start, the rows that have finished are retired from the top, one by one, up to
+ * the first row that is genuinely still singing; that row, and everything after it, stays. So an
+ * overlapping pair stays put, finished first line included, until the next line starts; then the
+ * finished one scrolls out and the other stays. A chain of overlaps is never one block: A
+ * overlapping B and B overlapping C keeps A and B until C starts, then B and C (if B still sings),
+ * and the next start retires whatever has finished by then, however long the chain runs.
+ *
+ * <p>Once nothing is singing any more (every line up to the current one has ended), the list moves
+ * on to the next line, exactly as it does for ordinary non-overlapping lines.
  *
  * <p>Everything is a pure function of the position, so a seek lands on exactly the state playing
- * would have reached. The lookup is a binary search over the running maximum of the line ends.
+ * would have reached, and pausing or resuming changes nothing. The lookup is a binary search over
+ * the running maximum of the line ends.
  */
 public final class LyricsOverlap {
 
@@ -23,6 +28,7 @@ public final class LyricsOverlap {
         boolean canFollow(int line);
     }
 
+    private final long[] startMs;
     private final long[] endMs;
     private final boolean[] known;
     /** First line of the run of known lines each line belongs to, or -1. */
@@ -33,13 +39,15 @@ public final class LyricsOverlap {
     private final int[] nextTimed;
 
     /**
+     * @param startMs  per line: its own time
      * @param endMs    per line: when its last sound ends, background vocals included
      * @param known    per line: it has word timing and text, so it has an end
      * @param untimed  per line: it has no time at all; it neither takes part nor ends a run
      * @param nextTimed per line: the next line that has a time, or -1
      */
-    public LyricsOverlap(long[] endMs, boolean[] known, boolean[] untimed, int[] nextTimed) {
+    public LyricsOverlap(long[] startMs, long[] endMs, boolean[] known, boolean[] untimed, int[] nextTimed) {
         final int lines = endMs.length;
+        this.startMs = startMs.clone();
         this.endMs = endMs.clone();
         this.known = known.clone();
         this.nextTimed = nextTimed.clone();
@@ -54,7 +62,7 @@ public final class LyricsOverlap {
                 continue;
             }
             if (!known[i]) {
-                // A blank or an unknown end: nothing before it can still be kept by what follows.
+                // A blank or an unknown end: nothing before it can still be kept by what follows it.
                 start = -1;
                 max = UNKNOWN;
                 runStart[i] = -1;
@@ -76,27 +84,26 @@ public final class LyricsOverlap {
         return known.length;
     }
 
-    /** When the last sound of {@code line} ends, or {@link #UNKNOWN} when the line takes no part. */
-    public long endOf(int line) {
-        return isKnown(line) ? endMs[line] : UNKNOWN;
-    }
-
     /** True when {@code line} has an end of its own and so takes part. */
     public boolean isKnown(int line) {
         return line >= 0 && line < known.length && known[line] && runStart[line] >= 0;
     }
 
+    /** When the last sound of {@code line} ends, or {@link #UNKNOWN} when the line takes no part. */
+    public long endOf(int line) {
+        return isKnown(line) ? endMs[line] : UNKNOWN;
+    }
+
     /**
-     * The oldest line that has started and has not finished at {@code position}, among the known
-     * lines up to {@code line} (the line the position is in). -1 when there is none, or when
-     * {@code line} takes no part.
+     * The oldest line, among the known lines up to {@code line}, that has not finished at
+     * {@code time}; -1 when every one of them has, or when {@code line} takes no part.
      */
-    public int oldestUnfinished(int line, long position) {
-        if (!isKnown(line) || runMaxEnd[line] <= position) return -1;
+    public int oldestUnfinished(int line, long time) {
+        if (!isKnown(line) || runMaxEnd[line] <= time) return -1;
         int low = runStart[line], high = line;
         while (low < high) {
             final int middle = (low + high) >>> 1;
-            if (runMaxEnd[middle] > position) {
+            if (runMaxEnd[middle] > time) {
                 high = middle;
             } else {
                 low = middle + 1;
@@ -110,31 +117,16 @@ public final class LyricsOverlap {
         return isKnown(line) && runMaxEnd[line] <= position;
     }
 
-    /** The line whose end is the last of the lines up to {@code line}; the lowest one on a tie. */
-    public int lastToFinish(int line) {
-        if (!isKnown(line)) return -1;
-        final long end = runMaxEnd[line];
-        int low = runStart[line], high = line;
-        while (low < high) {
-            final int middle = (low + high) >>> 1;
-            if (runMaxEnd[middle] >= end) {
-                high = middle;
-            } else {
-                low = middle + 1;
-            }
-        }
-        return low;
-    }
-
     /**
-     * The first line the list keeps: the oldest line still singing, or, once everything up to
-     * {@code line} has ended, the one that ended last (the list stays where it was). -1 when the
-     * line takes no part (the caller's own rules apply).
+     * The first line the list keeps while something is singing: the oldest line still unfinished
+     * when {@code line} STARTED. It does not change until the next line starts, whatever finishes
+     * in between. -1 when the line takes no part (the caller's own rules apply).
      */
-    public int anchorLine(int line, long position) {
+    public int anchorLine(int line) {
         if (!isKnown(line)) return -1;
-        final int oldest = oldestUnfinished(line, position);
-        return oldest >= 0 ? oldest : lastToFinish(line);
+        final int oldest = oldestUnfinished(line, startMs[line]);
+        // A line that has already ended when it starts (no length) is its own anchor.
+        return oldest >= 0 ? oldest : line;
     }
 
     /**
@@ -148,19 +140,19 @@ public final class LyricsOverlap {
         return next;
     }
 
-    /** The line on the anchor: the next line once everything has ended, else the anchor line. -1: no part. */
+    /** The line on the anchor: the next line once nothing sings, else the anchor line. -1: no part. */
     public int followLine(int line, long position, Followable followable) {
         if (!isKnown(line)) return -1;
         final int after = afterLine(line, position, followable);
-        return after >= 0 ? after : anchorLine(line, position);
+        return after >= 0 ? after : anchorLine(line);
     }
 
-    /** First lit line: the next line alone once everything has ended, else the anchor line. */
+    /** First lit line: the next line alone once nothing sings, else the anchor line. */
     public int litFirst(int line, long position, Followable followable) {
         return followLine(line, position, followable);
     }
 
-    /** Last lit line: the next line alone once everything has ended, else {@code line} itself. */
+    /** Last lit line: the next line alone once nothing sings, else {@code line} itself. */
     public int litLast(int line, long position, Followable followable) {
         if (!isKnown(line)) return line;
         final int after = afterLine(line, position, followable);

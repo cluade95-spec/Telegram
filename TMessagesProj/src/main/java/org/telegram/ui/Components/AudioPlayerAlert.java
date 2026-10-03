@@ -96,6 +96,7 @@ import org.telegram.messenger.ImageLoader;
 import org.telegram.messenger.ImageLocation;
 import org.telegram.messenger.ImageReceiver;
 import org.telegram.messenger.LocaleController;
+import org.telegram.messenger.LyricsBackgroundVocals;
 import org.telegram.messenger.LyricsGlow;
 import org.telegram.messenger.LyricsOverlap;
 import org.telegram.messenger.MediaController;
@@ -3316,11 +3317,10 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
     private long[] lyricsLineHoldEnd = new long[0];
     /**
      * Which lines the list keeps while the singing of neighbouring lines overlaps (a line, or its
-     * background vocals, still sung when the next line starts). Every line retires on its own: the
-     * list stays on the oldest line still singing and moves on when that one ends, however long a
-     * chain of overlaps runs.
+     * background vocals, still sung when the next line starts). Every line retires on its own, when
+     * a newer line starts and it has finished, however long a chain of overlaps runs.
      */
-    private LyricsOverlap lyricsOverlap = new LyricsOverlap(new long[0], new boolean[0], new boolean[0], new int[0]);
+    private LyricsOverlap lyricsOverlap = new LyricsOverlap(new long[0], new long[0], new boolean[0], new boolean[0], new int[0]);
     private final LyricsOverlap.Followable lyricsFollowable = this::canLyricsLineFollow;
     /**
      * Instrumental gaps that show the dots: each has a row of its own (LYRICS_ROW_INTERLUDE in
@@ -3458,9 +3458,9 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             final int preRolled = lyricsPreRollLine(index, position);
             if (preRolled != index) activeLine = preRolled;
         }
-        // The lit lines: from the oldest line still singing to the current one (so an overlapping
-        // pair stays lit together), or, once all of them have ended and the list has moved on, the
-        // next line on its own.
+        // The lit lines: from the oldest line kept (see lyricsFollowTargetRow) to the current one,
+        // so an overlapping pair stays lit together, or, once all of them have ended and the list
+        // has moved on, the next line on its own.
         int litFirst = activeLine;
         int litLast = activeLine;
         if (!idle && activeLine >= 0 && lyricsWordTimed) {
@@ -3807,9 +3807,10 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         // During an instrumental gap the dots sit on the anchor.
         if (lyricsInterludeRow != RecyclerView.NO_POSITION) targetRow = lyricsInterludeRow;
         // Apple Music: the list stays on a line, and on the oldest line of an overlap that is still
-        // singing, until that line has ended, background vocals included, and then moves on: to the
-        // next oldest line still singing, or, once all have ended, to the line after them. Every
-        // line retires on its own; a chain of overlaps is not one block.
+        // singing. When a line STARTS, the rows that have finished are retired from the top one by
+        // one, up to the first that still sings, which stays (a finished row waits for the next
+        // line to start); once nothing sings, the list moves to the line after. A chain of overlaps
+        // is not one block.
         if (lyricsWordTimed && lyricsOverlap.isKnown(line) && lyricsInterludeRow == RecyclerView.NO_POSITION) {
             final int follow = lyricsOverlap.followLine(line, position, lyricsFollowable);
             final int followRow = rowForLyricsLine(follow);
@@ -3964,6 +3965,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         lyricsDisplayLines = new SyncedLyricsController.Line[lines];
         lyricsLineHoldEnd = new long[lines];
         java.util.Arrays.fill(lyricsLineHoldEnd, Long.MIN_VALUE);
+        final long[] starts = new long[lines];
         final long[] ends = new long[lines];
         final boolean[] known = new boolean[lines];
         final boolean[] untimed = new boolean[lines];
@@ -3972,6 +3974,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             final SyncedLyricsController.Line source = currentLyrics.lines.get(i);
             final SyncedLyricsController.Line display = SyncedLyricsController.splitBackgroundVocals(source);
             lyricsDisplayLines[i] = display;
+            starts[i] = source.timeMs;
             ends[i] = LyricsOverlap.UNKNOWN;
             nextTimed[i] = nextTimedLyricsLine(i);
             untimed[i] = !source.timed;
@@ -3991,7 +3994,7 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 known[i] = true;
             }
         }
-        lyricsOverlap = new LyricsOverlap(ends, known, untimed, nextTimed);
+        lyricsOverlap = new LyricsOverlap(starts, ends, known, untimed, nextTimed);
     }
 
     /**
@@ -5497,6 +5500,12 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         private LinearGradient fillShader;
         private int fillShaderSung;
         private int fillShaderMuted;
+        /** The same fill for the small background-vocals line, between its own sung and unsung colours. */
+        private LinearGradient fillShaderBackground;
+        private int fillShaderBackgroundSung;
+        private int fillShaderBackgroundMuted;
+        private int backgroundSungColor;
+        private int backgroundMutedColor;
         private final Matrix fillMatrix = new Matrix();
 
         // --- words: lexical words of the line, their timing, lift and emphasis ---------------
@@ -6035,6 +6044,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             if (mutedColor == muted && sungColor == sung) return;
             mutedColor = muted;
             sungColor = sung;
+            backgroundMutedColor = LyricsBackgroundVocals.unsung(muted);
+            backgroundSungColor = LyricsBackgroundVocals.sung(sung);
             if (karaokeActive) {
                 // The spans carry resolved colours, and the gradient is built from them, so a new
                 // palette - a theme change, or this row moving through the focus crossfade - has to
@@ -6280,23 +6291,29 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
             final boolean rtl = boundary >= 0 && clusterRtl[boundary];
             float cut = boundaryX(boundary);
             if (!Float.isNaN(cut)) cut += (rtl ? -1f : 1f) * fillPadding();
+            // The small background-vocals line carries its own strengths in its colours (sung and
+            // unsung each scaled on their own), so its span must not dim it a second time.
+            if (backgroundSpan != null) backgroundSpan.strengthInColor = true;
             for (int r = 0; r < runCount; r++) {
                 final KaraokeSpan span = runSpans[r];
+                final boolean background = runStart[r] >= backgroundStart;
+                final int sung = background ? backgroundSungColor : sungColor;
+                final int muted = background ? backgroundMutedColor : mutedColor;
                 if (runEnd[r] <= spanSungTo) {
-                    span.setSolid(sungColor);                 // wholly sung
+                    span.setSolid(sung);                      // wholly sung
                 } else if (runStart[r] >= spanWordTo) {
-                    span.setSolid(mutedColor);                // not reached yet
+                    span.setSolid(muted);                     // not reached yet
                 } else {
-                    final Shader gradient = fillShader(cut, rtl);
+                    final Shader gradient = fillShader(cut, rtl, background);
                     if (gradient != null) {
                         // The colour is the fallback the paint would use without a shader, so a
                         // device that somehow refused it shows a muted run rather than nothing.
-                        span.set(mutedColor, gradient);
+                        span.set(muted, gradient);
                     } else {
                         // No geometry at all to place a boundary with - the row has not been laid
                         // out yet. The next tick, by which time it has, puts the fill where the
                         // clock says. Until then the run reads as not yet reached.
-                        span.setSolid(mutedColor);
+                        span.setSolid(muted);
                     }
                 }
                 // Word-local glow disabled: visual runs span the whole line in single-run LTR
@@ -6376,17 +6393,28 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
          * gradient per colour pair, moved by its local matrix, so a frame allocates nothing. The
          * coordinates are the row's Layout coordinates, the space the text is drawn in.
          */
-        private Shader fillShader(float cut, boolean rtl) {
+        private Shader fillShader(float cut, boolean rtl, boolean background) {
             if (Float.isNaN(cut) || fadeWidthPx <= 0f) return null;
-            if (fillShader == null || fillShaderSung != sungColor || fillShaderMuted != mutedColor) {
-                fillShader = new LinearGradient(0f, 0f, 1f, 0f, sungColor, mutedColor, Shader.TileMode.CLAMP);
-                fillShaderSung = sungColor;
-                fillShaderMuted = mutedColor;
+            final LinearGradient gradient;
+            if (background) {
+                if (fillShaderBackground == null || fillShaderBackgroundSung != backgroundSungColor || fillShaderBackgroundMuted != backgroundMutedColor) {
+                    fillShaderBackground = new LinearGradient(0f, 0f, 1f, 0f, backgroundSungColor, backgroundMutedColor, Shader.TileMode.CLAMP);
+                    fillShaderBackgroundSung = backgroundSungColor;
+                    fillShaderBackgroundMuted = backgroundMutedColor;
+                }
+                gradient = fillShaderBackground;
+            } else {
+                if (fillShader == null || fillShaderSung != sungColor || fillShaderMuted != mutedColor) {
+                    fillShader = new LinearGradient(0f, 0f, 1f, 0f, sungColor, mutedColor, Shader.TileMode.CLAMP);
+                    fillShaderSung = sungColor;
+                    fillShaderMuted = mutedColor;
+                }
+                gradient = fillShader;
             }
             fillMatrix.setScale(rtl ? -fadeWidthPx : fadeWidthPx, 1f);
             fillMatrix.postTranslate(cut, 0f);
-            fillShader.setLocalMatrix(fillMatrix);
-            return fillShader;
+            gradient.setLocalMatrix(fillMatrix);
+            return gradient;
         }
 
         @Override
@@ -6436,14 +6464,19 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
                 final int w = pieceWord[p];
                 drawPaint.set(base);
                 runSpans[r].updateDrawState(drawPaint);
+                final boolean backgroundRun = runStart[r] >= backgroundStart;
                 if (timeColoured && w >= 0 && w != singing) {
                     drawPaint.setShader(null);
-                    drawPaint.setColor(wordStartMs[w] <= wordClockMs ? sungColor : mutedColor);
+                    final boolean sungWord = wordStartMs[w] <= wordClockMs;
+                    drawPaint.setColor(backgroundRun
+                            ? (sungWord ? backgroundSungColor : backgroundMutedColor)
+                            : (sungWord ? sungColor : mutedColor));
                 }
-                if (runStart[r] >= backgroundStart) {
-                    // The layout set this line smaller (RelativeSizeSpan); draw it at that size.
+                if (backgroundRun) {
+                    // The layout set this line smaller (RelativeSizeSpan); draw it at that size. Its
+                    // sung and unsung strengths are already in its colours; only its visibility is left.
                     drawPaint.setTextSize(base.getTextSize() * LyricsTuning.BACKGROUND_VOCALS_SCALE);
-                    drawPaint.setAlpha(Math.round(drawPaint.getAlpha() * LyricsTuning.BACKGROUND_VOCALS_ALPHA * backgroundVisibility));
+                    drawPaint.setAlpha(Math.round(drawPaint.getAlpha() * backgroundVisibility));
                 }
                 final int line = runLine[r];
                 final int contextStart = layout.getLineStart(line);
@@ -6887,6 +6920,8 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
         }
 
         private void detachSpans() {
+            // Without karaoke colours the small line is dimmed by its span again.
+            if (backgroundSpan != null) backgroundSpan.strengthInColor = false;
             detachRunSpans();
             runCount = 0;
             wordStart = 0;
@@ -7002,10 +7037,18 @@ public class AudioPlayerAlert extends BottomSheet implements NotificationCenter.
     private static final class BackgroundVocalsSpan extends CharacterStyle implements UpdateAppearance {
         /** Set by the row: its focus, so the line is hidden while inactive. Appearance only. */
         float visibility = 1f;
+        /**
+         * Set by the row while karaoke colours are on the line: they already carry the line's sung
+         * and unsung strengths (LyricsBackgroundVocals), so only the visibility is applied here.
+         * Otherwise (line-synced text, or before the first karaoke frame) the line is dimmed as a
+         * whole by BACKGROUND_VOCALS_ALPHA, as it always was.
+         */
+        boolean strengthInColor;
 
         @Override
         public void updateDrawState(TextPaint paint) {
-            paint.setAlpha(Math.round(paint.getAlpha() * LyricsTuning.BACKGROUND_VOCALS_ALPHA * visibility));
+            final float strength = strengthInColor ? 1f : LyricsTuning.BACKGROUND_VOCALS_ALPHA;
+            paint.setAlpha(Math.round(paint.getAlpha() * strength * visibility));
         }
     }
 
