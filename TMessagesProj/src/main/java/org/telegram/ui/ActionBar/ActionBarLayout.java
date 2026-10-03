@@ -2335,7 +2335,8 @@ public class ActionBarLayout extends FrameLayout implements INavigationLayout, F
 
     @Override
     public boolean addFragmentToStack(BaseFragment fragment, int position) {
-        if (ProtectedChatGate.block(fragment, parentActivity, () -> addFragmentToStack(fragment, position))) {
+        final int finalPosition = position;
+        if (ProtectedChatGate.block(fragment, parentActivity, () -> addFragmentToStack(fragment, finalPosition))) {
             return false;
         }
         if (delegate != null && !delegate.needAddFragmentToStack(fragment, this) || !fragment.onFragmentCreate()) {
