@@ -3,6 +3,11 @@ name: Build Telegram Lyrics QA APK
 on:
   workflow_dispatch:
 
+# A newer manual build supersedes an older build only for this workflow and ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -105,6 +110,14 @@ jobs:
             exit 1
           fi
           echo "OK: standalone package suffix is .beta"
+
+      # This is the app javac task observed in the successful AfatStandalone build.
+      # Its compile classpath builds TMessagesProj's standalone compile JAR, so it
+      # also compiles the shared Java source and generated Lottie metadata. Neither
+      # Android module applies Kotlin. Native compilation, R8 and APK packaging
+      # remain in assemble below. Keep the same workspace; do not clean between steps.
+      - name: Compile production standalone QA Java
+        run: ./gradlew :TMessagesProj_AppStandalone:compileAfatStandaloneJavaWithJavac --no-daemon
 
       # TMessagesProj_AppStandalone's standalone build type: debuggable false, jniDebuggable
       # false, minifyEnabled true, release proguard rules, release keystore, and the ordinary
