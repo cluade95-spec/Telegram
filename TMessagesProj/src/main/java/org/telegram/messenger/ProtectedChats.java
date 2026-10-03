@@ -123,6 +123,16 @@ public class ProtectedChats {
         return key != 0 && s.shouldHideContent(key, dialogId);
     }
 
+    /** See {@link ProtectedChatsState#allowsExternalInteraction}: replies and buttons outside the opened chat. */
+    public static boolean allowsExternalInteraction(int account, long dialogId) {
+        ProtectedChatsState s = state();
+        if (s.protectedCount() == 0) {
+            return true;
+        }
+        long key = accountKey(account);
+        return key == 0 || s.allowsExternalInteraction(key, dialogId);
+    }
+
     public static boolean isLockedProtected(int account, long dialogId) {
         ProtectedChatsState s = state();
         if (!s.isFeatureEnabled() || s.protectedCount() == 0) {

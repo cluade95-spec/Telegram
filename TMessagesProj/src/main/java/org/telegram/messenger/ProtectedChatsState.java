@@ -543,6 +543,18 @@ public final class ProtectedChatsState {
         return hidePreview && isProtected(accountKey, dialogId);
     }
 
+    /**
+     * Whether something outside the opened conversation may act on the dialog: a reply typed into a
+     * notification, the popup, the Wear and car replies, a bot button on a notification. Such an
+     * action sends into the chat without opening it, so it would bypass the authentication that
+     * opening requires. It is never allowed for a protected dialog, whatever "Hide Message
+     * Previews" says (that only decides what is shown) and whether the chat is open for now (that
+     * only opens the conversation itself).
+     */
+    public synchronized boolean allowsExternalInteraction(long accountKey, long dialogId) {
+        return !isProtected(accountKey, dialogId);
+    }
+
     // ---------------------------------------------------------------- lifecycle of data
 
     public synchronized void removeDialog(long accountKey, long dialogId) {

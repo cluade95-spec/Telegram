@@ -363,6 +363,42 @@ public class ProtectedChatsStateTest {
     }
 
     @Test
+    public void hidePreviewsOffNeverAllowsAnExternalReplyIntoAProtectedChat() {
+        protect(ACC_A, CHAT_1);
+        state.relock(ACC_A, CHAT_1);
+        for (boolean hide : new boolean[] {true, false}) {
+            state.setHidePreviewWhenLocked(hide);
+            assertEquals("hide previews = " + hide, hide, state.shouldHideContent(ACC_A, CHAT_1));
+            assertFalse("a reply, popup, Wear/car action or bot button is not allowed while locked, hide previews = " + hide,
+                    state.allowsExternalInteraction(ACC_A, CHAT_1));
+        }
+    }
+
+    @Test
+    public void externalInteractionStaysClosedWhileTheChatIsTemporarilyOpen() {
+        protect(ACC_A, CHAT_1);
+        state.relock(ACC_A, CHAT_1);
+        unlock(ACC_A, CHAT_1);
+        state.chatEntered(ACC_A, CHAT_1);
+        for (boolean hide : new boolean[] {true, false}) {
+            state.setHidePreviewWhenLocked(hide);
+            assertFalse("authorization only opens the conversation, hide previews = " + hide, state.allowsExternalInteraction(ACC_A, CHAT_1));
+        }
+    }
+
+    @Test
+    public void externalInteractionIsOnlyAllowedForUnprotectedChats() {
+        protect(ACC_A, CHAT_1);
+        for (boolean hide : new boolean[] {true, false}) {
+            state.setHidePreviewWhenLocked(hide);
+            assertTrue("another chat of the account", state.allowsExternalInteraction(ACC_A, CHAT_2));
+            assertTrue("the same chat id on another account", state.allowsExternalInteraction(ACC_B, CHAT_1));
+        }
+        state.unprotect(ACC_A, CHAT_1, proof());
+        assertTrue("after protection is removed", state.allowsExternalInteraction(ACC_A, CHAT_1));
+    }
+
+    @Test
     public void previewHiddenOutsideTheConversationEvenWhenAuthorized() {
         protect(ACC_A, CHAT_1);
         state.relock(ACC_A, CHAT_1);

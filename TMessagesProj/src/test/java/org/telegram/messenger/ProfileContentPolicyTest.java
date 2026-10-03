@@ -318,4 +318,153 @@ public class ProfileContentPolicyTest {
         }
         assertFalse(ProfileContentPolicy.isContentWithheld(locked(SELF), locked(FRIEND)));
     }
+
+    // ---- the own profile as the UI builds it: section (ProfileActivity) and tabs (SharedMediaLayout) ----
+
+    /** What the own profile shows. Stories and Gifts come from the user info; the message tabs go through the policy. */
+    private static final class OwnProfile {
+        boolean section;
+        boolean stories;
+        boolean gifts;
+        boolean photoVideo;
+        boolean savedMessagesTab;
+    }
+
+    private OwnProfile ownProfile(boolean storiesPinned, int giftCount, int[] rawLayoutCounts, boolean hasSavedMessages) {
+        final boolean selfLocked = locked(SELF);
+        final int[] counts = ProfileContentPolicy.visibleLayoutCounts(rawLayoutCounts, selfLocked);
+        boolean anyMedia = false;
+        for (int c : counts) anyMedia |= c > 0;
+        final boolean savedTab = ProfileContentPolicy.showSavedMessagesTab(hasSavedMessages, selfLocked);
+        // ProfileActivity.updateRowsIds: hasMedia is true for Stories, Gifts, visible media, a visible saved tab.
+        final boolean hasContent = storiesPinned || giftCount > 0 || anyMedia || savedTab;
+        final OwnProfile profile = new OwnProfile();
+        profile.section = ProfileContentPolicy.showSharedMediaSection(hasContent, true, selfLocked);
+        if (profile.section) {
+            profile.stories = storiesPinned && offered(SELF, ProfileContentPolicy.TAB_STORIES);
+            profile.gifts = giftCount > 0 && offered(SELF, ProfileContentPolicy.TAB_GIFTS);
+            profile.photoVideo = counts[0] > 0 && offered(SELF, ProfileContentPolicy.TAB_PHOTOVIDEO);
+            profile.savedMessagesTab = savedTab;
+        }
+        return profile;
+    }
+
+    private static final int[] SAVED_MEDIA = {4, 2, 0, 3, 0, 0, 0};
+    private static final int[] NO_MEDIA = {0, 0, 0, 0, 0, 0, 0};
+
+    @Test
+    public void caseA_storiesGiftsAndSavedMessagesMedia_lockedShowsStoriesAndGiftsOnly() {
+        protect(SELF);
+        OwnProfile p = ownProfile(true, 3, SAVED_MEDIA, true);
+        assertTrue(p.section);
+        assertTrue("Stories", p.stories);
+        assertTrue("Gifts", p.gifts);
+        assertFalse("Saved Messages media", p.photoVideo);
+        assertFalse("Saved Messages tab", p.savedMessagesTab);
+
+        unlock(SELF);
+        p = ownProfile(true, 3, SAVED_MEDIA, true);
+        assertTrue(p.section && p.stories && p.gifts && p.photoVideo && p.savedMessagesTab);
+    }
+
+    @Test
+    public void caseB_storiesOnly_lockedShowsStories() {
+        protect(SELF);
+        OwnProfile p = ownProfile(true, 0, NO_MEDIA, false);
+        assertTrue(p.section);
+        assertTrue(p.stories);
+        assertFalse(p.gifts);
+    }
+
+    @Test
+    public void caseC_giftsOnly_lockedShowsGifts() {
+        protect(SELF);
+        OwnProfile p = ownProfile(false, 2, NO_MEDIA, false);
+        assertTrue(p.section);
+        assertTrue(p.gifts);
+        assertFalse(p.stories);
+    }
+
+    @Test
+    public void caseD_storiesAndGiftsWithoutSavedMessagesMedia_lockedShowsBoth() {
+        protect(SELF);
+        OwnProfile p = ownProfile(true, 5, NO_MEDIA, false);
+        assertTrue(p.section);
+        assertTrue(p.stories);
+        assertTrue(p.gifts);
+    }
+
+    @Test
+    public void caseE_onlyProtectedSavedMessagesMedia_isNeverExposed() {
+        protect(SELF);
+        OwnProfile p = ownProfile(false, 0, SAVED_MEDIA, true);
+        assertFalse("nothing but protected media: no section to carry it", p.section);
+        assertFalse(p.photoVideo);
+        assertFalse(p.savedMessagesTab);
+
+        unlock(SELF);
+        p = ownProfile(false, 0, SAVED_MEDIA, true);
+        assertTrue(p.section);
+        assertTrue(p.photoVideo);
+        assertTrue(p.savedMessagesTab);
+    }
+
+    @Test
+    public void storiesAndGiftsNeverDisappearBecauseOfSavedMessagesProtection() {
+        final int[][] mediaStates = {NO_MEDIA, SAVED_MEDIA};
+        for (boolean stories : new boolean[] {false, true}) {
+            for (int gifts : new int[] {0, 4}) {
+                for (int[] media : mediaStates) {
+                    for (boolean saved : new boolean[] {false, true}) {
+                        // Without any protection...
+                        OwnProfile plain = ownProfile(stories, gifts, media, saved);
+                        assertEquals(stories, plain.stories);
+                        assertEquals(gifts > 0, plain.gifts);
+                        // ...and with Saved Messages protected, locked and unlocked, Stories and Gifts are the same.
+                        protect(SELF);
+                        OwnProfile lockedProfile = ownProfile(stories, gifts, media, saved);
+                        assertEquals("stories=" + stories + " gifts=" + gifts, stories, lockedProfile.stories);
+                        assertEquals("stories=" + stories + " gifts=" + gifts, gifts > 0, lockedProfile.gifts);
+                        if (stories || gifts > 0) {
+                            assertTrue("a section that carries them", lockedProfile.section);
+                        }
+                        unlock(SELF);
+                        OwnProfile unlocked = ownProfile(stories, gifts, media, saved);
+                        assertEquals(stories, unlocked.stories);
+                        assertEquals(gifts > 0, unlocked.gifts);
+                        state.unprotect(ACCOUNT, SELF, state.proofFromPasscode("1234", null));
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    public void anotherUsersProfileIsNotChangedBySavedMessagesProtection() {
+        // The section of any other profile is the same function: the own-profile clause never applies.
+        protect(SELF);
+        assertTrue(ProfileContentPolicy.showSharedMediaSection(true, false, locked(SELF)));
+        assertFalse("nothing to show on another profile, as without protection",
+                ProfileContentPolicy.showSharedMediaSection(false, false, locked(SELF)));
+        assertEquals(ProfileContentPolicy.showSharedMediaSection(false, false, false),
+                ProfileContentPolicy.showSharedMediaSection(false, false, locked(SELF)));
+    }
+
+    @Test
+    public void storiesThatArriveWithTheUserInfoAreNotLostToAnEarlierBuild() {
+        protect(SELF);
+        // The profile is built before the full user info is there: no Stories or Gifts known, only protected media.
+        OwnProfile before = ownProfile(false, 0, SAVED_MEDIA, true);
+        assertFalse(before.section);
+        // The info arrives: with no section the rows are built again...
+        assertTrue(ProfileContentPolicy.rebuildWhenUserInfoArrives(before.section));
+        // ...and the Stories and Gifts it announces now have their section.
+        OwnProfile after = ownProfile(true, 2, SAVED_MEDIA, true);
+        assertTrue(after.section);
+        assertTrue(after.stories);
+        assertTrue(after.gifts);
+        assertFalse("still no Saved Messages media", after.photoVideo);
+        // A profile that already has its section needs no rebuild: its tabs follow the info.
+        assertFalse(ProfileContentPolicy.rebuildWhenUserInfoArrives(after.section));
+    }
 }

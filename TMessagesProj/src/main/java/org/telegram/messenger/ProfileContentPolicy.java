@@ -113,6 +113,29 @@ public final class ProfileContentPolicy {
         return hasSavedDialogs && !savedMessagesLocked;
     }
 
+    /**
+     * Whether a profile builds its shared-media section, the strip that carries Stories, Gifts and
+     * the media tabs. {@code hasContent} is true when anything fills it: Stories, Gifts, visible
+     * media, common groups, recommendations, bot previews. The own profile always has the section
+     * (it is where its Stories and Gifts appear, even before there are any), with one exception:
+     * while Saved Messages is locked and nothing else fills it, the section would be an empty page
+     * whose default tab is the Saved Messages media. Stories and Gifts are part of
+     * {@code hasContent}, so they can never be the thing that is lost.
+     */
+    public static boolean showSharedMediaSection(boolean hasContent, boolean ownProfile, boolean savedMessagesLocked) {
+        return hasContent || ownProfile && !savedMessagesLocked;
+    }
+
+    /**
+     * Whether the rows of an own profile must be built again when its full user info arrives. The
+     * info is what says whether there are Stories or Gifts, so a profile that had no section
+     * because it did not know yet (or because there was none) looks again; a profile that has the
+     * section already shows them through its tabs.
+     */
+    public static boolean rebuildWhenUserInfoArrives(boolean sectionShown) {
+        return !sectionShown;
+    }
+
     /** Whether any message content of this profile is withheld (so that a change of lock state needs a refresh). */
     public static boolean isContentWithheld(boolean dialogLocked, boolean savedMessagesLocked) {
         return dialogLocked || savedMessagesLocked;

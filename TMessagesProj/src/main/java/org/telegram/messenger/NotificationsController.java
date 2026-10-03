@@ -477,7 +477,7 @@ public class NotificationsController extends BaseController implements Notificat
             if (messageObject.isReactionPush ||
                 messageObject.messageOwner.mentioned && messageObject.messageOwner.action instanceof TLRPC.TL_messageActionPinMessage ||
                 DialogObject.isEncryptedDialog(dialog_id) ||
-                ProtectedChats.shouldHideContent(currentAccount, dialog_id) ||
+                !ProtectedChats.allowsExternalInteraction(currentAccount, dialog_id) ||
                 messageObject.messageOwner.peer_id.channel_id != 0 && !messageObject.isSupergroup() ||
                 dialog_id == UserObject.VERIFY ||
                 dialog_id == UserObject.OAUTH
@@ -497,7 +497,7 @@ public class NotificationsController extends BaseController implements Notificat
                 long dialog_id = messageObject.getDialogId();
                 if (messageObject.messageOwner.mentioned && messageObject.messageOwner.action instanceof TLRPC.TL_messageActionPinMessage ||
                         DialogObject.isEncryptedDialog(dialog_id) || messageObject.messageOwner.peer_id.channel_id != 0 && !messageObject.isSupergroup() ||
-                        ProtectedChats.shouldHideContent(currentAccount, dialog_id)) {
+                        !ProtectedChats.allowsExternalInteraction(currentAccount, dialog_id)) {
                     continue;
                 }
                 popupArray.add(0, messageObject);
@@ -931,8 +931,9 @@ public class NotificationsController extends BaseController implements Notificat
 
     private int addToPopupMessages(ArrayList<MessageObject> popupArrayAdd, MessageObject messageObject, long dialogId, boolean isChannel, SharedPreferences preferences) {
         if (messageObject.isStoryReactionPush) return 0;
-        // The popup shows the message itself, so it is not shown for a chat whose content is hidden.
-        if (ProtectedChats.shouldHideContent(currentAccount, messageObject.getDialogId())) return 0;
+        // The popup shows the message and has a reply box that sends without opening the chat, so a
+        // protected chat never gets one, whatever "Hide Message Previews" says.
+        if (!ProtectedChats.allowsExternalInteraction(currentAccount, messageObject.getDialogId())) return 0;
         int popup = 0;
         if (!DialogObject.isEncryptedDialog(dialogId)) {
             if (preferences.getBoolean("custom_" + dialogId, false)) {
@@ -4725,7 +4726,7 @@ public class NotificationsController extends BaseController implements Notificat
             }
 
             boolean hasCallback = false;
-            if (!AndroidUtilities.needShowPasscode() && !SharedConfig.isWaitingForPasscodeEnter && lastMessageObject.getDialogId() == 777000) {
+            if (!AndroidUtilities.needShowPasscode() && !SharedConfig.isWaitingForPasscodeEnter && lastMessageObject.getDialogId() == 777000 && ProtectedChats.allowsExternalInteraction(currentAccount, dialog_id)) {
                 if (lastMessageObject.messageOwner.reply_markup instanceof TLRPC.TL_replyInlineMarkup) {
                     final TLRPC.TL_replyInlineMarkup replyInlineMarkup = (TLRPC.TL_replyInlineMarkup) lastMessageObject.messageOwner.reply_markup;
                     ArrayList<TL_keyboard.KeyboardInlineButtonRow> rows = replyInlineMarkup.rows;
@@ -5138,7 +5139,7 @@ public class NotificationsController extends BaseController implements Notificat
 
             NotificationCompat.Action wearReplyAction = null;
 
-            if ((!isChannel || isSupergroup) && canReply && !SharedConfig.isWaitingForPasscodeEnter && !ProtectedChats.shouldHideContent(currentAccount, dialogId) && selfUserId != dialogId && !UserObject.isReplyUser(dialogId) && MessagesController.getInstance(currentAccount).getSendPaidMessagesStars(dialogId) <= 0) {
+            if ((!isChannel || isSupergroup) && canReply && !SharedConfig.isWaitingForPasscodeEnter && ProtectedChats.allowsExternalInteraction(currentAccount, dialogId) && selfUserId != dialogId && !UserObject.isReplyUser(dialogId) && MessagesController.getInstance(currentAccount).getSendPaidMessagesStars(dialogId) <= 0) {
                 Intent replyIntent = new Intent(ApplicationLoader.applicationContext, WearReplyReceiver.class);
                 replyIntent.putExtra("dialog_id", dialogId);
                 replyIntent.putExtra("max_id", maxId);
@@ -5624,7 +5625,7 @@ public class NotificationsController extends BaseController implements Notificat
 
             TL_keyboard.KeyboardInlineButton copybutton = null;
             TL_keyboard.TL_inlineButtonTypeCopy copyButtonType = null;
-            if (lastMessageObject != null && lastMessageObject.messageOwner != null && lastMessageObject.messageOwner.reply_markup instanceof TLRPC.TL_replyInlineMarkup) {
+            if (lastMessageObject != null && lastMessageObject.messageOwner != null && lastMessageObject.messageOwner.reply_markup instanceof TLRPC.TL_replyInlineMarkup && !ProtectedChats.shouldHideContent(currentAccount, dialogId)) {
                 TLRPC.TL_replyInlineMarkup reply_markup = (TLRPC.TL_replyInlineMarkup) lastMessageObject.messageOwner.reply_markup;
                 for (int i = 0; i < reply_markup.rows.size(); ++i) {
                     for (int j = 0; j < reply_markup.rows.get(i).buttons.size(); ++j) {
@@ -5667,7 +5668,7 @@ public class NotificationsController extends BaseController implements Notificat
                 builder.setLargeIcon(avatarBitmap);
             }
 
-            if (!AndroidUtilities.needShowPasscode(false) && !SharedConfig.isWaitingForPasscodeEnter) {
+            if (!AndroidUtilities.needShowPasscode(false) && !SharedConfig.isWaitingForPasscodeEnter && ProtectedChats.allowsExternalInteraction(currentAccount, dialogId)) {
                 if (rows != null) {
                     for (int r = 0, rc = rows.size(); r < rc; r++) {
                         TL_keyboard.KeyboardInlineButtonRow row = rows.get(r);

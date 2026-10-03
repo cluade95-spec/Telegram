@@ -41,7 +41,7 @@ public class WearReplyReceiver extends BroadcastReceiver {
         if (dialogId == 0 || maxId == 0 || !UserConfig.isValidAccount(currentAccount)) {
             return;
         }
-        if (ProtectedChats.shouldHideContent(currentAccount, dialogId)) {
+        if (!ProtectedChats.allowsExternalInteraction(currentAccount, dialogId)) {
             return;
         }
         AccountInstance accountInstance = AccountInstance.getInstance(currentAccount);

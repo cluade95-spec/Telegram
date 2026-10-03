@@ -14,7 +14,7 @@ Three separate notions exist now:
 | `DialogsActivity` header lock icon | "lock the app now" | app lock | action locks the app |
 | `TelegramMediaSession` | hide car/media metadata while app is locked | app lock | app lock |
 | `MediaDataController` launcher shortcuts | do not list frequent chats while a passcode lock is on | app lock (as on master); protected chats are listed like any other | a shortcut holds a chat's name and avatar, never its messages; opening one goes through the protected-chat gate. Hiding it removed a Telegram feature without protecting any message content |
-| `NotificationsController` pre-API-24 popup reply action, popup list, bubble, wear reply (`WearReplyReceiver`), car home (`HomeScreen`) | no reply from notifications while locked | app lock; per dialog `ProtectedChats.shouldHideContent` (a protected chat with "Hide Message Previews" on) | these surfaces show or act on message text, so they follow the same "hide previews" setting as the notification text itself; unrelated chats keep their paths |
+| `NotificationsController` pre-API-24 popup reply action, popup list and `PopupNotificationActivity`, wear / inline reply action (`WearReplyReceiver`), car unread list (`HomeScreen`), bot buttons on notifications | no reply from notifications while locked | app lock; per dialog `ProtectedChats.allowsExternalInteraction` (never for a protected dialog, whatever "Hide Message Previews" says or whether the chat is open for now) | each of these sends into the chat without opening it, so it would bypass the authentication that opening requires; unrelated chats keep their paths |
 | `NotificationsController` `passcode` log variable | log only | app lock | no behavior |
 | FLAG_SECURE / screenshots: `LaunchActivity`, `BubbleActivity`, `ExternalActionActivity`, `PaymentFormActivity`, `AndroidUtilities.allowScreenCapture` | block screenshots / task-switcher content whenever a passcode exists | **credential** (reverted to the original property) | the "show app content" switch is a credential-level setting; its rows are shown whenever a credential exists |
 | `EditWidgetActivity` note | "passcode ignored for widgets" | credential | text is about the passcode in general |
@@ -23,7 +23,13 @@ Three separate notions exist now:
 
 Preview rule: with "hide previews" on, content of a protected chat is hidden on every surface outside the opened
 conversation (dialog rows incl. accessibility, Saved Messages sub-lists, search, hashtag search, downloads list,
-notifications, widgets, popups, car) regardless of temporary authorization. Identity is never hidden.
+notifications, widgets, copy-code button) regardless of temporary authorization. Identity is never hidden.
+
+Interaction rule (independent of the preview setting): nothing outside the opened conversation may act on a protected
+dialog. The popup (it has a reply box), the notification and Wear reply, the car unread list (it replies), bot buttons on
+a notification, and a share into the chat (system share sheet, Direct Share shortcut, share picker: `LaunchActivity.didSelectDialogs`
+asks for the unlock first) all follow `ProtectedChats.allowsExternalInteraction`. Bubbles and launcher shortcuts only
+lead to the chat, which the gate authenticates.
 
 ## Chat authentication UI and settings (device QA passes)
 
@@ -56,6 +62,10 @@ keeps its normal structure for every peer (own profile, users, groups, channels,
   Posts) and their counts. Counts are masked when read, so unlocking needs no reload.
 * Saved Messages: only the Saved Messages content (messages and the Saved Messages / Saved Dialogs tabs) is withheld
   while Saved Messages is locked. The own profile is no longer cut down; its Stories and Gifts tabs stay.
+* Section: `ProfileContentPolicy.showSharedMediaSection`. The own profile always has its shared-media section (where
+  Stories and Gifts appear), except while Saved Messages is locked and nothing else (Stories, Gifts, visible media)
+  would fill it. Stories and Gifts are part of what fills it, so they cannot be what is lost. The own profile looks at its
+  rows again when its full user info arrives (`rebuildWhenUserInfoArrives`).
 * Gate: opening the profile of another protected dialog still goes through `ProtectedChatGate`, because that profile
   hosts the protected shared media. The own profile is never gated as a whole.
 * App Lock state, the credential and the locked/unlocked state never decide whether an unrelated profile feature is shown.

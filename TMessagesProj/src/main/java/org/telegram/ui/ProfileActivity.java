@@ -155,6 +155,7 @@ import org.telegram.messenger.MediaController;
 import org.telegram.messenger.MediaDataController;
 import org.telegram.messenger.MessageObject;
 import org.telegram.messenger.MessagesController;
+import org.telegram.messenger.ProfileContentPolicy;
 import org.telegram.messenger.ProtectedChats;
 import org.telegram.messenger.MessagesStorage;
 import org.telegram.messenger.NotificationCenter;
@@ -9276,6 +9277,12 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
                     if (listAdapter != null && !TextUtils.equals(userInfo.about, currentBio)) {
                         listAdapter.notifyItemChanged(bioRow);
                     }
+                    // The own profile has no shared-media section while Saved Messages is locked and
+                    // nothing else would fill it. The info that has just arrived says whether there are
+                    // Stories or Gifts, so look again: they must never wait for the profile to reopen.
+                    if (ProfileContentPolicy.rebuildWhenUserInfoArrives(sharedMediaRow >= 0)) {
+                        updateListAnimated(false);
+                    }
                 } else {
                     if (!openAnimationInProgress && !isCallAvailable) {
                         createActionBarMenu(true);
@@ -10855,7 +10862,7 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
                     reportDividerRow = rowCount++;
                 }
 
-                if (hasMedia || (user != null && user.bot && user.bot_can_edit && user.bot_has_main_app) || userInfo != null && userInfo.common_chats_count != 0 || myProfile && !savedMessagesLocked) {
+                if (ProfileContentPolicy.showSharedMediaSection(hasMedia || (user != null && user.bot && user.bot_can_edit && user.bot_has_main_app) || userInfo != null && userInfo.common_chats_count != 0, myProfile, savedMessagesLocked)) {
                     sharedMediaRow = rowCount++;
                 } else if (lastSectionRow == -1 && needSendMessage) {
                     sendMessageRow = rowCount++;
