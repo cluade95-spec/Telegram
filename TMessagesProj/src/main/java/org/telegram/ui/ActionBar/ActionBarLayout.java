@@ -86,6 +86,7 @@ import org.telegram.ui.Components.FloatingDebug.FloatingDebugProvider;
 import org.telegram.ui.Components.GroupCallPip;
 import org.telegram.ui.Components.LayoutHelper;
 import org.telegram.ui.LaunchActivity;
+import org.telegram.ui.ProtectedChatGate;
 import org.telegram.ui.Stories.StoryViewer;
 
 import java.util.ArrayList;
@@ -1949,9 +1950,13 @@ public class ActionBarLayout extends FrameLayout implements INavigationLayout, F
         boolean preview = params.preview;
         ActionBarPopupWindow.ActionBarPopupWindowLayout menu = params.menuView;
 
+        if (fragment != null && ProtectedChatGate.block(fragment, parentActivity, () -> presentFragment(params))) {
+            return false;
+        }
         if (fragment == null || checkTransitionAnimation() || delegate != null && check && !delegate.needPresentFragment(this, params) || !fragment.onFragmentCreate()) {
             return false;
         }
+        ProtectedChatGate.onFragmentCreated(fragment);
         final EdgeToEdgeSupportMode edgeToEdgeSupportMode = fragment.getEdgeToEdgeSupportMode();
         final boolean isSupportEdgeToEdge = edgeToEdgeSupportMode != EdgeToEdgeSupportMode.NONE;
         final boolean drawNavigationBar = fragment.drawEdgeNavigationBar();
@@ -2330,12 +2335,17 @@ public class ActionBarLayout extends FrameLayout implements INavigationLayout, F
 
     @Override
     public boolean addFragmentToStack(BaseFragment fragment, int position) {
+        final int finalPosition = position;
+        if (ProtectedChatGate.block(fragment, parentActivity, () -> addFragmentToStack(fragment, finalPosition))) {
+            return false;
+        }
         if (delegate != null && !delegate.needAddFragmentToStack(fragment, this) || !fragment.onFragmentCreate()) {
             return false;
         }
         if (fragmentsStack.contains(fragment)) {
             return false;
         }
+        ProtectedChatGate.onFragmentCreated(fragment);
         fragment.setParentLayout(this);
         if (position == -1 || position == INavigationLayout.FORCE_NOT_ATTACH_VIEW) {
             if (!fragmentsStack.isEmpty()) {

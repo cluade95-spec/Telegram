@@ -30,6 +30,10 @@ import android.os.SystemClock;
 import android.text.Editable;
 import android.text.InputFilter;
 import android.text.InputType;
+import android.text.SpannableString;
+import android.text.Spanned;
+import android.text.style.AbsoluteSizeSpan;
+import android.text.TextUtils;
 import android.text.TextWatcher;
 import android.text.method.PasswordTransformationMethod;
 import android.util.TypedValue;
@@ -62,10 +66,14 @@ import androidx.dynamicanimation.animation.SpringForce;
 import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.ApplicationLoader;
 import org.telegram.messenger.BotWebViewVibrationEffect;
+import org.telegram.messenger.ChatLockLayout;
 import org.telegram.messenger.FileLog;
 import org.telegram.messenger.FingerprintController;
 import org.telegram.messenger.LocaleController;
 import org.telegram.messenger.NotificationCenter;
+import org.telegram.messenger.PasscodeInputBuffer;
+import org.telegram.messenger.ProtectedChats;
+import org.telegram.messenger.ProtectedChatsState;
 import org.telegram.messenger.R;
 import org.telegram.messenger.SharedConfig;
 import org.telegram.messenger.support.fingerprint.FingerprintManagerCompat;
@@ -90,7 +98,7 @@ public class PasscodeView extends FrameLayout implements NotificationCenter.Noti
                 checkFingerprint();
             }
         } else if (id == NotificationCenter.passcodeDismissed) {
-            if (args[0] != this) {
+            if (args[0] != this && !chatLockMode) {
                 setVisibility(GONE);
             }
         }
@@ -99,6 +107,67 @@ public class PasscodeView extends FrameLayout implements NotificationCenter.Noti
     public interface PasscodeViewDelegate {
         void didAcceptedPassword(PasscodeView view);
     }
+
+    /**
+     * Chat authentication mode: the same unlock screen (keypad, digit animations, biometrics,
+     * retry throttling) shown inside the bottom popup of a single protected chat. Its layout comes
+     * from {@link ChatLockLayout} (the height the popup is offered), not from the display size used
+     * by the full-screen app lock. It verifies the shared credential through {@link ProtectedChatsState}
+     * and never touches the app lock state.
+     */
+    public interface ChatLockListener {
+        void onAuthenticated(ProtectedChatsState.AuthProof proof);
+    }
+
+    private boolean chatLockMode;
+    private ChatLockListener chatLockListener;
+    private CharSequence chatLockTitle;
+    private TextView unlockTitleView;
+    private boolean chatLockDone;
+
+    public void setChatLockMode(CharSequence title, ChatLockListener listener) {
+        chatLockMode = true;
+        chatLockListener = listener;
+        chatLockTitle = title;
+        unlockTitleView.setText(title);
+        unlockTitleView.setSingleLine(true);
+        unlockTitleView.setEllipsize(TextUtils.TruncateAt.END);
+        passcodeTextView.setSingleLine(true);
+        passcodeTextView.setEllipsize(TextUtils.TruncateAt.END);
+        // Label shown instead of the digits while the system biometric prompt is up: centred in the digits band.
+        LayoutParams lp = (LayoutParams) passcodeTextView.getLayoutParams();
+        lp.bottomMargin = dp(14);
+        lp.leftMargin = lp.rightMargin = dp(24);
+        passcodeTextView.setLayoutParams(lp);
+        // The digits sit at the bottom of their band (the full-screen layout leaves 46dp below them).
+        lp = (LayoutParams) passwordEditText2.getLayoutParams();
+        lp.bottomMargin = 0;
+        lp.leftMargin = lp.rightMargin = dp(40);
+        passwordEditText2.setLayoutParams(lp);
+        // Password mode has no title area: the chat name is the hint, small compared to the 36sp input.
+        SpannableString hint = new SpannableString(title);
+        hint.setSpan(new AbsoluteSizeSpan(16, true), 0, hint.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        passwordEditText.setHint(hint);
+        passwordEditText.setHintTextColor(0x99ffffff);
+    }
+
+    public boolean isChatLockMode() {
+        return chatLockMode;
+    }
+
+    /** Plays the same lock animation the app lock plays when it appears. */
+    public void playLockAnimation() {
+        imageView.getAnimatedDrawable().setCurrentFrame(0, false);
+        imageView.getAnimatedDrawable().setCustomEndFrame(37);
+        imageView.playAnimation();
+        AndroidUtilities.runOnUIThread(() -> {
+            try {
+                imageView.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP, HapticFeedbackConstants.FLAG_IGNORE_GLOBAL_SETTING);
+            } catch (Exception ignore) {}
+        }, 350);
+    }
+
+    private ChatLockLayout chatLockLayout;
 
     private final int BUTTON_X_MARGIN = 28;
     private final int BUTTON_Y_MARGIN = 16;
@@ -116,7 +185,7 @@ public class PasscodeView extends FrameLayout implements NotificationCenter.Noti
 
         private ArrayList<TextView> characterTextViews;
         private ArrayList<TextView> dotTextViews;
-        private StringBuilder stringBuilder;
+        private final PasscodeInputBuffer stringBuilder = new PasscodeInputBuffer();
         private final static String DOT = "\u2022";
         private AnimatorSet currentAnimation;
         private Runnable dotRunnable;
@@ -125,7 +194,6 @@ public class PasscodeView extends FrameLayout implements NotificationCenter.Noti
             super(context);
             characterTextViews = new ArrayList<>(4);
             dotTextViews = new ArrayList<>(4);
-            stringBuilder = new StringBuilder(4);
 
             for (int a = 0; a < 4; a++) {
                 TextView textView = new TextView(context);
@@ -158,7 +226,7 @@ public class PasscodeView extends FrameLayout implements NotificationCenter.Noti
         }
 
         public void appendCharacter(String c) {
-            if (stringBuilder.length() == 4) {
+            if (stringBuilder.isFull()) {
                 return;
             }
             try {
@@ -273,7 +341,7 @@ public class PasscodeView extends FrameLayout implements NotificationCenter.Noti
         }
 
         public String getString() {
-            return stringBuilder.toString();
+            return stringBuilder.value();
         }
 
         public int length() {
@@ -293,7 +361,7 @@ public class PasscodeView extends FrameLayout implements NotificationCenter.Noti
             ArrayList<Animator> animators = new ArrayList<>();
             int deletingPos = stringBuilder.length() - 1;
             if (deletingPos != 0) {
-                stringBuilder.deleteCharAt(deletingPos);
+                stringBuilder.eraseLast();
             }
 
             for (int a = deletingPos; a < 4; a++) {
@@ -317,7 +385,7 @@ public class PasscodeView extends FrameLayout implements NotificationCenter.Noti
             }
 
             if (deletingPos == 0) {
-                stringBuilder.deleteCharAt(deletingPos);
+                stringBuilder.eraseLast();
             }
 
             for (int a = 0; a < deletingPos; a++) {
@@ -365,7 +433,7 @@ public class PasscodeView extends FrameLayout implements NotificationCenter.Noti
                 currentAnimation.cancel();
                 currentAnimation = null;
             }
-            stringBuilder.delete(0, stringBuilder.length());
+            stringBuilder.clear();
             if (animated) {
                 ArrayList<Animator> animators = new ArrayList<>();
 
@@ -728,7 +796,7 @@ public class PasscodeView extends FrameLayout implements NotificationCenter.Noti
         numbersTitleContainer = new FrameLayout(context);
         numbersFrameLayout.addView(numbersTitleContainer, LayoutHelper.createFrame(LayoutHelper.WRAP_CONTENT, LayoutHelper.WRAP_CONTENT, Gravity.TOP | Gravity.CENTER_HORIZONTAL));
 
-        TextView title = new TextView(context);
+        TextView title = unlockTitleView = new TextView(context);
         title.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15);
         title.setTypeface(AndroidUtilities.bold());
         title.setTextColor(0xFFFFFFFF);
@@ -933,7 +1001,82 @@ public class PasscodeView extends FrameLayout implements NotificationCenter.Noti
         this.delegate = delegate;
     }
 
+    private void processChatLockDone(boolean fingerprint) {
+        if (chatLockDone) {
+            return;
+        }
+        ProtectedChatsState.AuthProof proof;
+        if (!fingerprint) {
+            ProtectedChats.refreshRetryTimer();
+            if (SharedConfig.passcodeRetryInMs > 0) {
+                return;
+            }
+            String password = "";
+            if (SharedConfig.passcodeType == SharedConfig.PASSCODE_TYPE_PIN) {
+                password = passwordEditText2.getString();
+            } else if (SharedConfig.passcodeType == SharedConfig.PASSCODE_TYPE_PASSWORD) {
+                password = passwordEditText.getText().toString();
+            }
+            if (password.length() == 0) {
+                onPasscodeError();
+                return;
+            }
+            // Verification, bad-try counting and the retry delay are the shared ones of the app lock.
+            proof = ProtectedChats.getState().proofFromPasscode(password, null);
+            if (proof == null) {
+                if (SharedConfig.passcodeRetryInMs > 0) {
+                    checkRetryTextView();
+                }
+                passwordEditText.setText("");
+                passwordEditText2.eraseAllCharacters(true);
+                onPasscodeError();
+                if (backgroundDrawable instanceof MotionBackgroundDrawable) {
+                    MotionBackgroundDrawable motionBackgroundDrawable = (MotionBackgroundDrawable) backgroundDrawable;
+                    if (backgroundAnimationSpring != null) {
+                        backgroundAnimationSpring.cancel();
+                        motionBackgroundDrawable.setPosAnimationProgress(1f);
+                    }
+                    if (motionBackgroundDrawable.getPosAnimationProgress() >= 1f) {
+                        motionBackgroundDrawable.rotatePreview(true);
+                    }
+                }
+                return;
+            }
+        } else {
+            proof = ProtectedChats.getState().proofFromBiometric();
+            if (proof == null) {
+                showPin(true);
+                return;
+            }
+            SharedConfig.badPasscodeTries = 0;
+            SharedConfig.saveConfig();
+        }
+        chatLockDone = true;
+        passwordEditText.clearFocus();
+        AndroidUtilities.hideKeyboard(passwordEditText);
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && FingerprintController.isKeyReady() && FingerprintController.checkDeviceFingerprintsChanged()) {
+            FingerprintController.deleteInvalidKey();
+        }
+
+        setOnTouchListener(null);
+        imageView.getAnimatedDrawable().setCustomEndFrame(71);
+        imageView.getAnimatedDrawable().setCurrentFrame(37, false);
+        imageView.playAnimation();
+        final ChatLockListener listener = chatLockListener;
+        final ProtectedChatsState.AuthProof finalProof = proof;
+        AndroidUtilities.runOnUIThread(() -> {
+            if (listener != null) {
+                listener.onAuthenticated(finalProof);
+            }
+        }, 260);
+    }
+
     private void processDone(boolean fingerprint) {
+        if (chatLockMode) {
+            processChatLockDone(fingerprint);
+            return;
+        }
         if (!fingerprint) {
             if (SharedConfig.passcodeRetryInMs > 0) {
                 return;
@@ -1119,7 +1262,7 @@ public class PasscodeView extends FrameLayout implements NotificationCenter.Noti
         NotificationCenter.getGlobalInstance().addObserver(this, NotificationCenter.didGenerateFingerprintKeyPair);
         NotificationCenter.getGlobalInstance().addObserver(this, NotificationCenter.passcodeDismissed);
 
-        if (keyboardNotifier == null && getParent() instanceof View) {
+        if (!chatLockMode && keyboardNotifier == null && getParent() instanceof View) {
             keyboardNotifier = new KeyboardNotifier((View) getParent(), keyboardHeight -> {
                 if (getContext() == null) return;
                 final boolean landscape = getContext().getResources().getConfiguration().orientation == Configuration.ORIENTATION_LANDSCAPE;
@@ -1185,7 +1328,7 @@ public class PasscodeView extends FrameLayout implements NotificationCenter.Noti
             return;
         }
         Activity parentActivity = AndroidUtilities.findActivity(getContext());
-        if (parentActivity != null && fingerprintView.getVisibility() == VISIBLE && !ApplicationLoader.mainInterfacePaused && (!(parentActivity instanceof LaunchActivity) || ((LaunchActivity) parentActivity).allowShowFingerprintDialog(this))) {
+        if (parentActivity != null && fingerprintView.getVisibility() == VISIBLE && !ApplicationLoader.mainInterfacePaused && (chatLockMode || !(parentActivity instanceof LaunchActivity) || ((LaunchActivity) parentActivity).allowShowFingerprintDialog(this))) {
             try {
                 if (BiometricManager.from(getContext()).canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_STRONG) == BiometricManager.BIOMETRIC_SUCCESS && FingerprintController.isKeyReady() && !FingerprintController.checkDeviceFingerprintsChanged()) {
                     final Executor executor = ContextCompat.getMainExecutor(getContext());
@@ -1209,7 +1352,7 @@ public class PasscodeView extends FrameLayout implements NotificationCenter.Noti
                         }
                     });
                     final BiometricPrompt.PromptInfo promptInfo = new BiometricPrompt.PromptInfo.Builder()
-                            .setTitle(LocaleController.getString(R.string.UnlockToUse))
+                            .setTitle(chatLockMode ? chatLockTitle : LocaleController.getString(R.string.UnlockToUse))
                             .setNegativeButtonText(LocaleController.getString(R.string.UsePIN))
                             .setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG)
                             .build();
@@ -1337,7 +1480,7 @@ public class PasscodeView extends FrameLayout implements NotificationCenter.Noti
             ((MotionBackgroundDrawable) backgroundDrawable).setParentView(backgroundFrameLayout);
         }
 
-        passcodeTextView.setText(LocaleController.getString(R.string.AppLocked));
+        passcodeTextView.setText(chatLockMode ? chatLockTitle : LocaleController.getString(R.string.AppLocked));
 
         if (SharedConfig.passcodeType == SharedConfig.PASSCODE_TYPE_PIN) {
             if (retryTextView.getVisibility() != VISIBLE) {
@@ -1543,7 +1686,56 @@ public class PasscodeView extends FrameLayout implements NotificationCenter.Noti
             border.setVisibility(SharedConfig.passcodeType == SharedConfig.PASSCODE_TYPE_PASSWORD ? VISIBLE : GONE);
         }
 
-        if (landscape) {
+        if (chatLockMode) {
+            // Popup layout: derived from the height the sheet offers, not from the display size.
+            final boolean pin = SharedConfig.passcodeType == SharedConfig.PASSCODE_TYPE_PIN;
+            final int offered = MeasureSpec.getMode(heightMeasureSpec) == MeasureSpec.UNSPECIFIED ? AndroidUtilities.displaySize.y : MeasureSpec.getSize(heightMeasureSpec);
+            // Pixel totals can exceed their dp totals (every dp term rounds up), so that much is kept back.
+            final ChatLockLayout metrics = chatLockLayout = ChatLockLayout.compute((int) ((offered - ChatLockLayout.MAX_ROUNDING_PX) / AndroidUtilities.density), pin);
+            final ChatLockLayout.Px px = AndroidUtilities::dp;
+            final int totalPx = metrics.totalHeightPx(px);
+
+            imageView.setVisibility(metrics.showIcon ? VISIBLE : GONE);
+            imageView.setTranslationX(width / 2f - dp(29));
+            imageView.setTranslationY(imageY = dp(metrics.iconTop()));
+            final int textMax = Math.max(dp(120), width - dp(48));
+            unlockTitleView.setMaxWidth(textMax);
+            subtitleView.setMaxWidth(textMax);
+            passcodeTextView.setMaxWidth(textMax);
+
+            layoutParams = (LayoutParams) passwordFrameLayout.getLayoutParams();
+            layoutParams.width = width;
+            layoutParams.leftMargin = 0;
+            layoutParams.topMargin = 0;
+            layoutParams.height = pin ? dp(metrics.digitsTop + ChatLockLayout.DIGITS_HEIGHT) : totalPx;
+            passwordFrameLayout.setLayoutParams(layoutParams);
+
+            layoutParams = (LayoutParams) numbersFrameLayout.getLayoutParams();
+            layoutParams.height = metrics.keysFrameHeightPx(px);
+            layoutParams.width = metrics.keysFrameWidthPx(px);
+            layoutParams.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
+            numbersFrameLayout.setLayoutParams(layoutParams);
+
+            layoutParams = (LayoutParams) numbersContainer.getLayoutParams();
+            layoutParams.leftMargin = 0;
+            layoutParams.topMargin = dp(metrics.digitsTop);
+            layoutParams.width = width;
+            layoutParams.height = ViewGroup.LayoutParams.MATCH_PARENT;
+            numbersContainer.setLayoutParams(layoutParams);
+
+            for (int a = 0; a < 12; a++) {
+                int num = a == 0 ? 10 : a == 10 ? 11 : a == 11 ? 9 : a - 1;
+                int row = num / 3;
+                int col = num % 3;
+                LayoutParams keyParams = (LayoutParams) numberFrameLayouts.get(a).getLayoutParams();
+                keyParams.width = keyParams.height = dp(metrics.buttonSize);
+                keyParams.topMargin = metrics.keyTopPx(row, px);
+                keyParams.leftMargin = metrics.keyLeftPx(col, px);
+                numberFrameLayouts.get(a).setLayoutParams(keyParams);
+            }
+            super.onMeasure(widthMeasureSpec, MeasureSpec.makeMeasureSpec(totalPx, MeasureSpec.EXACTLY));
+            return;
+        } else if (landscape) {
             imageView.setTranslationX((SharedConfig.passcodeType == SharedConfig.PASSCODE_TYPE_PIN ? width / 2f : width) / 2 - dp(29));
 
             layoutParams = (LayoutParams) passwordFrameLayout.getLayoutParams();
@@ -1644,6 +1836,11 @@ public class PasscodeView extends FrameLayout implements NotificationCenter.Noti
 
     @Override
     protected void onLayout(boolean changed, int left, int top, int right, int bottom) {
+        if (chatLockMode) {
+            super.onLayout(changed, left, top, right, bottom);
+            imageView.setTranslationY(imageY = dp(ChatLockLayout.ICON_TOP));
+            return;
+        }
         View rootView = getRootView();
         int usableViewHeight = rootView.getHeight() - AndroidUtilities.statusBarHeight - AndroidUtilities.getViewInset(rootView);
         getWindowVisibleDisplayFrame(rect);

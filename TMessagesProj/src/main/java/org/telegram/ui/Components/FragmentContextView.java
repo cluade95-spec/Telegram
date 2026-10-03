@@ -65,6 +65,7 @@ import org.telegram.messenger.ContactsController;
 import org.telegram.messenger.DialogObject;
 import org.telegram.messenger.LocaleController;
 import org.telegram.messenger.LocationController;
+import org.telegram.messenger.LyricsActivity;
 import org.telegram.messenger.MediaController;
 import org.telegram.messenger.MessageObject;
 import org.telegram.messenger.MessagesController;
@@ -2028,27 +2029,116 @@ public class FragmentContextView extends FrameLayout implements NotificationCent
         AndroidUtilities.cancelRunOnUIThread(advanceLyric);
         SyncedLyricsController.Lyrics lyrics = SyncedLyricsController.getInstance(lastMessageObject.currentAccount).getLyrics(lastMessageObject);
         long position = SyncedLyricsController.positionMs(lastMessageObject);
-        int line = lyrics.lineAt(position);
-        String lyric = line < 0 ? null : lyrics.lines.get(line).text;
-        logicalActiveLyric = TextUtils.isEmpty(lyric) ? null : lyric;
-        int transitionDuration = MediaController.getInstance().isMessagePaused() ? 180 : 440;
-        if (lyrics.isSynced() && !MediaController.getInstance().isMessagePaused() && line + 1 < lyrics.lines.size()) {
+        final boolean paused = MediaController.getInstance().isMessagePaused();
+        // The bar shows the title and artist whenever playback is paused, wherever it is paused.
+        // While playing it shows the active lyric, or the title and artist when there is none: an
+        // instrumental gap at any point of the song, the time before the first line, a blank, the
+        // end of the song. Decided from the position and the play state alone (LyricsActivity), the
+        // same way whether the song just started, was sought, resumed or the bar was only just
+        // opened; every path that updates the bar (progress, play state, a new player) comes here.
+        final LyricsActivity activity = lyricsActivityOf(lyrics);
+        final int line = lyrics.lineAt(position);
+        final int shown = activity.compactLine(position, !paused, LYRIC_ROLL_DURATION);
+        String lyric = shown < 0 ? null : lyrics.lines.get(shown).text;
+        final int active = activity.activeLine(position);
+        logicalActiveLyric = active < 0 || TextUtils.isEmpty(lyrics.lines.get(active).text) ? null : lyrics.lines.get(active).text;
+        int transitionDuration = paused ? 180 : 440;
+        long advanceInMs = Long.MAX_VALUE;
+        if (lyrics.isSynced() && !paused && line + 1 < lyrics.lines.size()) {
             long untilNext = lyrics.lines.get(line + 1).timeMs - position;
             long previousTime = line < 0 ? 0 : lyrics.lines.get(line).timeMs;
             long gap = Math.max(1, lyrics.lines.get(line + 1).timeMs - previousTime);
             long lead = Math.min(LYRIC_ROLL_DURATION, Math.max(80, gap / 2));
             transitionDuration = (int) lead;
             if (untilNext <= lead) {
-                lyric = lyrics.lines.get(line + 1).text;
                 transitionDuration = (int) Math.max(80, Math.min(lead, untilNext));
             } else {
-                AndroidUtilities.runOnUIThread(advanceLyric, untilNext - lead);
+                advanceInMs = untilNext - lead;
             }
         }
+        if (!paused) {
+            // The bar changes when a lyric ends and a gap begins, not only when the next one starts.
+            final long idleAt = activity.nextIdleStartMs(position);
+            if (idleAt != LyricsActivity.NONE) advanceInMs = Math.min(advanceInMs, Math.max(16L, idleAt - position));
+        }
+        if (advanceInMs != Long.MAX_VALUE) AndroidUtilities.runOnUIThread(advanceLyric, advanceInMs);
         if (TextUtils.isEmpty(lyric)) lyric = null;
         if (TextUtils.equals(activeLyric, lyric)) return;
         activeLyric = lyric;
         titleTextView.setText(lyric == null ? normalMusicTitle : lyric, animated && visible, transitionDuration);
+    }
+
+    private SyncedLyricsController.Lyrics lyricsActivityFor;
+    private LyricsActivity lyricsActivity;
+
+    /** The activity of the document, built once per document. */
+    private LyricsActivity lyricsActivityOf(final SyncedLyricsController.Lyrics lyrics) {
+        if (lyricsActivity != null && lyricsActivityFor == lyrics) return lyricsActivity;
+        lyricsActivityFor = lyrics;
+        lyricsActivity = new LyricsActivity(new LyricsActivity.Document() {
+            @Override
+            public int size() {
+                return lyrics.lines.size();
+            }
+
+            @Override
+            public boolean isSynced() {
+                return lyrics.isSynced();
+            }
+
+            @Override
+            public long timeMs(int line) {
+                return lyrics.lines.get(line).timeMs;
+            }
+
+            @Override
+            public boolean timed(int line) {
+                return lyrics.lines.get(line).timed;
+            }
+
+            @Override
+            public boolean hasText(int line) {
+                return !TextUtils.isEmpty(lyrics.lines.get(line).text);
+            }
+
+            @Override
+            public boolean hasWords(int line) {
+                final SyncedLyricsController.Segments segments = lyrics.lines.get(line).segments;
+                return segments != null && segments.size() > 0;
+            }
+
+            @Override
+            public long statedEndMs(int line) {
+                final SyncedLyricsController.Segments segments = lyrics.lines.get(line).segments;
+                if (segments == null || segments.size() == 0) return Long.MAX_VALUE;
+                long end = -1;
+                for (int k = 0; k < segments.size(); k++) {
+                    if (segments.hasEndTime(k)) end = Math.max(end, segments.endTimeMs(k));
+                }
+                final int last = segments.size() - 1;
+                if (!segments.hasEndTime(last) || end < 0) return Long.MAX_VALUE;
+                return end;
+            }
+
+            @Override
+            public long lastWordStartMs(int line) {
+                final SyncedLyricsController.Segments segments = lyrics.lines.get(line).segments;
+                return segments.startTimeMs(segments.size() - 1);
+            }
+
+            @Override
+            public long lastWordStatedMs(int line) {
+                final SyncedLyricsController.Segments segments = lyrics.lines.get(line).segments;
+                final int last = segments.size() - 1;
+                return segments.hasEndTime(last) ? segments.endTimeMs(last) - segments.startTimeMs(last) : 0;
+            }
+
+            @Override
+            public boolean isPlain() {
+                return lyrics.kind == SyncedLyricsController.Kind.PLAIN;
+            }
+        });
+        return lyricsActivity;
     }
 
     private static final long LYRIC_ROLL_DURATION = 440;

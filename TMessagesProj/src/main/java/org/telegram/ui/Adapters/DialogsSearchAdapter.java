@@ -42,6 +42,7 @@ import org.telegram.messenger.MediaDataController;
 import org.telegram.messenger.MessageObject;
 import org.telegram.messenger.MessagesController;
 import org.telegram.messenger.MessagesStorage;
+import org.telegram.messenger.ProtectedChats;
 import org.telegram.messenger.R;
 import org.telegram.messenger.UserConfig;
 import org.telegram.messenger.UserObject;
@@ -626,6 +627,10 @@ public class DialogsSearchAdapter extends RecyclerListView.SelectionAdapter {
                             long did = MessageObject.getDialogId(message);
                             int maxId = MessagesController.getInstance(currentAccount).deletedHistory.get(did);
                             if (maxId != 0 && message.id <= maxId) {
+                                continue;
+                            }
+                            if (ProtectedChats.shouldHideContent(currentAccount, did)) {
+                                // Do not let search reveal content of (or even hits in) locked protected chats.
                                 continue;
                             }
                             MessageObject msg = messageObjects.get(a);

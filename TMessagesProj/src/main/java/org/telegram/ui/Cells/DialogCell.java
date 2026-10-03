@@ -77,6 +77,7 @@ import org.telegram.messenger.LocaleController;
 import org.telegram.messenger.MediaDataController;
 import org.telegram.messenger.MessageObject;
 import org.telegram.messenger.MessagesController;
+import org.telegram.messenger.ProtectedChats;
 import org.telegram.messenger.MessagesStorage;
 import org.telegram.messenger.NotificationCenter;
 import org.telegram.messenger.R;
@@ -2166,6 +2167,16 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
                     drawClock = false;
                     drawError = false;
                 }
+            }
+
+            if (currentDialogFolderId == 0 && currentDialogCommunityId == 0 && ProtectedChats.shouldHideContent(currentAccount, protectedContentDialogId())) {
+                // Protected chat that is locked: keep name, avatar, time and counters, drop the content.
+                messageString = getString(R.string.ChatPasscodeHiddenPreview);
+                messageNameString = null;
+                buttonString = null;
+                thumbsCount = 0;
+                drawForwardIcon = false;
+                drawGiftIcon = false;
             }
 
             promoDialog = false;
@@ -5580,7 +5591,9 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
                 sb.append(". ");
             }
         }
-        if (encryptedChat == null) {
+        if (ProtectedChats.shouldHideContent(currentAccount, protectedContentDialogId())) {
+            sb.append(getString(R.string.ChatPasscodeHiddenPreview));
+        } else if (encryptedChat == null) {
             StringBuilder messageString = new StringBuilder();
             messageString.append(message.messageText);
             if (!message.isMediaEmpty()) {
@@ -5608,6 +5621,11 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
         }
         event.setContentDescription(sb);
         setContentDescription(sb);
+    }
+
+    /** Rows of the Saved Messages sub-lists show Saved Messages content, whatever peer they group by. */
+    private long protectedContentDialogId() {
+        return isSavedDialog || isSavedDialogCell ? UserConfig.getInstance(currentAccount).getClientUserId() : currentDialogId;
     }
 
     private MessageObject getCaptionMessage() {
