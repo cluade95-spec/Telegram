@@ -48,6 +48,10 @@ public final class ProtectedChatGate {
         if (fragment instanceof ChatActivity) {
             return dialogIdFromArgs(fragment.getArguments(), false);
         }
+        if (fragment instanceof ChatLockSettingsActivity) {
+            // the chat's own lock settings are as much part of the chat as its profile
+            return ((ChatLockSettingsActivity) fragment).getLockDialogId();
+        }
         if (fragment instanceof TopicsFragment || fragment instanceof ProfileActivity || fragment instanceof ProfileActivity2) {
             long dialogId = dialogIdFromArgs(fragment.getArguments(), true);
             // The own profile is an account page (also hosted as a main tab that never goes through a
@@ -129,6 +133,22 @@ public final class ProtectedChatGate {
         }
         final boolean forwardPicker = fragment instanceof DialogsActivity && ((DialogsActivity) fragment).isForwardPicker();
         ProtectedChats.lifecycle().presented(fragment.protectedGate, conversationDialogId(fragment), below.protectedGate, removeLast, forwardPicker);
+    }
+
+    /**
+     * Protects a chat from its own lock settings, which are on top of the chat's profile and chat: the
+     * user just proved the passcode, so the chat stays authorized as long as it is open and its
+     * Auto-lock counts from when it is left (see {@link ProtectedGateLifecycle#protectOpen}).
+     */
+    public static ProtectedChatsState.Result protectWhileOpen(BaseFragment from, long dialogId, ProtectedChatsState.AuthProof proof) {
+        final ArrayList<ProtectedGateLifecycle.StackEntry> entries = new ArrayList<>();
+        final INavigationLayout layout = from.getParentLayout();
+        if (layout != null && layout.getFragmentStack() != null) {
+            for (BaseFragment fragment : new ArrayList<>(layout.getFragmentStack())) {
+                entries.add(new ProtectedGateLifecycle.StackEntry(fragment.protectedGate, getDialogId(fragment), () -> tryClose(fragment)));
+            }
+        }
+        return ProtectedChats.protectOpen(from.getCurrentAccount(), dialogId, proof, entries);
     }
 
     /** The dialog a fragment shows as a conversation (a chat or a profile), or 0 for any other screen. */

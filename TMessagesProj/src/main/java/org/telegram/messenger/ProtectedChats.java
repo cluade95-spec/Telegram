@@ -16,7 +16,11 @@ import android.os.SystemClock;
  *
  * Supported dialogs: private chats (including bots and Saved Messages), basic groups,
  * supergroups, channels and secret chats. Folder pseudo-dialogs (archive, community rows) can not
- * be protected.
+ * be protected. A forum topic is protected through its parent dialog.
+ *
+ * Every dialog also has its own "hide message previews" and Auto-lock ({@link #getHidePreview},
+ * {@link #getRelockSeconds}); {@link ProtectedChatsState} resolves them, callers only ask questions
+ * ({@link #shouldHideContent}, {@link #isProtected}, {@link #allowsExternalInteraction}).
  */
 public class ProtectedChats {
 
@@ -102,6 +106,14 @@ public class ProtectedChats {
         return dialogId != 0 && !DialogObject.isFolderDialogId(dialogId);
     }
 
+    /**
+     * Whether the chat's own Lock Settings are offered for this dialog: a supported dialog while the
+     * feature can be used, which is the same condition the chat list uses to offer "Protect".
+     */
+    public static boolean isLockSettingsAvailable(int account, long dialogId) {
+        return accountKey(account) != 0 && ProtectedChatsState.isLockSettingsOffered(isSupportedDialog(dialogId), state().isFeatureEnabled(), SharedConfig.hasPasscode());
+    }
+
     // ------------------------------------------------------------------ queries
 
     public static boolean isFeatureEnabled() {
@@ -131,6 +143,18 @@ public class ProtectedChats {
         }
         long key = accountKey(account);
         return key == 0 || s.allowsExternalInteraction(key, dialogId);
+    }
+
+    /** The dialog's own "hide message previews" as the settings screen shows it (not a policy: see {@link #shouldHideContent}). */
+    public static boolean getHidePreview(int account, long dialogId) {
+        long key = accountKey(account);
+        return key != 0 ? state().getHidePreview(key, dialogId) : state().isHidePreviewWhenLocked();
+    }
+
+    /** The dialog's own Auto-lock in seconds as the settings screen shows it. */
+    public static int getRelockSeconds(int account, long dialogId) {
+        long key = accountKey(account);
+        return key != 0 ? state().getRelockSeconds(key, dialogId) : state().getRelockSeconds();
     }
 
     public static boolean isLockedProtected(int account, long dialogId) {
@@ -212,6 +236,47 @@ public class ProtectedChats {
             refreshNotifications();
         }
         return result;
+    }
+
+    /**
+     * Protects a chat that is open (its fragments are in the navigation stack): it stays authorized
+     * until the user leaves it. See {@link ProtectedGateLifecycle#protectOpen}.
+     */
+    public static ProtectedChatsState.Result protectOpen(int account, long dialogId, ProtectedChatsState.AuthProof proof, java.util.List<ProtectedGateLifecycle.StackEntry> stack) {
+        if (!isSupportedDialog(dialogId)) {
+            return ProtectedChatsState.Result.UNSUPPORTED;
+        }
+        long key = accountKey(account);
+        if (key == 0) {
+            return ProtectedChatsState.Result.UNSUPPORTED;
+        }
+        ProtectedChatsState.Result result = lifecycle().protectOpen(key, dialogId, proof, stack);
+        if (result == ProtectedChatsState.Result.OK) {
+            notifyChanged();
+            refreshNotifications();
+        }
+        return result;
+    }
+
+    /** The dialog's own "hide message previews". Kept whether or not the dialog is protected; it only acts while it is. */
+    public static ProtectedChatsState.Result setChatHidePreview(int account, long dialogId, boolean hide) {
+        if (!isSupportedDialog(dialogId)) {
+            return ProtectedChatsState.Result.UNSUPPORTED;
+        }
+        ProtectedChatsState.Result result = state().setChatHidePreview(accountKey(account), dialogId, hide);
+        if (result == ProtectedChatsState.Result.OK && state().isProtected(accountKey(account), dialogId)) {
+            notifyChanged();
+            refreshNotifications();
+        }
+        return result;
+    }
+
+    /** The dialog's own Auto-lock, one of {@link ProtectedChatsState#RELOCK_CHOICES}. */
+    public static ProtectedChatsState.Result setChatRelockSeconds(int account, long dialogId, int seconds) {
+        if (!isSupportedDialog(dialogId)) {
+            return ProtectedChatsState.Result.UNSUPPORTED;
+        }
+        return state().setChatRelockSeconds(accountKey(account), dialogId, seconds);
     }
 
     public static ProtectedChatsState.Result unlock(int account, long dialogId, ProtectedChatsState.AuthProof proof) {

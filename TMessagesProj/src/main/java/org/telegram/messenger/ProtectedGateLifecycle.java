@@ -456,6 +456,85 @@ public final class ProtectedGateLifecycle {
         return true;
     }
 
+    // ------------------------------------------------------------------ protecting an open chat
+
+    /** One fragment of a navigation stack as {@link #protectOpen} sees it. */
+    public static final class StackEntry {
+        private final Node node;
+        private final long conversation;
+        private final Closer closer;
+
+        /**
+         * @param conversation the dialog the fragment shows as a conversation (a chat, a profile, a
+         *                     topic list or the chat's own settings), 0 for any other screen
+         */
+        public StackEntry(Node node, long conversation, Closer closer) {
+            this.node = node;
+            this.conversation = conversation;
+            this.closer = closer;
+        }
+    }
+
+    /**
+     * The user protects a chat that is open right now (from the chat's own settings, so its chat and
+     * profile are in the stack under the screen that asked). The passcode was just proved, so the
+     * chat is in use and stays authorized until the user leaves it; only then does its own Auto-lock
+     * count, whatever that value is (an Immediate chat must not ask for the passcode again when the
+     * user goes Back to the chat they just locked). The fragments of the chat that are in the stack
+     * become nodes, covered by what was opened over them, exactly as if the chat had been protected
+     * when they were presented. Fragments of the dialog that are not part of the contiguous context
+     * on top of the stack (something that shows another conversation lies between) are not adopted: a
+     * chat that was reached through another conversation is not in use, and revealing it is gated
+     * like any other.
+     *
+     * @param stack the layout's fragments, bottom to top
+     */
+    public ProtectedChatsState.Result protectOpen(long accountKey, long dialogId, ProtectedChatsState.AuthProof proof, List<StackEntry> stack) {
+        final ProtectedChatsState.Result result = state.protectOpen(accountKey, dialogId, proof);
+        if (result != ProtectedChatsState.Result.OK) {
+            return result;
+        }
+        int bottom = -1;
+        for (int i = stack.size() - 1; i >= 0; i--) {
+            final long conversation = stack.get(i).conversation;
+            if (conversation == dialogId) {
+                bottom = i;
+            } else if (conversation != 0) {
+                break;
+            }
+        }
+        if (bottom >= 0) {
+            Node root = null;
+            for (int i = bottom; i < stack.size(); i++) {
+                final StackEntry entry = stack.get(i);
+                final Node node = entry.node;
+                if (node.finished) {
+                    continue;
+                }
+                if (entry.conversation == dialogId) {
+                    if (node.dialogId == 0) {
+                        created(node, accountKey, dialogId, entry.closer);
+                    }
+                    if (node.dialogId == dialogId && i < stack.size() - 1 && node.state == NodeState.VISIBLE) {
+                        node.state = NodeState.COVERED;
+                    }
+                    if (root == null && node.dialogId == dialogId) {
+                        root = node;
+                    }
+                } else if (root != null && node.dialogId == 0 && node.owner == null) {
+                    // opened over the chat while it was not protected: a child of it, like any screen over a protected chat
+                    node.owner = root;
+                    node.conversation = stack.get(i - 1).node.conversation;
+                }
+            }
+        }
+        if (!open.containsKey(key(accountKey, dialogId))) {
+            // nothing of the chat is open: nothing keeps it in use, its own Auto-lock counts from now
+            state.chatLeft(accountKey, dialogId);
+        }
+        return result;
+    }
+
     // ------------------------------------------------------------------ leaving and closing
 
     /**

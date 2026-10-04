@@ -176,6 +176,70 @@ stop) and used to be the same thing to the gate; `BubbleActivity` had its own co
 (`onPasscodePause` -> `ProtectedChats.onAppPaused`), fixed the same way; `ChatAttachAlertPhotoLayout.onPause` closes the camera
 view when the activity pauses (Telegram's own behaviour, unrelated to the gate).
 
+## Per-chat Lock Settings
+
+**Entry.** The three-dot menu of a chat's profile has *Lock Settings* (`ProfileActivity`, `lock_settings`; placed with the
+chat's own actions, above the leave/delete items). It is offered for every dialog protection supports, protected or not:
+users, bots, groups, supergroups, channels, secret chats, Saved Messages (the own profile is the profile of that dialog) and,
+for a topic, its parent dialog. The dialog id is found the way the profile's other actions find it (secret chat id, user id,
+`-chatId`) and is the canonical identity `ProtectedChatsState` already uses; no second identity model exists. The item is
+hidden when `ProtectedChatsState.isLockSettingsOffered` says no (an unsupported dialog; the feature switched off while a
+passcode exists, the same condition under which the chat list hides *Protect*). `ProfileActivity2` is not instantiated
+anywhere in the app and was not touched.
+
+**Screen** (`ChatLockSettingsActivity`, same cells and structure as the Protected Chats page, no explanation text): *Chat Lock*
+(switch), then *Hide Message Previews* (switch) and *Auto-lock* (value row, the same picker and the same five choices as the
+Protected Chats page, `ProtectedChatsSettingsActivity.showAutoLockDialog`). The action bar shows the chat's name. The gate
+treats the screen as part of the chat (`ProtectedChatGate.getDialogId`): it is reachable only while the chat is authorized,
+it is a child of the chat while the chat is protected, and it is closed with the chat's other fragments when the chat locks.
+
+**Chat Lock.** Switching it on or off asks for the passcode with the existing Chat Lock sheet (`PROTECT` / `UNPROTECT`), as the
+chat list's long-press does and under the same rule (they always authenticate; a chat that is open and authorized is not an
+exception). With no passcode the existing "Passcode Required" dialog leads to the existing passcode setup, and enabling
+continues when it is back with a passcode. No credential is created here and there is no per-chat password. The switch
+changes only after success; cancelling changes nothing. Both entry points are `ProtectedChatsState.protect*` / `unprotect*`
+on the same set, so long-press and the profile always agree and there is no second entry. Turning it off removes this chat's
+protection only (not the passcode, the feature, the app lock or another chat).
+
+**Protecting a chat that is open.** The chat's fragments are in the stack under the Lock Settings screen. The passcode was just
+proved, so `ProtectedGateLifecycle.protectOpen` marks the chat in use and registers the fragments of the chat that sit in the
+contiguous context on top of the stack (chat, profile, settings; anything above them is their child) as covered nodes, as if
+the chat had been protected when they were presented. Going Back to the chat therefore never asks again, whatever its
+Auto-lock; the Auto-lock counts from when the user leaves it. A chat reached through another conversation (the stack has
+another chat between) is not in use and is gated like any other when revealed; a chat with no fragment in the stack counts
+from the moment of protecting (it is never left authorized by accident: `protectOpen` ends the use at once when nothing was
+registered, and the state method is package-private).
+
+**Per-chat values.** `ProtectedChatsState` keeps, per account and dialog, an optional *hide previews* and an optional
+*Auto-lock*. A value that was never set for a chat is the value of the Protected Chats page, so chats protected before this
+feature behave exactly as before and the page keeps working for every chat that was not configured individually; the first
+time a value is changed on a chat's own screen it becomes that chat's own and the page no longer changes it. The screen shows
+the effective value; there is no label, badge or switch for any of this. Resolution is in one place:
+`shouldHideContent(account, dialog)`, `getRelockSeconds(account, dialog)` (used by `isUnlocked` and `appResumed`) and
+`allowsExternalInteraction`. Callers ask `ProtectedChats.shouldHideContent` (dialog rows, search, downloads, notifications,
+their service-message and rich content, bubbles' preview, widgets, hashtag search, popup content) and never read a setting.
+Protection status stays the authority: stored values are only read for a protected dialog, a dialog that has settings but is not
+protected behaves like any chat (no masking, no lock, interaction allowed), and turning Chat Lock on restores what the chat was
+configured with. Protected chats do not allow external interaction (notification and popup replies, Wear, car, bot buttons)
+whatever their previews say: preview visibility and interaction are separate policies, and previews off does not re-enable it.
+The two value rows change no authentication: the page they sit on is reachable only while the chat is authorized and the
+Protected Chats page changes the same values without one.
+
+**Storage.** The existing `protected_chats` preferences file: `chatSettingsAccounts` (comma list of account user ids) and
+`chatsettings_<accountUserId>` = records `dialogId:hidePreview:relockSeconds` joined by `;`, `hidePreview` is `1`, `0` or empty
+(not set), `relockSeconds` one of the five choices or empty (not set); unknown or corrupt records are ignored. Nothing else
+changed: `enabled`, `hidePreview`, `relockSeconds`, `accounts`, `chats_<account>` are read and written as before, so an old
+file loads as-is (no migration step and no reset). Settings survive restart and process death; authorization still does not.
+They are removed with the dialog (`removeDialog`), follow a dialog that migrates (group to supergroup), go with an account
+(`clearAccount`), and are cleared together with every protection when the passcode is removed or the feature is turned off.
+Removing Chat Lock keeps the chat's settings.
+
+**Auto-lock in the lifecycle.** Only the interval a chat is measured with changed; the lifecycle model (`VISIBLE` ...
+`DESTROYED`) is untouched. A temporary child, a permission dialog, the comments and a forward are not leaving, whatever the
+chat's own Auto-lock is (Immediate included); a real boundary (app background, screen off, manual lock, genuine departure)
+applies the chat's own interval, and if that makes a covered chat unauthorized the gate before reveal authenticates before the
+chat appears.
+
 ## Forwarding and sharing
 
 **Destination rule** (`ForwardDestinations`, one rule for every kind of destination: users, bots, groups, supergroups,

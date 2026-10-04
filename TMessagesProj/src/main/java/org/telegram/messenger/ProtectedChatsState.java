@@ -22,6 +22,16 @@ import java.util.Set;
  *
  * All public methods are synchronized: notifications are built off the UI thread.
  *
+ * Per-chat settings: besides the set of protected dialogs, a dialog can carry its own "hide message
+ * previews" and "Auto-lock" values. They are stored per account and dialog, independently of the
+ * protection itself, and are only ever <i>read</i> for a protected dialog: protection status stays
+ * the authority, so a dialog with saved settings that is not protected behaves like any other chat,
+ * and turning protection back on restores what the chat was configured with. A dialog that has no
+ * value of its own for a setting uses the value of the Protected Chats page; that is how every chat
+ * protected before per-chat settings existed keeps behaving exactly as it did. Everything that
+ * needs an answer asks this class ({@link #shouldHideContent}, {@link #getRelockSeconds(long, long)},
+ * {@link #allowsExternalInteraction}); nothing else interprets the stored values.
+ *
  * Timing semantics: a chat that was authenticated stays unlocked while it is open in the
  * foreground. The re-lock interval starts when the user leaves the chat or the app goes to the
  * background, measured on a monotonic clock that keeps counting during device sleep. Interval 0
@@ -91,8 +101,13 @@ public final class ProtectedChatsState {
     private static final String KEY_RELOCK = "relockSeconds";
     private static final String KEY_ACCOUNTS = "accounts";
     private static final String KEY_CHATS_PREFIX = "chats_";
+    /** Accounts that have per-chat settings, and one record list per account: {@code id:hidePreview:relockSeconds;...}. */
+    private static final String KEY_SETTINGS_ACCOUNTS = "chatSettingsAccounts";
+    private static final String KEY_SETTINGS_PREFIX = "chatsettings_";
 
     private static final class Auth {
+        final long accountKey;
+        long dialogId;
         /** True while the chat is open in the foreground. */
         boolean active;
         /** Elapsed time at which the chat was left / app was backgrounded. */
@@ -106,6 +121,23 @@ public final class ProtectedChatsState {
         /** The chat was covered while its forward transaction was open; the countdown starts if it ends with the chat still covered. */
         boolean leaveDeferred;
         long deferredLeftAt;
+
+        Auth(long accountKey, long dialogId) {
+            this.accountKey = accountKey;
+            this.dialogId = dialogId;
+        }
+    }
+
+    /** What the user configured for one dialog; a field that was never set follows the Protected Chats page. */
+    private static final class ChatSettings {
+        /** null: not set for this chat. */
+        Boolean hidePreview;
+        /** -1: not set for this chat. */
+        int relockSeconds = -1;
+
+        boolean isEmpty() {
+            return hidePreview == null && relockSeconds < 0;
+        }
     }
 
     /**
@@ -147,6 +179,7 @@ public final class ProtectedChatsState {
 
     private final Map<Long, Set<Long>> protectedByAccount = new HashMap<>();
     private final Map<String, Auth> authorized = new HashMap<>();
+    private final Map<Long, Map<Long, ChatSettings>> chatSettings = new HashMap<>();
     private boolean featureEnabled;
     private boolean hidePreview;
     private int relockSeconds;
@@ -179,6 +212,7 @@ public final class ProtectedChatsState {
                 }
             }
         }
+        loadChatSettings();
         // Without the feature or without the credential nothing can be unlocked; drop stale rows
         // instead of leaving chats that nobody could ever open.
         if ((!featureEnabled || !credential.hasCredential()) && !protectedByAccount.isEmpty()) {
@@ -214,6 +248,103 @@ public final class ProtectedChatsState {
             }
         }
         storage.put(KEY_ACCOUNTS, accounts.toString());
+    }
+
+    private void loadChatSettings() {
+        chatSettings.clear();
+        String accounts = storage.get(KEY_SETTINGS_ACCOUNTS);
+        if (accounts == null || accounts.isEmpty()) {
+            return;
+        }
+        for (String a : accounts.split(",")) {
+            try {
+                long accountKey = Long.parseLong(a);
+                Map<Long, ChatSettings> map = parseChatSettings(storage.get(KEY_SETTINGS_PREFIX + accountKey));
+                if (!map.isEmpty()) {
+                    chatSettings.put(accountKey, map);
+                }
+            } catch (NumberFormatException ignore) {
+            }
+        }
+    }
+
+    private static Map<Long, ChatSettings> parseChatSettings(String s) {
+        Map<Long, ChatSettings> map = new HashMap<>();
+        if (s == null || s.isEmpty()) {
+            return map;
+        }
+        for (String record : s.split(";")) {
+            String[] f = record.split(":", -1);
+            if (f.length != 3) {
+                continue;
+            }
+            try {
+                long id = Long.parseLong(f[0]);
+                if (id == 0) {
+                    continue;
+                }
+                ChatSettings cs = new ChatSettings();
+                if ("1".equals(f[1])) {
+                    cs.hidePreview = Boolean.TRUE;
+                } else if ("0".equals(f[1])) {
+                    cs.hidePreview = Boolean.FALSE;
+                }
+                if (!f[2].isEmpty()) {
+                    int seconds = Integer.parseInt(f[2]);
+                    if (isRelockChoice(seconds)) {
+                        cs.relockSeconds = seconds;
+                    }
+                }
+                if (!cs.isEmpty()) {
+                    map.put(id, cs);
+                }
+            } catch (NumberFormatException ignore) {
+            }
+        }
+        return map;
+    }
+
+    private void persistChatSettings() {
+        StringBuilder accounts = new StringBuilder();
+        Set<Long> keep = new HashSet<>();
+        for (Map.Entry<Long, Map<Long, ChatSettings>> e : chatSettings.entrySet()) {
+            if (e.getValue().isEmpty()) {
+                continue;
+            }
+            keep.add(e.getKey());
+            if (accounts.length() > 0) {
+                accounts.append(',');
+            }
+            accounts.append(e.getKey());
+            StringBuilder records = new StringBuilder();
+            for (Map.Entry<Long, ChatSettings> c : e.getValue().entrySet()) {
+                if (records.length() > 0) {
+                    records.append(';');
+                }
+                records.append(c.getKey()).append(':');
+                if (c.getValue().hidePreview != null) {
+                    records.append(c.getValue().hidePreview ? '1' : '0');
+                }
+                records.append(':');
+                if (c.getValue().relockSeconds >= 0) {
+                    records.append(c.getValue().relockSeconds);
+                }
+            }
+            storage.put(KEY_SETTINGS_PREFIX + e.getKey(), records.toString());
+        }
+        String old = storage.get(KEY_SETTINGS_ACCOUNTS);
+        if (old != null && !old.isEmpty()) {
+            for (String a : old.split(",")) {
+                try {
+                    long accountKey = Long.parseLong(a);
+                    if (!keep.contains(accountKey)) {
+                        storage.remove(KEY_SETTINGS_PREFIX + accountKey);
+                    }
+                } catch (NumberFormatException ignore) {
+                }
+            }
+        }
+        storage.put(KEY_SETTINGS_ACCOUNTS, accounts.toString());
     }
 
     private void persistSettings() {
@@ -258,13 +389,17 @@ public final class ProtectedChatsState {
         }
     }
 
-    private static int normalizeRelock(int seconds) {
+    private static boolean isRelockChoice(int seconds) {
         for (int c : RELOCK_CHOICES) {
             if (c == seconds) {
-                return seconds;
+                return true;
             }
         }
-        return DEFAULT_RELOCK_SECONDS;
+        return false;
+    }
+
+    private static int normalizeRelock(int seconds) {
+        return isRelockChoice(seconds) ? seconds : DEFAULT_RELOCK_SECONDS;
     }
 
     private static String key(long accountKey, long dialogId) {
@@ -298,8 +433,10 @@ public final class ProtectedChatsState {
         featureEnabled = false;
         protectedByAccount.clear();
         authorized.clear();
+        chatSettings.clear();
         persistSettings();
         persistAll();
+        persistChatSettings();
     }
 
     public synchronized boolean isHidePreviewWhenLocked() {
@@ -403,13 +540,30 @@ public final class ProtectedChatsState {
         long now = clock.elapsedMs();
         for (long dialogId : dialogIds) {
             ids.add(dialogId);
-            Auth auth = new Auth();
+            Auth auth = new Auth(accountKey, dialogId);
             auth.active = false;
             auth.leftAt = now;
             authorized.put(key(accountKey, dialogId), auth);
         }
         persistAll();
         return Result.OK;
+    }
+
+    /**
+     * Protects a chat the user has open right now (its fragments are in the navigation stack): the
+     * user just proved the passcode, so the chat is in use and stays authorized until it is left,
+     * and only then does its own Auto-lock count. Whoever calls this must register the open
+     * fragments of the chat as in use ({@link ProtectedGateLifecycle#protectOpen} does both), otherwise
+     * nothing would ever end the use; the package-private access keeps it that way.
+     */
+    synchronized Result protectOpen(long accountKey, long dialogId, AuthProof proof) {
+        Result result = protect(accountKey, dialogId, proof);
+        if (result == Result.OK) {
+            Auth auth = authorized.get(key(accountKey, dialogId));
+            auth.active = true;
+            auth.graceUntil = 0;
+        }
+        return result;
     }
 
     /** Permanently removes protection from the chat; needs proof of the passcode. */
@@ -459,7 +613,7 @@ public final class ProtectedChatsState {
         if (proof == null || !proof.consume()) {
             return Result.NOT_AUTHENTICATED;
         }
-        Auth auth = new Auth();
+        Auth auth = new Auth(accountKey, dialogId);
         long now = clock.elapsedMs();
         auth.active = false;
         auth.leftAt = now;
@@ -484,7 +638,8 @@ public final class ProtectedChatsState {
         if (now >= auth.leftAt && now < auth.graceUntil) {
             return true;
         }
-        if (relockSeconds <= 0 || now < auth.leftAt || now - auth.leftAt >= relockSeconds * 1000L) {
+        final int relock = relockSecondsOf(accountKey, dialogId);
+        if (relock <= 0 || now < auth.leftAt || now - auth.leftAt >= relock * 1000L) {
             authorized.remove(key(accountKey, dialogId));
             return false;
         }
@@ -706,7 +861,8 @@ public final class ProtectedChatsState {
             }
             auth.pausedWhileOpen = false;
             long now = clock.elapsedMs();
-            if (relockSeconds <= 0 || now < auth.leftAt || now - auth.leftAt >= relockSeconds * 1000L) {
+            final int relock = relockSecondsOf(auth.accountKey, auth.dialogId);
+            if (relock <= 0 || now < auth.leftAt || now - auth.leftAt >= relock * 1000L) {
                 it.remove();
             }
         }
@@ -734,7 +890,7 @@ public final class ProtectedChatsState {
      * opens the conversation itself.
      */
     public synchronized boolean shouldHideContent(long accountKey, long dialogId) {
-        return hidePreview && isProtected(accountKey, dialogId);
+        return isProtected(accountKey, dialogId) && hidePreviewOf(accountKey, dialogId);
     }
 
     /**
@@ -749,33 +905,135 @@ public final class ProtectedChatsState {
         return !isProtected(accountKey, dialogId);
     }
 
+    // ---------------------------------------------------------------- per-chat settings
+
+    private ChatSettings chatSettingsOf(long accountKey, long dialogId) {
+        Map<Long, ChatSettings> map = chatSettings.get(accountKey);
+        return map == null ? null : map.get(dialogId);
+    }
+
+    private boolean hidePreviewOf(long accountKey, long dialogId) {
+        ChatSettings cs = chatSettingsOf(accountKey, dialogId);
+        return cs != null && cs.hidePreview != null ? cs.hidePreview : hidePreview;
+    }
+
+    private int relockSecondsOf(long accountKey, long dialogId) {
+        ChatSettings cs = chatSettingsOf(accountKey, dialogId);
+        return cs != null && cs.relockSeconds >= 0 ? cs.relockSeconds : relockSeconds;
+    }
+
+    /**
+     * Whether message content is hidden for this dialog, as the settings screen shows it. This is the
+     * value, not the policy: it says nothing about whether the dialog is protected (see
+     * {@link #shouldHideContent} for that).
+     */
+    public synchronized boolean getHidePreview(long accountKey, long dialogId) {
+        return hidePreviewOf(accountKey, dialogId);
+    }
+
+    /** The Auto-lock of this dialog in seconds, as the settings screen shows it (see {@link #getHidePreview}). */
+    public synchronized int getRelockSeconds(long accountKey, long dialogId) {
+        return relockSecondsOf(accountKey, dialogId);
+    }
+
+    /**
+     * Sets this dialog's own "hide message previews". Stored whether or not the dialog is protected
+     * (it only acts while it is) and never touches another dialog or another account.
+     */
+    public synchronized Result setChatHidePreview(long accountKey, long dialogId, boolean hide) {
+        if (accountKey == 0 || dialogId == 0) {
+            return Result.UNSUPPORTED;
+        }
+        mutableChatSettings(accountKey, dialogId).hidePreview = hide;
+        persistChatSettings();
+        return Result.OK;
+    }
+
+    /** Sets this dialog's own Auto-lock; only one of {@link #RELOCK_CHOICES} is accepted. */
+    public synchronized Result setChatRelockSeconds(long accountKey, long dialogId, int seconds) {
+        if (accountKey == 0 || dialogId == 0 || !isRelockChoice(seconds)) {
+            return Result.UNSUPPORTED;
+        }
+        mutableChatSettings(accountKey, dialogId).relockSeconds = seconds;
+        persistChatSettings();
+        return Result.OK;
+    }
+
+    private ChatSettings mutableChatSettings(long accountKey, long dialogId) {
+        Map<Long, ChatSettings> map = chatSettings.get(accountKey);
+        if (map == null) {
+            map = new HashMap<>();
+            chatSettings.put(accountKey, map);
+        }
+        ChatSettings cs = map.get(dialogId);
+        if (cs == null) {
+            cs = new ChatSettings();
+            map.put(dialogId, cs);
+        }
+        return cs;
+    }
+
+    /**
+     * Whether a chat's own Lock Settings are offered (the profile's menu item): for a dialog that can
+     * be protected, while the feature can be used. That is the condition the chat list uses for
+     * "Protect": with a passcode but the feature switched off there is nothing to configure, and
+     * without a passcode the screen is offered because turning Chat Lock on leads to the passcode setup.
+     */
+    public static boolean isLockSettingsOffered(boolean supportedDialog, boolean featureEnabled, boolean hasCredential) {
+        return supportedDialog && (featureEnabled || !hasCredential);
+    }
+
+    /** Whether the user gave this dialog a value of its own for either setting (kept while it is not protected). */
+    public synchronized boolean hasChatSettings(long accountKey, long dialogId) {
+        return chatSettingsOf(accountKey, dialogId) != null;
+    }
+
     // ---------------------------------------------------------------- lifecycle of data
 
     public synchronized void removeDialog(long accountKey, long dialogId) {
         if (protectedByAccount.containsKey(accountKey) || authorized.containsKey(key(accountKey, dialogId))) {
             removeInternal(accountKey, dialogId);
         }
+        Map<Long, ChatSettings> map = chatSettings.get(accountKey);
+        if (map != null && map.remove(dialogId) != null) {
+            if (map.isEmpty()) {
+                chatSettings.remove(accountKey);
+            }
+            persistChatSettings();
+        }
     }
 
     /** Group upgraded to supergroup, etc. Keeps the protection on the new dialog id. */
     public synchronized void migrateDialog(long accountKey, long oldDialogId, long newDialogId) {
-        Set<Long> ids = protectedByAccount.get(accountKey);
-        if (ids == null || !ids.contains(oldDialogId) || newDialogId == 0) {
+        if (newDialogId == 0 || newDialogId == oldDialogId) {
             return;
         }
-        ids.remove(oldDialogId);
-        ids.add(newDialogId);
-        Auth auth = authorized.remove(key(accountKey, oldDialogId));
-        if (auth != null) {
-            authorized.put(key(accountKey, newDialogId), auth);
+        Set<Long> ids = protectedByAccount.get(accountKey);
+        if (ids != null && ids.contains(oldDialogId)) {
+            ids.remove(oldDialogId);
+            ids.add(newDialogId);
+            Auth auth = authorized.remove(key(accountKey, oldDialogId));
+            if (auth != null) {
+                auth.dialogId = newDialogId;
+                authorized.put(key(accountKey, newDialogId), auth);
+            }
+            persistAll();
         }
-        persistAll();
+        // the chat's own settings belong to the dialog, protected or not
+        Map<Long, ChatSettings> map = chatSettings.get(accountKey);
+        if (map != null && map.containsKey(oldDialogId)) {
+            map.put(newDialogId, map.remove(oldDialogId));
+            persistChatSettings();
+        }
     }
 
     /** Account removed / logged out. */
     public synchronized void clearAccount(long accountKey) {
         if (protectedByAccount.remove(accountKey) != null) {
             persistAll();
+        }
+        if (chatSettings.remove(accountKey) != null) {
+            persistChatSettings();
         }
         String prefix = accountKey + ":";
         for (Iterator<String> it = authorized.keySet().iterator(); it.hasNext(); ) {
@@ -793,10 +1051,12 @@ public final class ProtectedChatsState {
     public synchronized void onCredentialRemoved() {
         protectedByAccount.clear();
         authorized.clear();
+        chatSettings.clear();
         // Back to the default so that a passcode created later offers the feature again.
         featureEnabled = true;
         persistSettings();
         persistAll();
+        persistChatSettings();
     }
 
     public synchronized ArrayList<Long> protectedDialogs(long accountKey) {

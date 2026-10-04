@@ -560,6 +560,20 @@ public abstract class GateNavigationTestBase {
         assertEquals(ProtectedChatsState.Result.OK, state.protect(ACC, dialog, state.proofFromPasscode("1234", null)));
     }
 
+    /**
+     * ProtectedChatGate.protectWhileOpen: the chat's own lock settings, on top of the chat's profile
+     * and chat, protect the chat after the passcode was proved.
+     */
+    protected ProtectedChatsState.Result protectWhileOpen(long dialog) {
+        final List<ProtectedGateLifecycle.StackEntry> entries = new ArrayList<>();
+        for (Frag f : new ArrayList<>(layout.stack)) {
+            entries.add(new ProtectedGateLifecycle.StackEntry(f.node, f.dialog, () -> layout.tryClose(f)));
+        }
+        final ProtectedChatsState.Result result = gate.protectOpen(ACC, dialog, state.proofFromPasscode("1234", null), entries);
+        idle();
+        return result;
+    }
+
     protected void authenticate(long dialog) {
         assertEquals(ProtectedChatsState.Result.OK, state.unlock(ACC, dialog, state.proofFromPasscode("1234", null)));
     }

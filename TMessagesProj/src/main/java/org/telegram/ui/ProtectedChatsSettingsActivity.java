@@ -113,7 +113,7 @@ public class ProtectedChatsSettingsActivity extends BaseFragment implements Noti
         return fragmentView;
     }
 
-    private String autoLockValue(int seconds) {
+    static String autoLockValue(int seconds) {
         if (seconds == 0) {
             return LocaleController.getString(R.string.ChatProtectionRelockImmediately);
         } else if (seconds < 60 * 60) {
@@ -122,28 +122,38 @@ public class ProtectedChatsSettingsActivity extends BaseFragment implements Noti
         return LocaleController.formatString("AutoLockInTime", R.string.AutoLockInTime, LocaleController.formatPluralString("Hours", seconds / 60 / 60));
     }
 
-    private void showAutoLockDialog(TextSettingsCell cell) {
-        if (getParentActivity() == null) {
+    /** Receives the Auto-lock the user picked, in seconds (one of {@link ProtectedChatsState#RELOCK_CHOICES}). */
+    interface AutoLockChooser {
+        void onChosen(int seconds);
+    }
+
+    /** The Auto-lock picker, shared by this page and by a chat's own Lock Settings. */
+    static void showAutoLockDialog(BaseFragment fragment, int current, AutoLockChooser chooser) {
+        if (fragment.getParentActivity() == null) {
             return;
         }
         final int[] choices = ProtectedChatsState.RELOCK_CHOICES;
-        AlertDialog.Builder builder = new AlertDialog.Builder(getParentActivity());
+        AlertDialog.Builder builder = new AlertDialog.Builder(fragment.getParentActivity());
         builder.setTitle(LocaleController.getString(R.string.AutoLock));
-        final NumberPicker numberPicker = new NumberPicker(getParentActivity());
+        final NumberPicker numberPicker = new NumberPicker(fragment.getParentActivity());
         numberPicker.setMinValue(0);
         numberPicker.setMaxValue(choices.length - 1);
         for (int i = 0; i < choices.length; i++) {
-            if (choices[i] == ProtectedChats.getState().getRelockSeconds()) {
+            if (choices[i] == current) {
                 numberPicker.setValue(i);
             }
         }
         numberPicker.setFormatter(value -> autoLockValue(choices[value]));
         builder.setView(numberPicker);
-        builder.setNegativeButton(LocaleController.getString(R.string.Done), (dialog, which) -> {
-            ProtectedChats.getState().setRelockSeconds(choices[numberPicker.getValue()]);
+        builder.setNegativeButton(LocaleController.getString(R.string.Done), (dialog, which) -> chooser.onChosen(choices[numberPicker.getValue()]));
+        fragment.showDialog(builder.create());
+    }
+
+    private void showAutoLockDialog(TextSettingsCell cell) {
+        showAutoLockDialog(this, ProtectedChats.getState().getRelockSeconds(), seconds -> {
+            ProtectedChats.getState().setRelockSeconds(seconds);
             cell.setTextAndValue(LocaleController.getString(R.string.AutoLock), autoLockValue(ProtectedChats.getState().getRelockSeconds()), false);
         });
-        showDialog(builder.create());
     }
 
     private class ListAdapter extends RecyclerListView.SelectionAdapter {
