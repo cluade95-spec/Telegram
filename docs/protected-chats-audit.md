@@ -134,6 +134,24 @@ after the activity was stopped, a locked chat being asked for before it is creat
 entries go through), authorization that does not survive the process, and a protected chat opened as a child (comments, a
 forward destination) being gated and authorized on its own account, independently of the chat it was opened from.
 
+**Audit of what takes the top position from a chat** (read from the code; `CA` = `ChatActivity`, `AB` = `ActionBarLayout`,
+`LA` = `LaunchActivity`). The gate treats each mechanism, not each screen:
+
+| Mechanism | What it is (examples, evidence) | Chat's `onPause` | Gate |
+| --- | --- | --- | --- |
+| window, dialog, bottom sheet, in-chat view | attach menu `ChatAttachAlert` and its photo grid, albums, in-app camera view, file, location and contact layouts; circle-message `InstantCameraView` and voice recording (views in the chat); `PhonebookShareAlert`, `ShareAlert`, `BotWebViewSheet`, attach-menu bots, `EmbedBottomSheet`, `ArticleViewer` sheet, alert dialogs, popups; `PhotoViewer` (a window, `WindowManager.addView`); chat search, pinned-bar tap, hashtag search (in place, embedded chats off the stack) | no | nothing happens |
+| fragment pushed as a sheet | any `presentFragment` while a `ChatAttachAlert` or `BotWebViewSheet` is visible becomes `showAsSheet` (`AB.shouldOpenFragmentOverlay`); `showAsSheet`; `presentFragmentAsPreview` (until expanded) | no | nothing happens |
+| system permission dialog | camera (attach tile, empty-view button, circle message), microphone (voice, circle message, video), media/storage, location, contacts, QR camera and web permissions in a web app: `Activity.requestPermissions`, result before `onResume` | only by the host (`onPause`, no `onStop`) | `HOST_PAUSED`, back to `VISIBLE` on resume |
+| external activity | camera apps (`ACTION_IMAGE_CAPTURE`, `ACTION_VIDEO_CAPTURE`), system file and gallery pickers (`ACTION_GET_CONTENT`, `ACTION_PICK`), share chooser, dial, sms, contact insert, settings intents, Custom Tabs and the external browser (`Browser.openUrl`) | by the host (`onPause`, `onStop`) | background boundary; a result (`onActivityResult`, before `onResume`) keeps the chats that were open as it always did; with no result (a link opened in the browser) the normal background rule applies on return |
+| child fragment pushed | forward picker `DialogsActivity`; `ProfileActivity` (`ProfileActivity2` is not instantiated); `MediaActivity`; `LocationActivity` (viewing); `HashtagActivity`, `CalendarActivity`; the pinned list (a `ChatActivity` of the same dialog, `MODE_PINNED`); a reply thread (a second `ChatActivity` of the same dialog, `threadMessageId`); **channel comments** (a `ChatActivity` of the linked discussion chat: `chat_id = -discussionDialogId`, `setThreadMessages`, `presentFragment(chatActivity)` at CA:35757-35773, guarded by `isFullyVisible`); another chat opened by a link, a forwarded-from header or a search result; photo-picker search fragments when no alert is showing | at the end of the open transition | `COVERED`; opening another conversation from a child leaves the chat |
+| replacement or removal | a bot mentioned in a chat replaces it (`removeLast`); `PhotoViewer` "show in chat" replaces it; `TopicsFragment.prepareToSwitchAnimation` adds the topics screen *under* the chat and finishes the chat; `closeChats` (posted by most intent-driven links and notifications) finishes or removes every chat; `LaunchActivity.handleIntent` account switch and "show dialogs" remove all fragments; a second `ChatActivity` of the same dialog removes the older one (CA:27306) | pause and destroy | destroyed: normal Auto-lock from then (the fragments of one dialog count together, so topics under a chat or a duplicate does not lock it) |
+| tablet routing | non-chat fragments presented from the right or main layout go to the layers layout (own stack); the tablet-mode switch destroys and rebuilds the chats synchronously | not for layers pushes | no relation is recorded; a rebuilt chat is created again before the posted leave runs |
+
+Findings from the audit: a permission request and an external activity are different mechanisms (pause only, pause and
+stop) and used to be the same thing to the gate; `BubbleActivity` had its own copy of the same mistake
+(`onPasscodePause` -> `ProtectedChats.onAppPaused`), fixed the same way; `ChatAttachAlertPhotoLayout.onPause` closes the camera
+view when the activity pauses (Telegram's own behaviour, unrelated to the gate).
+
 ## Forwarding and sharing
 
 **Destination rule** (`ForwardDestinations`, one rule for every kind of destination: users, bots, groups, supergroups,
