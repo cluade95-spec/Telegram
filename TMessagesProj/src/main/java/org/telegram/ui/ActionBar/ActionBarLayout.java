@@ -1452,7 +1452,7 @@ public class ActionBarLayout extends FrameLayout implements INavigationLayout, F
                     velocityTracker.addMovement(ev);
                     if (!transitionAnimationInProgress && !inPreviewMode && maybeStartTracking && !startedTracking && dx >= AndroidUtilities.getPixelsInCM(0.4f, true) && Math.abs(dx) / 3 > dy) {
                         BaseFragment currentFragment = fragmentsStack.get(fragmentsStack.size() - 1);
-                        if (currentFragment.canBeginSlide() && findScrollingChild(this, ev.getX(), ev.getY()) == null) {
+                        if (currentFragment.canBeginSlide() && findScrollingChild(this, ev.getX(), ev.getY()) == null && !protectedBackBlocked()) {
                             startedTrackingX = (int) ev.getX();
                             prepareForMoving();
                         } else {
@@ -1485,7 +1485,7 @@ public class ActionBarLayout extends FrameLayout implements INavigationLayout, F
                     if (!inPreviewMode && !transitionAnimationPreviewMode && !startedTracking && currentFragment.isSwipeBackEnabled(ev)) {
                         float velX = velocityTracker.getXVelocity();
                         float velY = velocityTracker.getYVelocity();
-                        if (velX >= 3500 && velX > Math.abs(velY) && currentFragment.canBeginSlide()) {
+                        if (velX >= 3500 && velX > Math.abs(velY) && currentFragment.canBeginSlide() && !protectedBackBlocked()) {
                             startedTrackingX = (int) ev.getX();
                             prepareForMoving();
                             if (!beginTrackingSent) {
@@ -1532,6 +1532,16 @@ public class ActionBarLayout extends FrameLayout implements INavigationLayout, F
         return false;
     }
 
+    /**
+     * A swipe back is about to reveal the fragment under the top one: the same gate as
+     * closeLastFragment. When it blocks, no gesture starts, authentication is requested, and the
+     * navigation is the ordinary animated Back if the user authenticates.
+     */
+    private boolean protectedBackBlocked() {
+        final int size = fragmentsStack.size();
+        return size > 1 && ProtectedChatGate.blockReveal(this, fragmentsStack.get(size - 1), fragmentsStack.get(size - 2), parentActivity, () -> closeLastFragment(true));
+    }
+
     private boolean predictiveInput;
     private boolean predictiveBackInProgress;
     private boolean predictiveBackHasProgress;
@@ -1564,6 +1574,12 @@ public class ActionBarLayout extends FrameLayout implements INavigationLayout, F
             return false;
         }
         if (currentFragment.hasShownSheet() || !currentFragment.canBeginSlide()) {
+            return false;
+        }
+        // The preview shows the fragment under this one. If that is a protected chat that is locked,
+        // no preview starts; onBackInvoked then takes the ordinary path (onBackPressed ->
+        // closeLastFragment), which asks for authentication before anything is revealed.
+        if (ProtectedChatGate.revealsLockedChat(fragmentsStack.get(fragmentsStack.size() - 2))) {
             return false;
         }
         predictiveBackHasProgress = false;
@@ -2577,6 +2593,13 @@ public class ActionBarLayout extends FrameLayout implements INavigationLayout, F
             return;
         }
         if (delegate != null && !delegate.needCloseLastFragment(this) || checkTransitionAnimation() || fragmentsStack.isEmpty()) {
+            return;
+        }
+        // Gate before reveal: if the fragment under this one is a protected chat that is locked, nothing
+        // below happens (it would create its view and resume it); the user is asked to authenticate
+        // and this call runs again once if they do. System back, toolbar back, finishFragment and
+        // every other way of closing the top fragment come through here.
+        if (fragmentsStack.size() > 1 && ProtectedChatGate.blockReveal(this, fragmentsStack.get(fragmentsStack.size() - 1), fragmentsStack.get(fragmentsStack.size() - 2), parentActivity, () -> closeLastFragment(animated, forceNoAnimation))) {
             return;
         }
         if (parentActivity.getCurrentFocus() != null) {

@@ -328,18 +328,23 @@ public class ProtectedGateNavigationTest extends GateNavigationTestBase {
     }
 
     @Test
-    public void aCoveredChatIsAlsoLockedByTheBackground() {
-        openSource();
+    public void aCoveredChatIsAlsoLockedByTheBackground_andAsksBeforeItShowsAgain() {
+        final Frag a = openSource();
         open(new Frag("comments", PLAIN, false));
+        final int resumesBefore = a.resumes;
         activityPaused();
         activityStopped();
         activityResumed();
         assertTrue(locked(SOURCE));
-        assertEquals("the covered chat was removed under its child", Collections.singletonList("A"), layout.removedByGate);
-        assertEquals("list, comments", layout.names());
-        back();
-        assertEquals("list", layout.names());
-        assertEquals(0, layout.forcedTransitionEnds);
+        assertEquals("it stays where it is, not on screen", "list, A, comments", layout.names());
+        assertNothingWasPopped();
+
+        assertFalse("Back does not start", layout.closeLast(true));
+        idle();
+        assertEquals("authentication first", SOURCE, pendingReveal().dialog);
+        assertEquals("the chat was not shown", resumesBefore, a.resumes);
+        answerCancel();
+        assertEquals("the user stays on the comments", "list, A, comments", layout.names());
     }
 
     @Test
@@ -581,18 +586,23 @@ public class ProtectedGateNavigationTest extends GateNavigationTestBase {
     public void manualLockWhileACoveringChildIsOpen_authorizationIsClearedAndCanNotBeRevived() {
         final Frag a = openSource();
         final Frag media = open(new Frag("media", 0, false));
+        final int resumesBefore = a.resumes;
 
         manualLock(SOURCE);
         assertTrue(locked(SOURCE));
-        assertEquals("removed silently under its child", "list, media", layout.names());
-        assertEquals(Collections.singletonList("A"), layout.removedByGate);
-        assertEquals(0, layout.forcedTransitionEnds);
-        assertEquals(ProtectedGateLifecycle.NodeState.DESTROYED, a.node.getState());
+        assertEquals("it stays under its child, locked", "list, A, media", layout.names());
+        assertNothingWasPopped();
 
-        back();
-        assertEquals("list", layout.names());
-        assertTrue("returning does not bring it back", locked(SOURCE));
-        assertFalse("and it must authenticate again", layout.present(new Frag("A", SOURCE, false), false, true));
+        // Neither a permission round trip nor anything else on the child restores the authorization.
+        activityPaused();
+        activityResumed();
+        assertTrue(locked(SOURCE));
+
+        assertFalse("Back toward it does not start", layout.closeLast(true));
+        idle();
+        assertEquals("authentication is asked for", SOURCE, pendingReveal().dialog);
+        assertEquals("the chat was not shown", resumesBefore, a.resumes);
+        assertEquals("list, A, media", layout.names());
     }
 
     @Test
@@ -610,9 +620,11 @@ public class ProtectedGateNavigationTest extends GateNavigationTestBase {
         assertEquals(ProtectedChatsState.ForwardPhase.PICKER, state.getForwardPhase(ACC, SOURCE));
         manualLock(SOURCE);
         assertEquals(ProtectedChatsState.ForwardPhase.NONE, state.getForwardPhase(ACC, SOURCE));
-        assertEquals("list, picker", layout.names());
-        back();
-        assertEquals("list", layout.names());
+        assertEquals("the covered chat stays, locked", "list, A, picker", layout.names());
+        assertNothingWasPopped();
+        assertFalse(layout.closeLast(true));
+        idle();
+        assertEquals("Back from the picker asks first", SOURCE, pendingReveal().dialog);
     }
 
     // ================================================================== never pop a fragment that is becoming visible
@@ -621,8 +633,10 @@ public class ProtectedGateNavigationTest extends GateNavigationTestBase {
     public void aLockedChatThatIsRevealedAnywayIsNeverClosedFromInsideTheTransition() {
         final Frag a = openSource();
         open(new Frag("media", 0, false));
-        // The authorization ended without the usual closing (no notification reached the activity).
+        // The authorization ended without the usual closing (no notification reached the activity),
+        // and the reveal is a path the layout does not gate.
         state.relock(ACC, SOURCE);
+        gateRevealEnabled = false;
         idle();
         assertEquals("list, A, media", layout.names());
 
@@ -638,10 +652,11 @@ public class ProtectedGateNavigationTest extends GateNavigationTestBase {
     }
 
     @Test
-    public void aLockedChatRevealedByASwipeIsNotClosedWhileTheSwipeRuns() {
+    public void aLockedChatRevealedByAPathTheLayoutDoesNotGateIsNeverClosedWhileTheSwipeRuns() {
         final Frag a = openSource();
         open(new Frag("media", 0, false));
         state.relock(ACC, SOURCE);
+        gateRevealEnabled = false;                       // stands in for an unforeseen path
         layout.swipeStart();
         idle();
         assertNothingWasPopped();
@@ -652,19 +667,20 @@ public class ProtectedGateNavigationTest extends GateNavigationTestBase {
     }
 
     @Test
-    public void aLockedFragmentFoundWhileATransitionRunsIsClosedWhenItEnded() {
-        final Frag a = openSource();
-        final Frag media = new Frag("media", 0, false);
-        assertTrue(layout.present(media, false, true));       // the transition is running
+    public void aLockedTopFragmentFoundWhileItsOwnTransitionRunsIsClosedWhenItEnded() {
+        final Frag a = new Frag("A", SOURCE, false);
+        protect(SOURCE);
+        authenticate(SOURCE);
+        assertTrue(layout.present(a, false, true));            // A is opening: its transition is running
         state.relock(ACC, SOURCE);
         closeLockedFragments();                                // protectedChatsChanged reached the activity now
         idle();
-        assertEquals("not now: A is second from top in a running transition", Collections.emptyList(), layout.removedByGate);
+        assertEquals("not now: the top fragment of a running transition", Collections.emptyList(), layout.removedByGate);
         assertEquals(0, layout.forcedTransitionEnds);
         layout.transitionEnds();
         idle();
         assertEquals(Collections.singletonList("A"), layout.removedByGate);
-        assertEquals("list, media", layout.names());
+        assertEquals("list", layout.names());
         assertEquals(0, layout.forcedTransitionEnds);
     }
 
@@ -682,7 +698,11 @@ public class ProtectedGateNavigationTest extends GateNavigationTestBase {
         manualLock(SOURCE);
         assertTrue(locked(SOURCE));
         assertFalse("B is not affected by A", locked(PROT_B));
-        assertEquals("list, B", layout.names());
+        assertEquals("A stays under B, locked", "list, A, B", layout.names());
+        assertFalse(layout.closeLast(true));
+        idle();
+        assertEquals("only A is asked for", SOURCE, pendingReveal().dialog);
+        assertEquals(1, reveals.size());
     }
 
     @Test

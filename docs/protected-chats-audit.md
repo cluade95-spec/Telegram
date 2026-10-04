@@ -82,7 +82,7 @@ a chat all the time and the chat is where the user comes back to. `ProtectedGate
 | --- | --- | --- |
 | `VISIBLE` | on screen, in use | a child is presented over it, the host pauses, it is closed |
 | `HOST_PAUSED` | the activity is paused (a system permission dialog, a split-screen focus change, picture-in-picture) but the chat is still what the user sees; not navigation, not leaving | the activity resumes; if it is stopped instead, the app-background boundary applies |
-| `COVERED` | a child fragment (forward picker or destination, channel comments, a profile, a media, search or contact screen) is over it and it is where Back returns to; still in use, still authorized | Back (it becomes `RETURNING`) |
+| `COVERED` | a child fragment (forward picker or destination, channel comments, a profile, a media, search or contact screen) is over it and it is where Back returns to; still in use, still authorized unless the app was backgrounded / the screen turned off / the user locked manually meanwhile (then it stays in the stack locked and Back asks first) | Back (it becomes `RETURNING`, after the gate before reveal if it is locked) |
 | `RETURNING` | resumed while its transition (Back, swipe, predictive back) is still running; nothing is evaluated and nothing is closed mid-transition | the transition ends (`VISIBLE`), a cancelled swipe (`COVERED`) |
 | `LEFT` | genuinely left while its fragment is still in a stack; it is closed as soon as that is safe | - |
 | `DESTROYED` | popped or removed; normal Auto-lock applies from then | - |
@@ -115,24 +115,48 @@ resumed when the gesture starts and paused again when it is given up) are the sa
 
 **Genuine departure** (normal Auto-lock applies from that moment): the chat is closed or removed; the app goes to the
 background (activity stopped, screen off); a manual lock; and a child that opens *another* conversation than the ones that
-belong to the chat's context (another chat or profile opened from the comments, a link to another chat). A chat left that way
-is closed at once if it is not on screen (silently, under its children), whatever the interval: an old instance does not wait
-in a stack to be revealed later, and opening it again goes through the gate (and asks nothing while the interval lasts). The
-forward picker's own screens (a forum's topics) belong to the forward while the picker is open.
+belong to the chat's context (another chat or profile opened from the comments, a link to another chat). A chat left by that
+last kind of departure is closed at once if it is not on screen (silently, under its children), whatever the interval: an old
+instance does not wait in a stack to be revealed later, and opening it again goes through the gate (and asks nothing while the
+interval lasts). A chat whose authorization ended by the app going to the background, the screen turning off or a manual lock
+while a child covered it is different: it stays in the stack (`COVERED`, locked) and the gate before reveal asks when Back
+would show it. The forward picker's own screens (a forum's topics) belong to the forward while the picker is open.
 
-**Never pop what is becoming visible.** The gate closes a fragment that lost its authorization at the moment it loses it (a
-manual lock, the app returning from the background, a departure), when it is not on screen, through `ProtectedChatGate.tryClose`:
-silent removal for a fragment that is not the top or second of its layout, `finishFragment(false)` for the top, and *not now* for
-the top or second fragment of a layout that is in a transition or a swipe, retried when the transition ended
-(`BaseFragment.onBecomeFullyVisible/Hidden` -> `transitionSettled`). Nothing is ever closed from inside the call that resumes a
-fragment. The Build #82 `removeSelfFromStack` in `onFragmentResumed` is gone; a locked fragment that is revealed anyway (no known
-path) is closed after the transition, not during it.
+**Gate before reveal.** A chat that lost its authorization while a child covered it (the app went to the background, a manual
+lock, the screen turned off, a long background past the interval) is *not* closed when the user comes back toward it: it
+stays in the stack, locked, not on screen, and whatever is about to reveal it asks first. The one decision
+(`ProtectedGateLifecycle.blockReveal`, adapted by `ProtectedChatGate.blockReveal`) is made at the earliest point each Back
+path has, before the fragment's view is created or resumed:
+
+| Entry | Earliest point | Locked chat underneath |
+| --- | --- | --- |
+| system back, toolbar back arrow, `finishFragment`, `LaunchActivity.onBackPressed`, tablet panes, bubbles | `ActionBarLayout.closeLastFragment`, right after the delegate/transition checks and before keyboard, container swap, `performCreateView` and `onResume` | the call returns; the authentication sheet is shown; on success the same call runs once |
+| touch swipe back | `ActionBarLayout.onTouchEvent`, before `prepareForMoving` (move threshold and fling) | no gesture starts; the sheet is shown; on success the ordinary animated Back runs |
+| predictive back (Android 13/14+) | `ActionBarLayout.onBackStarted`, before `prepareForMoving` | no preview starts, so nothing of the chat is drawn; `onBackInvoked` then takes the ordinary path (`onBackPressed` -> `closeLastFragment`), which asks |
+
+Authentication uses the existing Chat Lock sheet (`ProtectedChatAuthSheet`, mode UNLOCK). Success unlocks that chat only and
+runs the original navigation once, and only if the same two fragments are still the top two of that stack (a late answer
+after the stack changed, a duplicate answer, or a second Back while the sheet is up does nothing more); cancel changes
+nothing: no transition started, nothing was shown, nothing is closed, the fragment that asked to close is not left marked as
+finishing, and Back again asks again. A chat that is still authorized takes none of this (the check is the authorization
+state, never the fact that a fragment is in a stack).
+
+**Where a fragment is still removed, and why.** Never from the call that resumes a fragment and never by completing a
+transition early (`ActionBarLayout.removeFragmentFromStack` does that). Only `ProtectedChatGate.tryClose` removes, and only
+for these: (1) the top fragment when it lost its authorization while the user was away (the app came back, a manual lock)
+together with the locked fragments directly under it, since it is on screen and cannot stay and the ones under it would need
+their own sheet to be revealed; (2) the fragments of a chat the user genuinely left (`release`: another conversation opened
+from a child), which are off screen and must not wait to be revealed; (3) a last-resort fallback for a reveal no layout hook
+gates (none is known): the chat is closed after its transition. Non-top fragments go away silently (`removeSelfFromStack`);
+the top one with `finishFragment(false)`; "not now" while the top or second fragment of a layout is in a transition or
+swipe, retried when `onBecomeFullyVisible/Hidden` reports it ended. A locked fragment that is merely covered is not removed.
 
 **Security boundaries kept.** The app background, the screen turning off, a manual lock, Auto-lock after a genuine departure and
 after the activity was stopped, a locked chat being asked for before it is created (the gate in front of `presentFragment`,
 `addFragmentToStack`, sheets and the right-sliding container, which is what notification, deep-link, share and restored-state
 entries go through), authorization that does not survive the process, and a protected chat opened as a child (comments, a
-forward destination) being gated and authorized on its own account, independently of the chat it was opened from.
+forward destination) being gated and authorized on its own account, independently of the chat it was opened from. A stale
+fragment in a stack grants nothing: every reveal is decided by the authorization state.
 
 **Audit of what takes the top position from a chat** (read from the code; `CA` = `ChatActivity`, `AB` = `ActionBarLayout`,
 `LA` = `LaunchActivity`). The gate treats each mechanism, not each screen:

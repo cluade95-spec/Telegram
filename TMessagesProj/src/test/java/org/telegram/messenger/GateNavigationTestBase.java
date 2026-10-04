@@ -28,6 +28,9 @@ import java.util.Map;
  *       cancelled gesture pauses it again, a completed one pauses and destroys the top;</li>
  *   <li>removeFragmentFromStack: completes a running transition first (counted as a forced end),
  *       then pops; the gate must never make it do that;</li>
+ *   <li>gate before reveal: closeLastFragment, a swipe start and a predictive back start ask the
+ *       gate before the fragment below is touched; the authentication sheet is a stand-in that a
+ *       test answers ({@link #answerUnlock}, {@link #answerCancel});</li>
  *   <li>the activity: onPause forwards a pause to the top fragment inside the host-lifecycle window,
  *       onStop is the app-background boundary, onResume applies the foreground rules, closes what
  *       lost its authorization and resumes the top fragment (the order of LaunchActivity).</li>
@@ -57,6 +60,41 @@ public abstract class GateNavigationTestBase {
     protected Layout layout;
     protected Frag list;
     private Map<String, String> storage;
+
+    /** The gate before reveal runs (a test turns it off to stand in for a path the layout does not gate). */
+    protected boolean gateRevealEnabled = true;
+    /** Authentication sheets the gate asked for, in order. */
+    protected final List<Reveal> reveals = new ArrayList<>();
+
+    protected static final class Reveal {
+        public final long dialog;
+        final Runnable onUnlocked;
+        final Runnable onCancelled;
+        boolean answered;
+
+        Reveal(long dialog, Runnable onUnlocked, Runnable onCancelled) {
+            this.dialog = dialog;
+            this.onUnlocked = onUnlocked;
+            this.onCancelled = onCancelled;
+        }
+    }
+
+    private final ProtectedGateLifecycle.Authenticator sheet = new ProtectedGateLifecycle.Authenticator() {
+        @Override
+        public boolean isShowing() {
+            for (Reveal r : reveals) {
+                if (!r.answered) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        @Override
+        public void ask(long accountKey, long dialogId, Runnable onUnlocked, Runnable onCancelled) {
+            reveals.add(new Reveal(dialogId, onUnlocked, onCancelled));
+        }
+    };
 
     private ProtectedChatsState newState() {
         return new ProtectedChatsState(new ProtectedChatsState.Storage() {
@@ -91,6 +129,8 @@ public abstract class GateNavigationTestBase {
         now = 100_000;
         storage = new HashMap<>();
         posted.clear();
+        reveals.clear();
+        gateRevealEnabled = true;
         state = newState();
         assertEquals(ProtectedChatsState.Result.OK, state.enableFeature());
         assertTrue(state.setRelockSeconds(ProtectedChatsState.RELOCK_IMMEDIATELY));
@@ -109,6 +149,7 @@ public abstract class GateNavigationTestBase {
     /** The process died and started again: protections persist, authorizations do not. */
     protected void restartProcess() {
         posted.clear();
+        reveals.clear();
         state = newState();
         startProcess();
     }
@@ -123,6 +164,8 @@ public abstract class GateNavigationTestBase {
         public final ProtectedGateLifecycle.Node node = new ProtectedGateLifecycle.Node();
         Layout parent;
         public boolean destroyed;
+        /** How often the layout resumed it (that is when its view becomes visible). */
+        public int resumes;
 
         public Frag(String name, long dialog, boolean picker) {
             this.name = name;
@@ -132,6 +175,7 @@ public abstract class GateNavigationTestBase {
 
         // BaseFragment.onResume / onPause / onFragmentDestroy / onBecomeFullyVisible|Hidden through ProtectedChatGate
         void onResume() {
+            resumes++;
             if (node.isRegistered()) {
                 gate.resumed(node);
             }
@@ -232,6 +276,10 @@ public abstract class GateNavigationTestBase {
             }
             final Frag current = top();
             final Frag previous = below();
+            // ProtectedChatGate.blockReveal, at the top of ActionBarLayout.closeLastFragment
+            if (previous != null && revealBlocked(current, previous, () -> closeLast(animated))) {
+                return false;
+            }
             if (previous != null) {
                 previous.onResume();
             }
@@ -260,10 +308,61 @@ public abstract class GateNavigationTestBase {
             }
         }
 
-        /** prepareForMoving (swipe, predictive back start): the previous fragment is resumed when the gesture starts. */
-        public void swipeStart() {
+        /**
+         * A touch swipe starts (ActionBarLayout.onTouchEvent -> protectedBackBlocked -> prepareForMoving):
+         * the previous fragment is resumed when the gesture starts, unless the gate before reveal
+         * blocks it (then authentication is asked for and no gesture starts).
+         *
+         * @return whether the gesture started
+         */
+        public boolean swipeStart() {
+            if (revealBlocked(top(), below(), () -> closeLast(true))) {
+                return false;
+            }
             swipePrevious = below();
             swipePrevious.onResume();
+            return true;
+        }
+
+        /**
+         * A predictive back starts (ActionBarLayout.onBackStarted): no preview of a locked chat; the
+         * ordinary Back that follows (onBackInvoked -> onBackPressed) asks for authentication.
+         *
+         * @return whether the preview started
+         */
+        public boolean predictiveStart() {
+            if (gateRevealEnabled && gate.revealsLockedChat(ACC, below().dialog)) {
+                return false;
+            }
+            swipePrevious = below();
+            swipePrevious.onResume();
+            return true;
+        }
+
+        /** onBackInvoked: the preview completes, or, if none started, an ordinary animated Back. */
+        public void predictiveInvoked(boolean started) {
+            if (started) {
+                swipeComplete();
+            } else {
+                closeLast(true);
+            }
+        }
+
+        /** onBackCancelled. */
+        public void predictiveCancelled(boolean started) {
+            if (started) {
+                swipeCancel();
+            }
+        }
+
+        private boolean revealBlocked(Frag current, Frag previous, Runnable proceed) {
+            return gateRevealEnabled && previous.dialog != 0
+                    && gate.blockReveal(ACC, previous.dialog, sheet, () -> stillOnTop(current, previous), proceed);
+        }
+
+        private boolean stillOnTop(Frag current, Frag previous) {
+            final int size = stack.size();
+            return size >= 2 && stack.get(size - 1) == current && stack.get(size - 2) == previous && !current.destroyed && !previous.destroyed;
         }
 
         /** onSlideAnimationEnd(backAnimation = true): the gesture was given up. */
@@ -321,6 +420,11 @@ public abstract class GateNavigationTestBase {
             }
             removedByGate.add(f.name);
             if (index == stack.size() - 1 && stack.size() > 1) {
+                for (int below = index - 1; below >= 0 && isLockedFrag(stack.get(below)); below--) {
+                    final Frag under = stack.get(below);
+                    removedByGate.add(under.name);
+                    removeFragmentFromStack(under);
+                }
                 closeLast(false);
             } else {
                 removeFragmentFromStack(f);
@@ -399,12 +503,47 @@ public abstract class GateNavigationTestBase {
     /** ProtectedChatGate.closeLockedFragments, as LaunchActivity.closeLockedProtectedChats runs it. */
     protected void closeLockedFragments() {
         final List<Frag> copy = new ArrayList<>(layout.stack);
-        Collections.reverse(copy);
-        for (Frag f : copy) {
-            if (f.dialog != 0 && state.isLockedProtected(ACC, f.dialog)) {
-                gate.closeLocked(f.node, () -> layout.tryClose(f));
+        int bottomOfRun = copy.size();
+        while (bottomOfRun > 0 && isLockedFrag(copy.get(bottomOfRun - 1))) {
+            bottomOfRun--;
+        }
+        for (int i = bottomOfRun; i < copy.size(); i++) {
+            final Frag f = copy.get(i);
+            gate.closeLocked(f.node, () -> layout.tryClose(f));
+        }
+    }
+
+    protected boolean isLockedFrag(Frag f) {
+        return f.dialog != 0 && state.isLockedProtected(ACC, f.dialog);
+    }
+
+    /** The authentication sheet that is up, or null. */
+    protected Reveal pendingReveal() {
+        for (Reveal r : reveals) {
+            if (!r.answered) {
+                return r;
             }
         }
+        return null;
+    }
+
+    /** The user types the passcode: the state unlocks the chat and the original navigation runs. */
+    protected void answerUnlock() {
+        final Reveal r = pendingReveal();
+        assertTrue("an authentication sheet is up", r != null);
+        r.answered = true;
+        authenticate(r.dialog);
+        r.onUnlocked.run();
+        idle();
+    }
+
+    /** The sheet is dismissed. */
+    protected void answerCancel() {
+        final Reveal r = pendingReveal();
+        assertTrue("an authentication sheet is up", r != null);
+        r.answered = true;
+        r.onCancelled.run();
+        idle();
     }
 
     /** ProtectedChats.relock: the state changes, protectedChatsChanged closes what is locked. */

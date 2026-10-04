@@ -163,6 +163,12 @@ public final class ProtectedChatGate {
             return false;
         }
         if (index == stack.size() - 1 && stack.size() > 1) {
+            // Closing the top fragment reveals the one under it; a locked one there would need its own
+            // authentication (see blockReveal) and the top fragment could not be closed meanwhile, so
+            // those go first. They are not on screen: removing them is silent.
+            for (int below = index - 1; below >= 0 && isLocked(stack.get(below)); below--) {
+                stack.get(below).removeSelfFromStack();
+            }
             fragment.finishFragment(false);
         } else {
             fragment.removeSelfFromStack();
@@ -326,10 +332,65 @@ public final class ProtectedChatGate {
     }
 
     /**
-     * Closes every fragment of the given layouts that shows a protected dialog which is no longer
-     * authorized (authorization expired, manual re-lock, app returned from background). Fragments
-     * that are not on screen are removed silently; the top fragment, or one involved in a running
-     * transition, is closed once that transition ended (never by cutting it short).
+     * Gate before reveal. Back ({@code ActionBarLayout.closeLastFragment}: system back, toolbar back,
+     * {@code finishFragment}), a swipe back and the start of a predictive back are about to reveal
+     * {@code previous}, the fragment under {@code current}. If that is a protected chat that is locked
+     * right now, the operation does not start: the existing authentication sheet is shown instead and
+     * {@code proceed} (the original operation) runs once after a successful authentication, if the two
+     * fragments are still on top of the stack. A cancel leaves the user on {@code current}; nothing is
+     * closed and nothing of the protected chat has been shown.
+     *
+     * @return true when the caller must not start the operation
+     */
+    public static boolean blockReveal(INavigationLayout layout, BaseFragment current, BaseFragment previous, Activity activity, Runnable proceed) {
+        final long dialogId = getDialogId(previous);
+        if (dialogId == 0) {
+            return false;
+        }
+        final int account = previous.getCurrentAccount();
+        final ProtectedGateLifecycle.Authenticator auth = activity == null ? null : new ProtectedGateLifecycle.Authenticator() {
+            @Override
+            public boolean isShowing() {
+                return ProtectedChatAuthSheet.isShowing();
+            }
+
+            @Override
+            public void ask(long accountKey, long dialog, Runnable onUnlocked, Runnable onCancelled) {
+                authenticate(activity, null, account, dialog, ProtectedChatAuthSheet.Mode.UNLOCK, onUnlocked, onCancelled);
+            }
+        };
+        final boolean blocked = ProtectedChats.lifecycle().blockReveal(ProtectedChats.accountKey(account), dialogId, auth,
+                () -> isStillOnTop(layout, current, previous), proceed);
+        if (blocked) {
+            // BaseFragment.finishFragment marked the fragment as finishing before asking the layout to close it
+            current.setFinishing(false);
+        }
+        return blocked;
+    }
+
+    private static boolean isStillOnTop(INavigationLayout layout, BaseFragment current, BaseFragment previous) {
+        final java.util.List<BaseFragment> stack = layout.getFragmentStack();
+        final int size = stack == null ? 0 : stack.size();
+        return size >= 2 && stack.get(size - 1) == current && stack.get(size - 2) == previous && !current.isFinished && !previous.isFinished;
+    }
+
+    /**
+     * Whether Back would reveal a protected chat that is locked right now (the predictive back
+     * preview asks this before it shows anything of the fragment under the top one).
+     */
+    public static boolean revealsLockedChat(BaseFragment previous) {
+        final long dialogId = getDialogId(previous);
+        return dialogId != 0 && ProtectedChats.lifecycle().revealsLockedChat(ProtectedChats.accountKey(previous.getCurrentAccount()), dialogId);
+    }
+
+    /**
+     * Closes what lost its authorization and is on screen or in the way, after the app came back from
+     * the background or a manual lock: the top fragment of each layout when it shows a locked protected
+     * dialog, together with the locked fragments directly under it. A locked fragment that is covered
+     * by something that is not locked stays where it is; it is not visible, and whatever reveals it
+     * is gated (see {@link #blockReveal}): the user is asked to authenticate instead of losing the
+     * chat. The top fragment, or one involved in a running transition, is closed once that
+     * transition ended (never by cutting it short).
      */
     public static void closeLockedFragments(java.util.List<INavigationLayout> layouts) {
         for (INavigationLayout layout : layouts) {
@@ -340,11 +401,14 @@ public final class ProtectedChatGate {
                 continue;
             }
             ArrayList<BaseFragment> stack = new ArrayList<>(layout.getFragmentStack());
-            for (int i = stack.size() - 1; i >= 0; i--) {
+            int bottomOfRun = stack.size();
+            while (bottomOfRun > 0 && isLocked(stack.get(bottomOfRun - 1))) {
+                bottomOfRun--;
+            }
+            // from the bottom of the locked run up, so that closing the top never reveals a locked one
+            for (int i = bottomOfRun; i < stack.size(); i++) {
                 final BaseFragment fragment = stack.get(i);
-                if (isLocked(fragment)) {
-                    ProtectedChats.lifecycle().closeLocked(fragment.protectedGate, () -> tryClose(fragment));
-                }
+                ProtectedChats.lifecycle().closeLocked(fragment.protectedGate, () -> tryClose(fragment));
             }
         }
     }

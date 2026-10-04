@@ -41,9 +41,19 @@ import java.util.Map;
  * such as pickers or media are related; another chat or profile is not). Where a countdown applies
  * (Auto-lock intervals) it starts from that moment.
  *
- * <p>Nothing is ever popped because a fragment is becoming visible again: a chat that lost its
- * authorization is closed at the moment it loses it (it is not on screen then) or, if the layout is
- * in the middle of a transition, as soon as that transition ended (see {@link Closer}).
+ * <p><b>Gate before reveal.</b> A chat that lost its authorization while it was covered by a child
+ * (the app went to the background, a manual lock, the screen turned off) stays where it is in the
+ * stack. Whatever is about to reveal it (Back, a swipe, the start of a predictive back) asks
+ * {@link #blockReveal} first: while the chat is locked, the navigation does not start, the existing
+ * authentication sheet is shown, and the original navigation runs once if (and only if) the user
+ * authenticates and the stack is still what it was; cancelling leaves the user where they are. The
+ * protected content is never made visible and then removed.
+ *
+ * <p>What is closed is what is on screen or in the way: the top fragment when it lost its
+ * authorization (the app came back, a manual lock) together with the locked fragments directly under
+ * it (revealing them would need the same authentication), and the fragments of a chat the user
+ * genuinely left. Nothing is ever popped from inside the call that resumes a fragment, and nothing
+ * by completing a transition early (see {@link Closer}).
  *
  * <p>Each dialog has its own authorization ({@code ProtectedChatsState}); the nodes of different
  * dialogs never share state, so a destination, a comments chat or a child that shows another
@@ -67,6 +77,15 @@ public final class ProtectedGateLifecycle {
      */
     public interface Closer {
         boolean tryClose();
+    }
+
+    /** The existing authentication UI, as the gate before reveal uses it. */
+    public interface Authenticator {
+        /** An authentication sheet is already up: the navigation that asked is swallowed. */
+        boolean isShowing();
+
+        /** Shows the sheet; exactly one of the callbacks runs, once. */
+        void ask(long accountKey, long dialogId, Runnable onUnlocked, Runnable onCancelled);
     }
 
     public enum NodeState {
@@ -385,6 +404,56 @@ public final class ProtectedGateLifecycle {
                 leave(node, accountKey, dialogId);
             }
         }
+    }
+
+    // ------------------------------------------------------------------ gate before reveal
+
+    /**
+     * Whether revealing a fragment that shows this dialog (Back, a swipe, a predictive back preview)
+     * would expose a chat that is protected and locked right now. The authority is the authorization
+     * state, never the fact that a fragment is still somewhere in a stack.
+     */
+    public boolean revealsLockedChat(long accountKey, long dialogId) {
+        return dialogId != 0 && state.isLockedProtected(accountKey, dialogId);
+    }
+
+    /**
+     * A navigation operation is about to reveal the fragment that shows {@code dialogId}.
+     *
+     * @param auth       the authentication UI; null when there is no way to ask (the reveal stays
+     *                   blocked: secure failure)
+     * @param stillThere whether the stack is still what it was when the operation was blocked (the
+     *                   same fragment on top and the same one under it); checked when the
+     *                   authentication succeeds so that a stale answer never closes a different fragment
+     * @param proceed    the original operation, started again from the top
+     * @return true when the operation must not start now. The authentication sheet is shown (once,
+     * even if Back is pressed again meanwhile) and {@code proceed} runs once after a successful
+     * authentication; a cancel runs nothing and changes nothing.
+     */
+    public boolean blockReveal(long accountKey, long dialogId, Authenticator auth, java.util.function.BooleanSupplier stillThere, Runnable proceed) {
+        if (!revealsLockedChat(accountKey, dialogId)) {
+            return false;
+        }
+        if (auth == null || auth.isShowing()) {
+            return true;
+        }
+        poster.post(() -> {
+            if (!state.isLockedProtected(accountKey, dialogId) || auth.isShowing()) {
+                // authorized in the meantime, or another sheet won the race: nothing to ask
+                return;
+            }
+            final boolean[] done = new boolean[1];
+            auth.ask(accountKey, dialogId, () -> {
+                if (done[0]) {
+                    return;
+                }
+                done[0] = true;
+                if (stillThere.getAsBoolean()) {
+                    proceed.run();
+                }
+            }, () -> done[0] = true);
+        });
+        return true;
     }
 
     // ------------------------------------------------------------------ leaving and closing

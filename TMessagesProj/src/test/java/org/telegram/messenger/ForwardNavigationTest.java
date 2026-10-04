@@ -616,10 +616,15 @@ public class ForwardNavigationTest extends GateNavigationTestBase {
         activityResumed();
         assertTrue("the normal lock applies", locked(SOURCE));
 
-        // The locked chat was removed silently when the app came back, before anything could show it.
-        assertEquals(Collections.singletonList("A"), layout.removedByGate);
-        assertEquals("list, picker", layout.names());
-        assertEquals(0, layout.forcedTransitionEnds);
+        // The locked chat is under the picker, not on screen: it is neither shown nor removed. Back from
+        // the picker toward it asks for authentication first.
+        assertNothingWasPopped();
+        assertEquals("list, A, picker", layout.names());
+        assertTrue(layout.closeLast(true) == false);
+        idle();
+        assertEquals("A was not revealed again", 1, a.resumes);
+        assertEquals(SOURCE, pendingReveal().dialog);
+        assertEquals("list, A, picker", layout.names());
     }
 
     @Test
@@ -636,8 +641,12 @@ public class ForwardNavigationTest extends GateNavigationTestBase {
         assertEquals(ProtectedChatsState.ForwardPhase.NONE, phase());
         activityResumed();
         assertTrue(locked(SOURCE));
-        assertEquals(Collections.singletonList("A"), layout.removedByGate);
-        assertEquals(0, layout.forcedTransitionEnds);
+        assertNothingWasPopped();
+        assertEquals("list, A, B", layout.names());
+        assertTrue(layout.closeLast(true) == false);     // Back from the destination toward the locked source
+        idle();
+        assertEquals(SOURCE, pendingReveal().dialog);
+        assertEquals("authentication before the source shows", "list, A, B", layout.names());
     }
 
     @Test
