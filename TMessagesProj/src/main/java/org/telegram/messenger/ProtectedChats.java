@@ -242,15 +242,20 @@ public class ProtectedChats {
         return lifecycle;
     }
 
+    /**
+     * The app went to the background (the activity stopped, the screen turned off): the one point where
+     * every open chat stops being in use. An activity that is only paused (a system permission dialog
+     * over it) is not the background; see {@link ProtectedGateLifecycle#hostLifecycle}.
+     */
     public static void onAppPaused() {
         if (state().protectedCount() > 0) {
-            state().appPaused();
+            lifecycle().appBackgrounded();
         }
     }
 
     public static void onAppResumed() {
         if (state().protectedCount() > 0) {
-            state().appResumed();
+            lifecycle().appForegrounded();
             notifyChanged();
         }
     }

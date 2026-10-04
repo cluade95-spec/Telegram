@@ -70,6 +70,70 @@ keeps its normal structure for every peer (own profile, users, groups, channels,
   hosts the protected shared media. The own profile is never gated as a whole.
 * App Lock state, the credential and the locked/unlocked state never decide whether an unrelated profile feature is shown.
 
+## Lifecycle of an open protected chat (device QA, build #82)
+
+Build #82 kicked the user out of an authorized protected chat when Android showed a camera or microphone permission
+dialog, when a channel's comments were opened and closed, and in the three forward flows. One mistake sat under all of
+them: *"the fragment was paused or covered" was treated as "the user left the chat"*. Telegram and Android put things above
+a chat all the time and the chat is where the user comes back to. `ProtectedGateLifecycle` (pure Java, driven by
+`ProtectedChatGate`) now models this explicitly. A fragment that shows a protected dialog is a node in one of these states:
+
+| State | Meaning | Left by |
+| --- | --- | --- |
+| `VISIBLE` | on screen, in use | a child is presented over it, the host pauses, it is closed |
+| `HOST_PAUSED` | the activity is paused (a system permission dialog, a split-screen focus change, picture-in-picture) but the chat is still what the user sees; not navigation, not leaving | the activity resumes; if it is stopped instead, the app-background boundary applies |
+| `COVERED` | a child fragment (forward picker or destination, channel comments, a profile, a media, search or contact screen) is over it and it is where Back returns to; still in use, still authorized | Back (it becomes `RETURNING`) |
+| `RETURNING` | resumed while its transition (Back, swipe, predictive back) is still running; nothing is evaluated and nothing is closed mid-transition | the transition ends (`VISIBLE`), a cancelled swipe (`COVERED`) |
+| `LEFT` | genuinely left while its fragment is still in a stack; it is closed as soon as that is safe | - |
+| `DESTROYED` | popped or removed; normal Auto-lock applies from then | - |
+
+**System permission dialogs.** `Activity.requestPermissions` shows the permission controller's translucent dialog over the
+activity: `LaunchActivity.onPause` runs, `onStop` does not, and the result arrives in `onRequestPermissionsResult` just before
+`onResume`. Build #82 had two places that read `onPause` as "the app left": `ActionBarLayout.onPause` forwarded it to the top
+chat as an ordinary fragment pause (starting the Immediate countdown for that chat), and `LaunchActivity.onPasscodePause`
+called `ProtectedChats.onAppPaused`, marking every open chat as backgrounded. `onResume` then found the chat locked and the
+gate closed it. Now `ActionBarLayout.onPause/onResume` run the forwarded host lifecycle inside
+`ProtectedChatGate.hostLifecycle(true/false)`, so a fragment paused there is `HOST_PAUSED`, not covered; and the
+app-background boundary (`ProtectedChats.onAppPaused`) moved to what really is the background: `LaunchActivity.onStop`,
+`BubbleActivity.onStop` and the screen turning off. Allow, Deny and a dismissed dialog are the same lifecycle (the gate never
+sees the answer). No timer, no per-permission case: the camera, the microphone, a circle message, the attachment menu and any
+future permission are the same pause without a stop. If the activity is stopped (Home pressed over the dialog) the normal
+background boundary wins: Immediate Auto-lock applies on return, and a timed interval counts from the stop. A system activity
+that stops the app (file picker, the camera app) keeps the existing rule: its result (`onActivityResult`) revives chats that
+were open; a permission UI of a device vendor that fully covers the app is, like any app switch, a background.
+
+**Channel comments and every other child.** The comments are a `ChatActivity` of the linked discussion chat pushed over the
+channel. In build #82 the channel's pause started the Immediate countdown, it locked, and Back resumed a locked chat, which the
+gate closed with `removeSelfFromStack` while `closeLastFragment`'s transition was running (`removeFragmentFromStack` completes a
+running transition first): the glitch, then the kick. Now covering is not leaving. `ActionBarLayout.presentFragment` tells the
+gate what it presents over (`ProtectedChatGate.onFragmentPresented`); a fragment presented over a protected chat that is in
+use is its child, and so is anything opened from a child as long as it shows no other conversation than the ones that belong to
+the chat's context (the chat's own dialog, the dialog the child shows, screens that are not a conversation: pickers, media,
+search, settings). The chat stays authorized and counted as open however long the child stays, for every Auto-lock interval.
+Back, system back, the toolbar arrow, a completed swipe or predictive back, and a cancelled one (the previous fragment is
+resumed when the gesture starts and paused again when it is given up) are the same `COVERED` / `RETURNING` transitions.
+
+**Genuine departure** (normal Auto-lock applies from that moment): the chat is closed or removed; the app goes to the
+background (activity stopped, screen off); a manual lock; and a child that opens *another* conversation than the ones that
+belong to the chat's context (another chat or profile opened from the comments, a link to another chat). A chat left that way
+is closed at once if it is not on screen (silently, under its children), whatever the interval: an old instance does not wait
+in a stack to be revealed later, and opening it again goes through the gate (and asks nothing while the interval lasts). The
+forward picker's own screens (a forum's topics) belong to the forward while the picker is open.
+
+**Never pop what is becoming visible.** The gate closes a fragment that lost its authorization at the moment it loses it (a
+manual lock, the app returning from the background, a departure), when it is not on screen, through `ProtectedChatGate.tryClose`:
+silent removal for a fragment that is not the top or second of its layout, `finishFragment(false)` for the top, and *not now* for
+the top or second fragment of a layout that is in a transition or a swipe, retried when the transition ended
+(`BaseFragment.onBecomeFullyVisible/Hidden` -> `transitionSettled`). Nothing is ever closed from inside the call that resumes a
+fragment. The Build #82 `removeSelfFromStack` in `onFragmentResumed` is gone; a locked fragment that is revealed anyway (no known
+path) is closed after the transition, not during it.
+
+**Security boundaries kept.** The app background, the screen turning off, a manual lock, Auto-lock after a genuine departure and
+after the activity was stopped, a locked chat being asked for before it is created (the gate in front of `presentFragment`,
+`addFragmentToStack`, sheets and the right-sliding container, which is what notification, deep-link, share and restored-state
+entries go through), authorization that does not survive the process, and a protected chat opened as a child (comments, a
+forward destination) being gated and authorized on its own account, independently of the chat it was opened from.
+
 ## Forwarding and sharing
 
 **Destination rule** (`ForwardDestinations`, one rule for every kind of destination: users, bots, groups, supergroups,
@@ -95,27 +159,27 @@ forward; none of them is the user leaving the source chat. Phases, per source di
 
 | Phase | Source chat | Starts | Ends |
 | --- | --- | --- | --- |
-| `NONE` (source visible, or no forward) | shown or covered by ordinary navigation | - | - |
-| `PICKER` (`FORWARD_PICKER_OPEN`; a destination's `FORWARD_AUTH_OPEN` sheet is only a layer over it) | covered by the picker, not left | `ActionBarLayout.presentFragment` -> `ProtectedChatGate.onForwardPickerPresented`, only for a forward picker over a protected dialog that is authorized and visible | picker destroyed (`CANCELLED` when the source was shown again first: Back, system/toolbar/gesture back), source destroyed, app paused, manual lock |
+| `NONE` (source visible, or no forward) | shown, or covered by a child | - | - |
+| `PICKER` (`FORWARD_PICKER_OPEN`; a destination's `FORWARD_AUTH_OPEN` sheet is only a layer over it) | covered by the picker, not left | `ActionBarLayout.presentFragment` -> `ProtectedChatGate.onFragmentPresented`, only for a forward picker over a protected dialog that is authorized and visible | picker destroyed (`CANCELLED` when the source was shown again first: Back, system/toolbar/gesture back), source destroyed, app paused, manual lock |
 | `HANDING_OVER` (`RETURNING_TO_SOURCE`) | covered | `DialogsActivity.notifyDelegate` before `didSelectDialogs` | the delegate returns (`forwardSettled`, in a `finally`) |
 | `DESTINATION` (`DESTINATION_OPENED`) | covered by the destination chat | settle: a chat is on top of the source | destination paused or destroyed, source destroyed, app paused, manual lock |
 | `COMPLETING` (`FORWARD_COMPLETION_UI`) | shown again, success/tag UI on it | settle: the picker returned to the source | bulletin/undo view hidden, any navigation away, next forward, app paused, source destroyed |
 
-Why a cancel is not special: coming back on screen is itself the event that makes the cover not count. The cover is
-only *deferred* while the forward runs (`chatLeft` records when it happened); showing the source again
-(`chatEntered`) discards the deferral, so Back from the picker, Back from the destination and a forward that returns to the
-source all find the chat as it was. Nothing is decided at resume time: build #82 resolved the hold when the source resumed
+Why a cancel is not special: the picker and the destination are children of the source, and a covered chat is not left (see
+the lifecycle section above); so Back from the picker, Back from the destination and a forward that returns to the source all
+find the chat as it was. The forward phases add the transaction's own bookkeeping on top: if the user does leave while a
+forward is open (the chat is released), the forward ends with it. Nothing is decided at resume time: build #82 resolved the hold when the source resumed
 (`ProtectedChatGate.onFragmentResumed` called `forwardPickerClosed`), which applied the Immediate Auto-lock, and the chat
 gate then closed the freshly resumed source with `removeSelfFromStack` while the Back animation was still running
 (`ActionBarLayout.removeFragmentFromStack` completes the running transition, then closes the chat); and it abandoned the
 hold as soon as a destination opened, so Back from the destination met a locked source.
 
-The deferral is applied (the cover counts as leaving, from when it began) only when the forward ends with the source still
-covered: the picker destroyed while something else is on top, the destination left for unrelated navigation (a profile, another
-chat), the app going to the background. A chat that was only covered by its forward is not revived by a return from a
+A destination that opens *another conversation* (a chat or profile) takes the user out of the source's context: the source is
+left and normal Auto-lock applies from then (it is closed under the destination, silently). A screen that shows no other
+conversation (a profile of the destination's own chat, media, search) does not. The app going to the background, a manual
+lock and the source being closed end the forward; a chat that was only covered by its forward is not revived by a return from a
 system activity. The swipe-back preview resumes the source when the swipe starts and pauses it again when the swipe is given
-up: the deferral is discarded and recorded again, and the phase is untouched until the picker or destination is actually
-destroyed.
+up: the phase is untouched until the picker or destination is actually destroyed.
 
 The hold does not depend on the screen type: any fragment that shows a protected dialog which is authorized and visible
 right now (a chat, a profile with its shared media, the chat behind the photo viewer) can start it. A screen that is not gated
@@ -125,6 +189,6 @@ source dialog, every transition is addressed to one dialog, a destination's own 
 there is no global "current forward chat". The hold never authorizes another chat or Saved Messages and uses no timer.
 Destination authentication is unchanged: a selection of several chats asks for each locked protected destination in turn,
 remembers what the user unlocked for it while its own restart runs, and sends once; a cancel sends nothing; Saved Messages
-stays write-only and the tag-emoji completion is kept. `ActionBarLayout.presentFragment` is involved only to *start* the
-transaction (it knows which fragment a picker is presented over); Back, destination and completion are decided by the fragment
-lifecycle callbacks every kind of back navigation goes through (`closeLastFragment`, the swipe-back animation).
+stays write-only and the tag-emoji completion is kept. `ActionBarLayout.presentFragment` is involved only to record who
+covers whom and to start the transaction; Back, destination and completion are decided by the fragment lifecycle callbacks
+every kind of back navigation goes through (`closeLastFragment`, the swipe-back animation).

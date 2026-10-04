@@ -1006,12 +1006,18 @@ public class ActionBarLayout extends FrameLayout implements INavigationLayout, F
 //                onOpenAnimationEnd();
 //            }
 //        }
-        if (!fragmentsStack.isEmpty()) {
-            BaseFragment lastFragment = fragmentsStack.get(fragmentsStack.size() - 1);
-            lastFragment.onResume();
-        }
-        if (sheetFragment != null) {
-            sheetFragment.onResume();
+        // The activity's own resume: not navigation (see ProtectedGateLifecycle.hostLifecycle).
+        ProtectedChatGate.hostLifecycle(true);
+        try {
+            if (!fragmentsStack.isEmpty()) {
+                BaseFragment lastFragment = fragmentsStack.get(fragmentsStack.size() - 1);
+                lastFragment.onResume();
+            }
+            if (sheetFragment != null) {
+                sheetFragment.onResume();
+            }
+        } finally {
+            ProtectedChatGate.hostLifecycle(false);
         }
     }
 
@@ -1028,12 +1034,19 @@ public class ActionBarLayout extends FrameLayout implements INavigationLayout, F
 
     @Override
     public void onPause() {
-        if (!fragmentsStack.isEmpty()) {
-            BaseFragment lastFragment = fragmentsStack.get(fragmentsStack.size() - 1);
-            lastFragment.onPause();
-        }
-        if (sheetFragment != null) {
-            sheetFragment.onPause();
+        // The activity's own pause (a system permission dialog pauses it without stopping it): not
+        // navigation, see ProtectedGateLifecycle.hostLifecycle.
+        ProtectedChatGate.hostLifecycle(true);
+        try {
+            if (!fragmentsStack.isEmpty()) {
+                BaseFragment lastFragment = fragmentsStack.get(fragmentsStack.size() - 1);
+                lastFragment.onPause();
+            }
+            if (sheetFragment != null) {
+                sheetFragment.onPause();
+            }
+        } finally {
+            ProtectedChatGate.hostLifecycle(false);
         }
     }
 
@@ -2002,7 +2015,7 @@ public class ActionBarLayout extends FrameLayout implements INavigationLayout, F
         boolean needAnimation = preview || !forceWithoutAnimation && MessagesController.getGlobalMainSettings().getBoolean("view_animations", true);
 
         final BaseFragment currentFragment = !fragmentsStack.isEmpty() ? fragmentsStack.get(fragmentsStack.size() - 1) : null;
-        ProtectedChatGate.onForwardPickerPresented(fragment, currentFragment);
+        ProtectedChatGate.onFragmentPresented(fragment, currentFragment, removeLast);
 
         fragment.setParentLayout(this);
         View fragmentView = fragment.fragmentView;

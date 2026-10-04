@@ -224,6 +224,14 @@ public class BubbleActivity extends BasePermissionsActivity implements INavigati
     }
 
     @Override
+    protected void onStop() {
+        super.onStop();
+        // No longer visible: the background boundary. onPause alone is not (a system permission
+        // dialog pauses the activity and leaves it on screen).
+        org.telegram.messenger.ProtectedChats.onAppPaused();
+    }
+
+    @Override
     protected void onDestroy() {
         super.onDestroy();
         if (currentAccount != -1) {
@@ -276,7 +284,6 @@ public class BubbleActivity extends BasePermissionsActivity implements INavigati
     }
 
     private void onPasscodePause() {
-        org.telegram.messenger.ProtectedChats.onAppPaused();
         if (lockRunnable != null) {
             AndroidUtilities.cancelRunOnUIThread(lockRunnable);
             lockRunnable = null;

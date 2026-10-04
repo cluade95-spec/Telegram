@@ -6805,6 +6805,9 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
     protected void onStop() {
         super.onStop();
         isStarted = false;
+        // The activity is no longer visible: the app is in the background. (onPause alone is not: a
+        // system permission dialog pauses the activity and leaves it on screen.)
+        ProtectedChats.onAppPaused();
         pipActivityHandler.onStop();
         Browser.unbindCustomTabsService(this);
         ApplicationLoader.mainInterfaceStopped = true;
@@ -7564,6 +7567,7 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
             if (ApplicationLoader.isScreenOn) {
                 onPasscodeResume();
             } else {
+                ProtectedChats.onAppPaused();
                 onPasscodePause();
             }
         } else if (id == NotificationCenter.needCheckSystemBarColors) {
@@ -8146,7 +8150,6 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
     }
 
     private void onPasscodePause() {
-        ProtectedChats.onAppPaused();
         if (lockRunnable != null) {
             if (BuildVars.LOGS_ENABLED) {
                 FileLog.d("cancel lockRunnable onPasscodePause");

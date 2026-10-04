@@ -74,12 +74,12 @@ public final class ProtectedChatGate {
         if (dialogId == 0 || fragment.protectedGate.isRegistered() || !ProtectedChats.isProtected(fragment.getCurrentAccount(), dialogId)) {
             return;
         }
-        ProtectedChats.lifecycle().created(fragment.protectedGate, ProtectedChats.accountKey(fragment.getCurrentAccount()), dialogId);
+        ProtectedChats.lifecycle().created(fragment.protectedGate, ProtectedChats.accountKey(fragment.getCurrentAccount()), dialogId, () -> tryClose(fragment));
     }
 
     /**
-     * A covered fragment (another chat, a sheet, the app in the background) is not "being used":
-     * the re-lock countdown of its dialog starts once no fragment of it is visible.
+     * Covered by a child fragment, or paused together with the activity (a system permission dialog is
+     * not navigation): neither is the user leaving the chat. See {@link ProtectedGateLifecycle}.
      */
     public static void onFragmentPaused(BaseFragment fragment) {
         if (!fragment.protectedGate.isIdle()) {
@@ -87,10 +87,17 @@ public final class ProtectedChatGate {
         }
     }
 
-    /** Back on screen: if the authorization ended while it was covered, it must not show again. */
+    /** Back on screen. Nothing is evaluated or closed from inside the call that resumes a fragment. */
     public static void onFragmentResumed(BaseFragment fragment) {
         if (fragment.protectedGate.isRegistered()) {
-            ProtectedChats.lifecycle().resumed(fragment.protectedGate, fragment::removeSelfFromStack);
+            ProtectedChats.lifecycle().resumed(fragment.protectedGate);
+        }
+    }
+
+    /** The layout finished the transition this fragment took part in (fully visible or fully hidden). */
+    public static void onFragmentSettled(BaseFragment fragment) {
+        if (!fragment.protectedGate.isIdle()) {
+            ProtectedChats.lifecycle().transitionSettled(fragment.protectedGate);
         }
     }
 
@@ -98,6 +105,69 @@ public final class ProtectedChatGate {
         if (!fragment.protectedGate.isIdle()) {
             ProtectedChats.lifecycle().destroyed(fragment.protectedGate);
         }
+    }
+
+    /**
+     * The navigation layout is forwarding the host activity's own pause or resume to its last
+     * fragment between {@code hostLifecycle(true)} and {@code hostLifecycle(false)}.
+     */
+    public static void hostLifecycle(boolean active) {
+        ProtectedChats.lifecycle().hostLifecycle(active);
+    }
+
+    /**
+     * A fragment is being presented over {@code below} (called by the navigation layout for every
+     * presented fragment; it does nothing unless {@code below} belongs to a protected chat's
+     * context). The new fragment becomes a child of that chat: the chat is covered, not left,
+     * unless the child opens another conversation than the ones that belong to the chat's own
+     * context. The forward picker additionally starts the forward transaction. This hook only
+     * records who covers whom; every decision is made by the fragment lifecycle callbacks.
+     */
+    public static void onFragmentPresented(BaseFragment fragment, BaseFragment below, boolean removeLast) {
+        if (below == null || !below.protectedGate.isInContext()) {
+            return;
+        }
+        final boolean forwardPicker = fragment instanceof DialogsActivity && ((DialogsActivity) fragment).isForwardPicker();
+        ProtectedChats.lifecycle().presented(fragment.protectedGate, conversationDialogId(fragment), below.protectedGate, removeLast, forwardPicker);
+    }
+
+    /** The dialog a fragment shows as a conversation (a chat or a profile), or 0 for any other screen. */
+    private static long conversationDialogId(BaseFragment fragment) {
+        if (fragment instanceof ChatActivity || fragment instanceof ProfileActivity || fragment instanceof ProfileActivity2) {
+            return getDialogId(fragment);
+        }
+        return 0;
+    }
+
+    /**
+     * Closes a fragment whose authorization ended, without ever cutting a transition short:
+     * {@code ActionBarLayout.removeFragmentFromStack} completes a running transition first and
+     * {@code closeLastFragment} refuses to run during one. Returns false when the fragment is the top
+     * or second fragment of a layout that is in a transition (or being swiped); the gate then retries
+     * when that transition ended.
+     */
+    private static boolean tryClose(BaseFragment fragment) {
+        if (fragment.isFinished) {
+            return true;
+        }
+        final INavigationLayout layout = fragment.getParentLayout();
+        if (layout == null || layout.getFragmentStack() == null) {
+            return true;
+        }
+        final java.util.List<BaseFragment> stack = layout.getFragmentStack();
+        final int index = stack.indexOf(fragment);
+        if (index < 0) {
+            return true;
+        }
+        if (index >= stack.size() - 2 && (layout.isTransitionAnimationInProgress() || layout.isSwipeInProgress())) {
+            return false;
+        }
+        if (index == stack.size() - 1 && stack.size() > 1) {
+            fragment.finishFragment(false);
+        } else {
+            fragment.removeSelfFromStack();
+        }
+        return true;
     }
 
     public static boolean isLocked(BaseFragment fragment) {
@@ -160,21 +230,6 @@ public final class ProtectedChatGate {
     }
 
     // ------------------------------------------------------------------ forward transaction
-
-    /**
-     * A forward picker is being presented over {@code below} (called by the navigation layout for
-     * every presented fragment; it ignores everything that is not a forward picker). Whatever screen
-     * {@code below} is, if it shows a protected dialog that is authorized and visible right now, that
-     * authorization is held while the forward runs. This is the only place the layout is involved: it
-     * starts the transaction. Everything after it (Back, a destination, completion) is decided by
-     * the fragment lifecycle callbacks above, see {@link ProtectedGateLifecycle}.
-     */
-    public static void onForwardPickerPresented(BaseFragment picker, BaseFragment below) {
-        if (below == null || !below.protectedGate.isRegistered() || !(picker instanceof DialogsActivity) || !((DialogsActivity) picker).isForwardPicker()) {
-            return;
-        }
-        ProtectedChats.lifecycle().pickerPresented(picker.protectedGate, below.protectedGate);
-    }
 
     /** What the picker remembers between handing its selection over and the delegate returning. */
     public static final class Handover {
@@ -271,8 +326,10 @@ public final class ProtectedChatGate {
     }
 
     /**
-     * Pops every fragment of the given layouts that shows a protected dialog which is no longer
-     * authorized (authorization expired, manual re-lock, app returned from background).
+     * Closes every fragment of the given layouts that shows a protected dialog which is no longer
+     * authorized (authorization expired, manual re-lock, app returned from background). Fragments
+     * that are not on screen are removed silently; the top fragment, or one involved in a running
+     * transition, is closed once that transition ended (never by cutting it short).
      */
     public static void closeLockedFragments(java.util.List<INavigationLayout> layouts) {
         for (INavigationLayout layout : layouts) {
@@ -284,13 +341,9 @@ public final class ProtectedChatGate {
             }
             ArrayList<BaseFragment> stack = new ArrayList<>(layout.getFragmentStack());
             for (int i = stack.size() - 1; i >= 0; i--) {
-                BaseFragment fragment = stack.get(i);
+                final BaseFragment fragment = stack.get(i);
                 if (isLocked(fragment)) {
-                    if (i == stack.size() - 1) {
-                        fragment.finishFragment(false);
-                    } else {
-                        fragment.removeSelfFromStack();
-                    }
+                    ProtectedChats.lifecycle().closeLocked(fragment.protectedGate, () -> tryClose(fragment));
                 }
             }
         }

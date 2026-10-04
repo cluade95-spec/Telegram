@@ -751,6 +751,7 @@ public abstract class BaseFragment {
 
     public void onBecomeFullyVisible() {
         isFullyVisible = true;
+        ProtectedChatGate.onFragmentSettled(this);
         AccessibilityManager mgr = (AccessibilityManager) ApplicationLoader.applicationContext.getSystemService(Context.ACCESSIBILITY_SERVICE);
         if (mgr.isEnabled()) {
             ActionBar actionBar = getActionBar();
@@ -796,6 +797,7 @@ public abstract class BaseFragment {
 
     public void onBecomeFullyHidden() {
         isFullyVisible = false;
+        ProtectedChatGate.onFragmentSettled(this);
         updateSheetsVisibility();
     }
 
