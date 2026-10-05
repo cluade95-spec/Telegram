@@ -14619,6 +14619,10 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
             final int currentAccount = f.getCurrentAccount();
             final Theme.ResourcesProvider resourcesProvider = f.getResourceProvider();
             return new SearchResult[]{
+                    new SearchResult(1000, getString(R.string.UsageActivity), R.drawable.settings_activity, () -> {
+                        if (f instanceof SettingsActivity) ((SettingsActivity) f).presentSettingFragment(new UsageReportActivity());
+                        else f.presentFragment(new UsageReportActivity());
+                    }).withLink("tg://settings/activity"),
                     new SearchResult(500, getString(R.string.EditName), 0, () -> f.presentFragment(new ChangeNameActivity(resourcesProvider))),
                     new SearchResult(501, getString(R.string.ChangePhoneNumber), 0, () -> f.presentFragment(new ActionIntroActivity(ActionIntroActivity.ACTION_TYPE_CHANGE_PHONE_NUMBER))).withLink("tg://settings/edit/change-number"),
                     new SearchResult(502, getString(R.string.AddAnotherAccount), 0, () -> {

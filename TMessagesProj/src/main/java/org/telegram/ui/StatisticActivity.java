@@ -2192,6 +2192,7 @@ public class StatisticActivity extends BaseFragment implements NotificationCente
 
             errorTextView.setVisibility(View.GONE);
             chartView.legendSignatureView.isTopHourChart = viewData.useHourFormat;
+            chartView.legendSignatureView.localHourLabels = viewData.localHourLabels;
             chartHeaderView.showDate(!viewData.useHourFormat);
 
             if (viewData.chartData == null && viewData.token != null) {
@@ -2409,6 +2410,7 @@ public class StatisticActivity extends BaseFragment implements NotificationCente
         public boolean isEmpty;
         public boolean isLanguages;
         public boolean useHourFormat;
+        public String[] localHourLabels;
         public boolean useWeekFormat;
 
         public ChartViewData(String title, int grahType) {

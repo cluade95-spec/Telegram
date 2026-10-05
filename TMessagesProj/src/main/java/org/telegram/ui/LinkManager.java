@@ -297,6 +297,11 @@ public class LinkManager {
         final String fourth = segments.size() > 3 ? segments.get(3) : null;
         final String fifth  = segments.size() > 4 ? segments.get(4) : null;
 
+        if ("activity".equalsIgnoreCase(first)) {
+            presentFragment(new UsageReportActivity());
+            return true;
+        }
+
         // legacy paths:
         if ("theme".equalsIgnoreCase(first) || "themes".equalsIgnoreCase(first)) { // open_settings = 2;
             presentFragment(new ThemeActivity(ThemeActivity.THEME_TYPE_BASIC));

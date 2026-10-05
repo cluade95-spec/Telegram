@@ -40,6 +40,7 @@ import java.util.Locale;
 public class LegendSignatureView extends FrameLayout {
 
     public boolean isTopHourChart;
+    public String[] localHourLabels;
     LinearLayout content;
     Holder[] holders;
     TextView time;
@@ -159,7 +160,8 @@ public class LegendSignatureView extends FrameLayout {
         }
 
         if (isTopHourChart) {
-            time.setText(String.format(Locale.ENGLISH, "%02d:00", date));
+            time.setText(localHourLabels != null && index >= 0 && index < localHourLabels.length
+                    ? localHourLabels[index] : String.format(Locale.ENGLISH, "%02d:00", date));
         } else {
             if (useWeek) {
                 time.setText(String.format("%s — %s", format4.format(new Date(date)), format3.format(new Date(date + 86400000L * 7))));

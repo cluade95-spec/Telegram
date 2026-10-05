@@ -110,7 +110,7 @@ public final class UsageSurfaceResolver {
         if (fragment instanceof org.telegram.ui.Components.HashtagActivity) return UsageClassifier.FragmentFacts.of(UsageClassifier.Kind.SEARCH);
         if (fragment instanceof TopicsFragment) return UsageClassifier.FragmentFacts.of(UsageClassifier.Kind.TOPICS);
         if (fragment instanceof ProfileActivity || fragment instanceof ProfileActivity2) return UsageClassifier.FragmentFacts.of(UsageClassifier.Kind.PROFILE);
-        if (fragment instanceof SettingsActivity) return UsageClassifier.FragmentFacts.of(UsageClassifier.Kind.SETTINGS);
+        if (fragment instanceof SettingsActivity || fragment instanceof org.telegram.ui.UsageReportActivity) return UsageClassifier.FragmentFacts.of(UsageClassifier.Kind.SETTINGS);
         if (fragment instanceof ContactsActivity || fragment instanceof CallLogActivity) return UsageClassifier.FragmentFacts.of(UsageClassifier.Kind.EXPLICIT_OTHER);
         return UsageClassifier.FragmentFacts.of(UsageClassifier.Kind.OTHER);
     }
