@@ -280,9 +280,13 @@ versus reading beyond messages sent. Showing "Communication 62%" would be fake p
 categories (Private Chats / Groups / Channels are understandable on their own) plus **messages sent** per period. A later
 version can add "time in chats where you wrote that day" (derivable from per-dialog sent counts) if wanted.
 
-Messages sent: counted at the existing `StatsController.incrementSentItemsCount(..., TYPE_MESSAGES, n)` call sites in
-`SendMessagesHelper` (server confirmed; forwards counted per message), plus the `SecretChatHelper` confirmation. Scheduled
-messages count when sent by the server.
+Messages sent: observe successful actual-send confirmations in `SendMessagesHelper` (forwards counted per message),
+plus visible-message confirmations in `SecretChatHelper`. The existing statistics sites also run for scheduling acceptance;
+Activity excludes `TL_updateNewScheduledMessage` and every scheduling acknowledgment. Scheduled messages count only on
+actual outgoing `from_scheduled` delivery updates (`TL_updateNewMessage` / `TL_updateNewChannelMessage`, including verified
+new-message difference catch-up), or an actual-send reply. Deduplicate confirmations atomically with the daily metric in
+`usage.db`, using an opaque digest of account/dialog/server message identity (secret sends use their random id); no message
+content is stored and replay cannot increment the metric twice. Failed sends do not count. No protocol/network behavior changes.
 
 Charts: `StatisticActivity.ChartViewData` + `StatisticActivity.createChartData(json, VIEW_TYPE_STACKBAR, false)` +
 `UItem.asChart(...)`; series colors from existing `statisticChartLine_*` theme keys mapped per category.
@@ -379,7 +383,7 @@ accountant with event scripts.
 | A1 Core accounting | pure accountant, policy, clock, ledger, surfaces enum | — | `messenger/usage/UsagePolicy`, `UsageSurface`, `UsageClock`, `UsageAccountant`, `UsageLedger` | `onInput`, `onForeground/Background`, `onScreen`, `onSurface`, `onPassive`, `onCall`, `drain()` | §23 accountant tests | JVM tests green | Android hooks, storage, UI |
 | A2 Classification | classifier + Android resolver | A1 | `usage/UsageClassifier`, `UsageSurfaceResolver`, `DialogsActivity` (public `isSearchShown()`), Local History fragment types later | `classify(...)`, `resolve()` | classifier tests | resolver logs surfaces in debug builds on device (counts only) | storage, UI |
 | A3 Signals | wire input/foreground/screen/navigation/playback/calls into `UsageTracker` | A2 | `usage/UsageTracker`, `LaunchActivity` (`onUserInteraction`, `dispatchKeyEvent`), `BottomSheet`, `AlertDialog`, `PhotoViewer`, `SecretMediaViewer`, `StoryViewer`, `ArticleViewer`, `ChatActivityEnterView`, `BaseFragment` (next to `ProtectedChatGate` calls), `ActionBarLayout.onFragmentStackChanged`, `MainTabsActivity.onViewPagerScrollEnd`, `ApplicationLoader` (listener registration) | `UsageTracker.onUserInput()`, `onNavigationChanged()` | existing suites unchanged | device check: debug overlay or log of credited seconds per surface over QA steps 1-8 | persistence, UI |
-| A4 Persistence | store, flush, rollup, account removal, messages sent/opens/sessions | A3 | `usage/UsageStore`, `UserConfig.clearConfig`, `SendMessagesHelper` (3 sites), `SecretChatHelper` | `flush()`, `query(range)`, `reset()`, `onAccountRemoved(uid)` | rollup/isolation tests; instrumented `UsageStoreTest` | kill mid-use: verify event-checked flush and accepted event-free loss; DB size check | UI |
+| A4 Persistence | store, flush, rollup, account removal, messages sent/opens/sessions | A3 | `usage/UsageStore`, `UserConfig.clearConfig`, `SendMessagesHelper` (confirmed sends), `SecretChatHelper`, `MessagesController` (scheduled delivery observation only) | `flush()`, `query(range)`, `reset()`, `onAccountRemoved(uid)` | rollup/isolation tests; instrumented `UsageStoreTest` | kill mid-use: verify event-checked flush and accepted event-free loss; DB size check | UI |
 | A5 Dashboard | `UsageReportActivity`, Settings row, search entry, strings | A4 | `ui/UsageReportActivity`, `SettingsActivity`, `ProfileActivity.SearchAdapter`, `res/values/strings.xml`, icon drawable | — | report-math tests | QA 9-11, light/dark, RTL, TalkBack | Local History surface |
 | A6 Integration + hardening | Local History surface (once LH4 exists), tablet rules, backup rules, performance review | A5 (+ LH4) | `UsageClassifier`, resolver, manifest rules shared with Local History | — | full suite | full QA §24 incl. 12 | — |
 
@@ -393,7 +397,7 @@ Existing (small hooks): `LaunchActivity`, `ApplicationLoader`, `BaseFragment`, `
 `Components/ChatActivityEnterView`, `DialogsActivity` (getter), `SendMessagesHelper`, `SecretChatHelper`, `UserConfig`,
 `SettingsActivity`, `ProfileActivity` (search array only), `res/values/strings.xml`, one drawable, manifest backup rules (shared).
 
-Not changed: `MessagesController`, `MessagesStorage`, `ConnectionsManager`, `ChatActivity` (classification only reads its
+Not changed: `MessagesStorage`, `ConnectionsManager`, `ChatActivity` (classification only reads its
 public getters).
 
 ## 27. Risks and open questions
