@@ -226,7 +226,7 @@ CREATE TABLE daily(
 * Flush (one transaction of upserts on `usageQueue`) when: the app goes to the background (`ForegroundDetector.onBecameBackground`),
   the screen turns off, the dashboard opens, the account changes, or unflushed time reaches **5 minutes** (checked at accounting
   events; no timer).
-* Crash/process-death loss is bounded by 5 minutes of foreground time; background flushes make loss after the app is left zero.
+* The 5-minute threshold is event-checked, not a strict process-death guarantee. Long event-free active intervals (connected calls or passive playback) may lose more than 5 minutes on abrupt process death before another accounting event. This is accepted; no timers, polling, periodic callbacks, scheduled jobs or background service are added. Meaningful lifecycle/state/accounting boundaries flush earned time only; queued writes must complete to survive death.
 * Clock: durations use `SystemClock.elapsedRealtime()`; the local day/hour of a credit uses `System.currentTimeMillis()` and the
   default time zone **at booking time**. A wall-clock jump or time-zone change only moves where future credits are booked; an
   interval is never double counted or negative because durations are monotonic. A credit spanning midnight is split.
@@ -319,7 +319,7 @@ Charts: `StatisticActivity.ChartViewData` + `StatisticActivity.createChartData(j
 
 ## 20. Process-death handling
 
-In-memory ledger lost; at most 5 minutes of foreground time (§13). On start, no recovery is attempted; there is no "open
+In-memory ledger and unfinished queued writes are lost; the event-checked threshold does not bound loss during long event-free active intervals (§13). On start, no recovery is attempted; there is no "open
 segment" on disk to repair. The database is always consistent (transactions).
 
 ## 21. Edge cases
@@ -379,7 +379,7 @@ accountant with event scripts.
 | A1 Core accounting | pure accountant, policy, clock, ledger, surfaces enum | — | `messenger/usage/UsagePolicy`, `UsageSurface`, `UsageClock`, `UsageAccountant`, `UsageLedger` | `onInput`, `onForeground/Background`, `onScreen`, `onSurface`, `onPassive`, `onCall`, `drain()` | §23 accountant tests | JVM tests green | Android hooks, storage, UI |
 | A2 Classification | classifier + Android resolver | A1 | `usage/UsageClassifier`, `UsageSurfaceResolver`, `DialogsActivity` (public `isSearchShown()`), Local History fragment types later | `classify(...)`, `resolve()` | classifier tests | resolver logs surfaces in debug builds on device (counts only) | storage, UI |
 | A3 Signals | wire input/foreground/screen/navigation/playback/calls into `UsageTracker` | A2 | `usage/UsageTracker`, `LaunchActivity` (`onUserInteraction`, `dispatchKeyEvent`), `BottomSheet`, `AlertDialog`, `PhotoViewer`, `SecretMediaViewer`, `StoryViewer`, `ArticleViewer`, `ChatActivityEnterView`, `BaseFragment` (next to `ProtectedChatGate` calls), `ActionBarLayout.onFragmentStackChanged`, `MainTabsActivity.onViewPagerScrollEnd`, `ApplicationLoader` (listener registration) | `UsageTracker.onUserInput()`, `onNavigationChanged()` | existing suites unchanged | device check: debug overlay or log of credited seconds per surface over QA steps 1-8 | persistence, UI |
-| A4 Persistence | store, flush, rollup, account removal, messages sent/opens/sessions | A3 | `usage/UsageStore`, `UserConfig.clearConfig`, `SendMessagesHelper` (3 sites), `SecretChatHelper` | `flush()`, `query(range)`, `reset()`, `onAccountRemoved(uid)` | rollup/isolation tests; instrumented `UsageStoreTest` | kill the process mid-use: loss <= 5 min; DB size check | UI |
+| A4 Persistence | store, flush, rollup, account removal, messages sent/opens/sessions | A3 | `usage/UsageStore`, `UserConfig.clearConfig`, `SendMessagesHelper` (3 sites), `SecretChatHelper` | `flush()`, `query(range)`, `reset()`, `onAccountRemoved(uid)` | rollup/isolation tests; instrumented `UsageStoreTest` | kill mid-use: verify event-checked flush and accepted event-free loss; DB size check | UI |
 | A5 Dashboard | `UsageReportActivity`, Settings row, search entry, strings | A4 | `ui/UsageReportActivity`, `SettingsActivity`, `ProfileActivity.SearchAdapter`, `res/values/strings.xml`, icon drawable | — | report-math tests | QA 9-11, light/dark, RTL, TalkBack | Local History surface |
 | A6 Integration + hardening | Local History surface (once LH4 exists), tablet rules, backup rules, performance review | A5 (+ LH4) | `UsageClassifier`, resolver, manifest rules shared with Local History | — | full suite | full QA §24 incl. 12 | — |
 
@@ -424,7 +424,7 @@ Technical risks:
 4. Background, screen off and app switch stop accounting immediately; a connected call counts as Calls.
 5. Protected chats count time and show identity only; Local History time appears under Local History.
 6. No network request, no background service, no timer, no wake lock is added (code review + QA).
-7. Data lives in `no_backup`, survives restart and process death (bounded loss of 5 min), is reset by the user, and is
+7. Data lives in `no_backup`, survives restart and process death after completed flushes (event-free loss accepted, §13), is reset by the user, and is
    anonymized per account on logout.
 8. Storage stays within the §12 estimates under the heavy profile.
 9. All §23 tests pass, negative controls fail when the protected behavior is removed, existing test suites stay green.
