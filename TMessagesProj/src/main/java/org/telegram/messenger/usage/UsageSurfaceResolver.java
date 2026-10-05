@@ -138,6 +138,9 @@ public final class UsageSurfaceResolver {
             r.dialogId = ((TopicsFragment) f).getDialogId();
             return r;
         }
+        if (f instanceof org.telegram.messenger.localhistory.LocalHistoryScreen) {
+            return UsageClassifier.FragmentFacts.of(UsageClassifier.Kind.LOCAL_HISTORY);
+        }
         if (f instanceof ProfileActivity || f instanceof ProfileActivity2) {
             return UsageClassifier.FragmentFacts.of(UsageClassifier.Kind.PROFILE);
         }

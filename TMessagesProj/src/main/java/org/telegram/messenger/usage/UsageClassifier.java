@@ -23,7 +23,7 @@ public final class UsageClassifier {
     public static final int MODE_WELCOME_MESSAGES = 9;
 
     public enum Kind {
-        NONE, CHAT, DIALOGS, TOPICS, PROFILE, SETTINGS, CALL_LOG, CONTACTS, OTHER
+        NONE, CHAT, DIALOGS, TOPICS, PROFILE, SETTINGS, CALL_LOG, CONTACTS, LOCAL_HISTORY, OTHER
     }
 
     /** Plain facts about the top fragment. */
@@ -103,6 +103,9 @@ public final class UsageClassifier {
                 return new SurfaceKey(UsageSurface.CHAT_GROUP, top.dialogId);
             case PROFILE:
                 return new SurfaceKey(UsageSurface.PROFILE, 0);
+            case LOCAL_HISTORY:
+                // the feed, its info page and its edit screen; no dialog id, the reserved one is not a real peer
+                return new SurfaceKey(UsageSurface.LOCAL_HISTORY, 0);
             case SETTINGS:
                 return new SurfaceKey(UsageSurface.SETTINGS, 0);
             case CALL_LOG:

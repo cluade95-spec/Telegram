@@ -113,6 +113,15 @@ public class UsageClassifierTest {
     }
 
     @Test
+    public void localHistoryScreensAreTheLocalHistorySurface() {
+        assertKey(UsageSurface.LOCAL_HISTORY, 0, c(UsageClassifier.FragmentFacts.of(UsageClassifier.Kind.LOCAL_HISTORY)));
+        UsageClassifier.OverlayFacts o = new UsageClassifier.OverlayFacts();
+        o.mediaViewer = true;
+        assertKey(UsageSurface.MEDIA_VIEWER, 0, UsageClassifier.classify(UsageClassifier.FragmentFacts.of(UsageClassifier.Kind.LOCAL_HISTORY), o, false));
+        assertKey(UsageSurface.LOCAL_HISTORY, 0, UsageClassifier.classify(UsageClassifier.FragmentFacts.of(UsageClassifier.Kind.LOCAL_HISTORY), null, true));
+    }
+
+    @Test
     public void overlayPriority() {
         UsageClassifier.FragmentFacts f = chat(5);
         f.isUser = true;
