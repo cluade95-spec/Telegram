@@ -1,14 +1,557 @@
-# Local History Chat: implementation plan
+# Activity and Local History Chat: implementation plan
 
-Planning name: **Local History Chat**. Final product name not chosen.
-Baseline: `master` `055a0c3b`. Source evidence: [local-history-chat-research.md](local-history-chat-research.md) (cited as R§n).
-Paths relative to `TMessagesProj/src/main/java/org/telegram/`. Code names introduced here are proposals; everything else exists.
+Single-file plan for two independent features, cut into **3 implementation parts**. Baseline: `master` `055a0c3b` (PR #9,
+Protected Chats) plus the planning docs of PR #11. Source evidence: [activity-research.md](activity-research.md) and
+[local-history-chat-research.md](local-history-chat-research.md) (cited as R§n inside the references).
+Paths are relative to `TMessagesProj/src/main/java/org/telegram/`.
 
-This feature is independent of Activity. The only coupling is one surface classification (§30).
+## How this file is organized
+
+1. **The 3 parts** (below): what to build, in which order, with entry conditions, deliverables and gates. Implement one part at a
+   time; inside a part, one phase at a time (build, test, commit, next).
+2. **Reference A: Activity specification** (sections `A1`-`A28`) and **Reference B: Local History Chat specification**
+   (sections `B1`-`B40`): the full design. A `§n` written inside Reference A means A`n`; inside Reference B it means B`n`.
+   Phase ids (`A1`...`A6`, `LH1`...`LH8`) are the rows of the phase tables in A25 and B37.
+
+Rules for every part:
+
+* Read the part, the referenced sections and the matching research sections, then re-verify the cited methods in the
+  current source (line numbers are approximate; method names are the contract). If the source contradicts the plan, stop that
+  phase and report the conflict instead of working around it.
+* Implement only the files listed for the phase. Add the listed tests (including negative controls). Run the JVM unit tests under
+  `TMessagesProj/src/test` and the existing Protected Chats suites; they must stay green.
+* One commit per phase (phase id in the message), one pull request per part. Do not trigger the manual build workflow unless the
+  owner asks.
+* Defaults for the open product questions are the recommendations in A27 and B39 until the owner answers otherwise.
+
+## The 3 parts at a glance
+
+| Part | Name | Phases | Result you can test on a device | Depends on |
+| --- | --- | --- | --- | --- |
+| 1 | Activity | A1, A2, A3, A4, A5 | Settings → Activity shows real data | nothing |
+| 2 | Local History core | LH1, LH2, LH3, LH4, LH5 | other people's edits and deletions are captured and readable in a read-only chat, with media | nothing (independent of Part 1) |
+| 3 | Local History finish + Activity integration | LH6, LH7, LH8, A6 | editable name/photo, version history, search, Protected Chats, settings, backup rules, "Local History" time in Activity | Parts 1 and 2 |
+
+Parts 1 and 2 do not depend on each other and can be built in either order or in parallel by different people; Part 3 needs both.
+Recommended order: 1, 2, 3 (Activity first: no message pipeline, pure core, one open decision).
 
 ---
 
-## 1. Product scope
+## Part 1: Activity (phases A1-A5)
+
+**Goal:** Settings → Activity works end to end for all accounts: active-time accounting, surface classification, local storage,
+dashboard. The Local History surface does not exist yet, so its screens (none yet) need no mapping.
+
+**Build (see A25 for the per-phase table):**
+
+| Phase | One-line scope | Main files |
+| --- | --- | --- |
+| A1 | pure accounting core with injectable clock | `messenger/usage/UsagePolicy`, `UsageSurface`, `UsageClock`, `UsageAccountant`, `UsageLedger` |
+| A2 | classifier (pure) + Android surface resolver | `usage/UsageClassifier`, `UsageSurfaceResolver`, `DialogsActivity.isSearchShown()` |
+| A3 | wire input, foreground, screen, navigation, playback, call signals | `usage/UsageTracker`, `LaunchActivity`, `BottomSheet`, `AlertDialog`, `PhotoViewer`, `SecretMediaViewer`, `StoryViewer`, `ArticleViewer`, `ChatActivityEnterView`, `BaseFragment`, `ActionBarLayout`, `MainTabsActivity`, `ApplicationLoader` |
+| A4 | SQLite store, flush, rollup, account removal, messages sent / opens / sessions | `usage/UsageStore`, `UserConfig.clearConfig`, `SendMessagesHelper`, `SecretChatHelper` |
+| A5 | dashboard, Settings row, settings search entry, strings | `ui/UsageReportActivity`, `SettingsActivity`, `ProfileActivity.SearchAdapter`, `strings.xml` |
+
+**Entry conditions:** none. Idle window 60 s and the other Activity defaults in A27 unless changed.
+
+**Exit gate (all must hold):**
+
+* A23 unit tests green, negative controls fail when the protected behavior is removed (idle cap, double booking).
+* Device QA A24 steps 1-11 pass (step 12, Local History time, waits for Part 3).
+* No timer, service, wake lock or network request added (A14); data lives in `no_backup/usage`.
+* Acceptance criteria A28 items 1-4 and 6-9 (item 5 partly: protected chats count time with identity only; Local History part in Part 3).
+
+**Explicitly not in this part:** the Local History surface and its mapping (A6), anything under `messenger/localhistory`.
+
+---
+
+## Part 2: Local History core (phases LH1-LH5)
+
+**Goal:** the archive works. Edits and remote deletions of ordinary private users are captured exactly once, the chat appears in
+the chat list and shows entries in a group-style, read-only feed, and downloaded media survives deletion.
+
+**Build (see B37 for the per-phase table):**
+
+| Phase | One-line scope | Main files |
+| --- | --- | --- |
+| LH1 | reserved id, classifier, network guards G1-G4 | `messenger/localhistory/LocalDialogIds`, `MessagesController` (`getInputPeer*`, `getInputUser`, `getInputChannel`), `SendMessagesHelper` |
+| LH2 | feature database (`no_backup`), schema, repository, eligibility, diff, account removal | `localhistory/LocalHistoryDatabase`, `LocalHistoryRepository`, `LocalHistoryEligibility`, `LocalHistoryDiff`, `LocalHistory`, `UserConfig.clearConfig` |
+| LH3 | edit and deletion capture hooks | `MessagesStorage.putMessages` (+ `fromEditUpdate`), `getMessagesForArchiveSync`, `MessagesController.processUpdateArray`, `deleteMessagesByPush`, `LocalHistoryCapture` |
+| LH4 | chat-list row, `LocalHistoryActivity` read-only feed, unread, **plus the enable switch and "Delete all local history"** (moved here from LH8) | `DialogsAdapter`, `DialogCell`, `DialogsActivity`, `NotificationCenter`, `ui/LocalHistoryActivity`, `LocalHistoryRenderModel`, `PrivacySettingsActivity` |
+| LH5 | media holds, copier, budget, viewer, save to gallery | `FileLoader.deleteFiles`, `LocalHistoryMediaHolds`, `LocalHistoryMediaCopier`, viewer provider |
+
+**Entry conditions:** none beyond the defaults in B39 (off by default, delete on logout, 50 MB / 1 GB media limits, bulk grouping above 20).
+
+**Exit gate (all must hold):**
+
+* B34 tests for eligibility, diff, ledger, ids, network guards and media states green; the three mutation checks fail as designed.
+* Device QA B36 steps 1-8 and 11 and 13 pass (steps 9-10 and 12 belong to Part 3).
+* Opening, scrolling and closing the chat issues zero network requests (guard tests + proxy log).
+* Existing Protected Chats suites unchanged and green; `ChatActivity`, `ProfileActivity` and `cache4.db` schema untouched.
+
+**Known limitation until Part 3:** the Local History Chat cannot yet be locked with Protected Chats and has no edit/profile/search
+screens. The feature stays off by default, and the enable screen says so; do not enable it for daily use before Part 3.
+
+**Explicitly not in this part:** name/photo editing, version-history sheet, in-chat search, Protected Chats, backup rules, the Activity surface.
+
+---
+
+## Part 3: Local History finish and Activity integration (phases LH6, LH7, LH8, A6)
+
+**Goal:** complete the Local History Chat and connect it to Activity.
+
+**Build:**
+
+| Phase | One-line scope | Main files |
+| --- | --- | --- |
+| LH6 | info page, local name/photo (no server APIs), version-history sheet, in-chat search, per-entry delete, clear history | `ui/LocalHistoryProfileActivity`, `ui/LocalHistoryEditActivity`, `Components/LocalHistoryRevisionsSheet` |
+| LH7 | Protected Chats integration (B28 items 1-9) | `ProtectedChats`, `ProtectedChatGate`, `ProtectedDialogIdentity`, `ProtectedChatsListActivity`, `ChatLockSettingsActivity`, `DialogCell`, `DialogsSearchAdapter` |
+| LH8 | hardening: explicit backup / data-extraction rules, logging review, bulk-entry UI polish, full QA | `AndroidManifest.xml`, `res/xml/data_extraction_rules.xml`, `res/xml/backup_rules.xml` |
+| A6 | Activity classifies the Local History screens as "Local History", tablet rules, backup rules (shared with LH8), performance review | `UsageClassifier`, `UsageSurfaceResolver` |
+
+**Entry conditions:** Part 1 and Part 2 merged. Verify the `ImageUpdater` no-upload gate at the start of LH6 (B18); use the fallback
+picker if it uploads.
+
+**Exit gate (all must hold):**
+
+* `ProtectedLocalIdentityTest` and all earlier suites green; existing Protected Chats tests unchanged.
+* Full device QA B36 (1-13) and A24 (1-12) pass, including: no request when renaming or setting the photo; lock from the row and from the info page; time spent in the chat shows as "Local History" in Activity.
+* Acceptance criteria B40 (all 10) and A28 (all 9).
+
+**Explicitly not in this part:** notifications for archive events, forwarding preserved content, archived content in global search, Android Auto Backup of feature data.
+
+---
+
+## Reference A: Activity specification
+
+Product name: **Activity** (Settings → Activity). Evidence: [activity-research.md](activity-research.md). Internal code uses the prefix
+`Usage` to avoid confusion with Android activities (`UsageTracker`, `UsageReportActivity`); the user-facing name is Activity.
+Independent of the Local History Chat; the only coupling is one surface (A7). Phase **A6** is delivered in Part 3, A1-A5 in Part 1.
+
+### A1. Product scope
+
+A local report answering "where did my time inside Telegram actually go?":
+
+* total **active** time for Today / This week / This month, with the previous period for comparison;
+* a non-overlapping breakdown by surface category;
+* most-used chats;
+* a small set of secondary metrics (§16).
+
+Everything is computed and stored on the device.
+
+### A2. Non-goals
+
+Usage limits, focus mode, blocking, breaks, doomscroll warnings, parental controls, AI analysis, cloud analytics, server
+reporting, Telegram API changes, uploads, background services, periodic wakeups, per-message tracking, content capture.
+
+### A3. Existing architecture discovered
+
+* No app-wide last-input timestamp exists; `LaunchActivity.onUserInteraction` is the cheapest central input hook but misses
+  separate windows and IME typing (R§1).
+* Foreground: `ForegroundDetector` (app-wide refcount). Background boundary: activity stop, not pause (PR #9 finding).
+  Screen: `ScreenReceiver` / `NotificationCenter.screenStateChanged` (R§2).
+* Surface: no single "visible fragment" notion; main tabs live in `MainTabsActivity` outside the stack; tablets show up to three
+  layouts; viewers are separate windows (R§3).
+* Calls: `VoIPService` state and `didStartedCall` / `didEndCall` (R§3).
+* Messages sent: existing confirmed-send counting points in `SendMessagesHelper` (R§5).
+* UI: `UniversalFragment` + `UItem.asChart` + `ui/Charts` work without network (R§6).
+
+### A4. Active-time definition
+
+A second counts as **active** when all of these hold:
+
+1. Telegram is in the foreground (`ForegroundDetector.isForeground()`), **and**
+2. the screen is on (`ApplicationLoader.isScreenOn`), **and**
+3. either the user interacted within the idle window (§5), or an **engaged passive activity** is running (§6), or a call is
+   connected (§6).
+
+Each active second is credited to exactly one **surface key** `(accountUserId, surface, dialogKey)`: the primary surface at
+that instant (§8). Calls are exclusive: while a call is connected, its seconds go to Calls and nothing else.
+
+### A5. Idle detection
+
+**Model: event-driven, no timers.** The accountant remembers `lastInputAt` (monotonic `SystemClock.elapsedRealtime`). When any
+event arrives at time `t`, the open segment `[segStart, t]` is credited only up to `activeUntil = max(lastInputAt + IDLE,
+passiveUntil)`. Nothing runs while the user is idle; the credit is computed lazily at the next event (input, navigation,
+background, screen off, dashboard open).
+
+**`IDLE = 60 s`.** Reasoning:
+
+* The screen turning off ends accounting immediately. Common Android screen timeouts are 30 s to 2 min, so in the common case
+  the screen timeout, not our window, ends an idle period. The window matters when the screen stays on (long timeouts,
+  "screen attention" that keeps it on while the user looks, docks).
+* Reading without touching is real use. A long channel post (about 300 words) takes 60-75 s to read; a window shorter than
+  that (the 15 s Telegram uses for per-message read metrics) would undercount reading.
+* Overcount is bounded: putting the phone down with the screen on adds at most 60 s per abandonment. The example in the brief
+  (2 min scrolling, 20 min untouched) reports 3 min, not 22.
+* Monotonic and explainable: a gap of `g` seconds without input credits `min(g, 60)`.
+
+The constant lives in `UsagePolicy.IDLE_MS`; tests pin the behavior.
+
+**What counts as input:** touches and keys in the main window (`LaunchActivity.onUserInteraction`, `dispatchKeyEvent`); touches
+in `BottomSheet`, `AlertDialog`, `PhotoViewer`, `SecretMediaViewer`, `StoryViewer` (own window), `ArticleViewer` (own window);
+text changes in `ChatActivityEnterView` and search fields (IME typing produces no touch in our windows). Scrolling is touch;
+fling continuation after the finger lifts is covered by the window. Navigation itself is not input (a programmatic navigation
+must not reset idle).
+
+### A6. Passive media and call rules
+
+| Activity | Counts? | Rule | Why |
+| --- | --- | --- | --- |
+| Video in `PhotoViewer` (playing, viewer visible) | yes | extends `passiveUntil` while playing | the user chose to watch |
+| Stories playing (`StoryViewer` shown, not paused) | yes | while playing | auto-advance is watching |
+| Voice / round message playback (`MediaController`, app foreground, screen on) | yes | while playing | listening to a message |
+| Music playback with Telegram in front | no extension | normal idle window applies | a playlist can play for an hour while the phone sits; the user is not using Telegram |
+| Any playback with Telegram in background or screen off | no | — | not "inside Telegram" by our definition |
+| Autoplaying GIFs / muted in-chat videos | no | — | not chosen by the user |
+| Picture-in-picture over other apps | no | Telegram is not foreground | consistent rule; listed as an open question |
+| 1-to-1 call (`VoIPService`, `STATE_ESTABLISHED`) | yes, as **Calls**, even with the screen off (proximity sensor) | exclusive while connected | a call is unambiguous Telegram use |
+| Group call / video chat / live stream joined and connected | yes, as **Calls** | exclusive while connected | same |
+| System permission dialog over the app | normal idle window | activity paused, not stopped; no input reaches us | brief by nature |
+| Split-screen / multi-window, Telegram not focused | normal idle window | input stops arriving | — |
+
+### A7. Surface taxonomy
+
+Internal surfaces (stored as small ints, stable):
+
+| Id | Surface | Display category | Per-dialog key |
+| --- | --- | --- | --- |
+| 1 | CHAT_PRIVATE | Private Chats | user id |
+| 2 | CHAT_SECRET | Private Chats | encrypted dialog id |
+| 3 | CHAT_BOT | Bots | bot user id |
+| 4 | CHAT_SAVED | Other (listed as "Saved Messages") | self id |
+| 5 | CHAT_GROUP (basic, supergroup, forum topic, comments thread) | Groups | chat dialog id (parent for topics) |
+| 6 | CHAT_CHANNEL (broadcast, channel direct messages) | Channels | channel dialog id |
+| 7 | CHAT_LIST (main list, archive, folders, community lists, topics side panel) | Chat List | 0 |
+| 8 | SEARCH (chat-list search, hashtag search mode) | Search | 0 |
+| 9 | STORIES | Stories | 0 |
+| 10 | MEDIA_VIEWER (`PhotoViewer`, `SecretMediaViewer`, Instant View) | Media | 0 |
+| 11 | PROFILE (any profile, including own) | Other ("Profiles") | 0 |
+| 12 | SETTINGS | Other ("Settings") | 0 |
+| 13 | CALL | Calls | 0 |
+| 14 | LOCAL_HISTORY | Local History | `LocalDialogIds.LOCAL_HISTORY` |
+| 15 | OTHER | Other | 0 |
+
+Decisions: bots are their own category (bot use is neither a conversation with a person nor a channel); Saved Messages is
+personal storage, counted under Other but visible in Most Used; secret chats are private chats; topics roll up to their group;
+channel comments count as Groups (the discussion group is where the time goes); the Local History Chat is its own category and
+never Private Chats. Display categories with zero time are hidden.
+
+### A8. Surface-classification architecture
+
+Three pieces, all central:
+
+* `UsageSurface` (pure enum + display mapping).
+* `UsageClassifier` (pure, unit-tested): `SurfaceKey classify(FragmentFacts top, OverlayFacts overlays, boolean inSettingsContext)`
+  where `FragmentFacts` is a plain value (kind, dialog id, chat mode, isBot, isSelf, isChannel, isMegagroup, isForum, isEncrypted,
+  searchShown, folderId) produced by the Android adapter. Priority: call connected > media viewer > stories > Instant View >
+  top fragment.
+* `UsageSurfaceResolver` (Android): builds the facts from `LaunchActivity`:
+  1. overlays: `VoIPService`/group call state, `PhotoViewer.hasInstance() && isVisible()`, `SecretMediaViewer`, `StoryViewer`
+     (`globalInstances` or the top fragment's `getLastStoryViewer()`), `ArticleViewer`;
+  2. top fragment: top of `sheetFragmentsStack`, else on tablets the layers layout if visible, else the right layout's last
+     fragment if non-empty and not `tabletFullSize`, else `actionBarLayout.getLastFragmentIncludeMainTabs()`; `BubbleActivity`
+     when it is the foreground activity;
+  3. settings context: `SettingsActivity` is in the stack below the top fragment and the top is not a chat, profile, chat list,
+     story or viewer (no list of settings classes needed).
+
+Fragment kinds recognized by type: `ChatActivity`, `DialogsActivity`, `TopicsFragment`, `ProfileActivity`/`ProfileActivity2`,
+`SettingsActivity`, `LocalHistoryActivity` (and its profile/edit screens), `CallLogActivity` (OTHER), `ContactsActivity` (OTHER).
+Everything else is OTHER unless in settings context. Adding a type is one line in the resolver.
+
+`ChatActivity` mapping: `getCurrentEncryptedChat() != null` -> SECRET; user: self or `MODE_SAVED` -> SAVED, `isBot` -> BOT,
+else PRIVATE; chat: `isChannelAndNotMegaGroup` or `isMonoForum` -> CHANNEL, else GROUP (topic key = parent dialog);
+`MODE_SEARCH` -> SEARCH; `MODE_QUICK_REPLIES`, `MODE_EDIT_BUSINESS_LINK`, `MODE_WELCOME_MESSAGES` -> SETTINGS; other modes keep
+the dialog's surface.
+
+Resolution triggers (each just marks the resolver dirty; one coalesced UI-thread runnable resolves): `BaseFragment.onResume` /
+`onPause` (next to the existing `ProtectedChatGate` calls), `ActionBarLayout.onFragmentStackChanged`, `MainTabsActivity.onViewPagerScrollEnd`,
+viewer open/close, `StoryViewer` open/close, `DialogsActivity.showSearch`, call start/end, `activeAccountChanged`.
+
+### A9. Per-dialog accounting
+
+* Key: `(accountUserId, dialogId)` with the dialog id Telegram uses (users > 0, chats < 0, secret chats encrypted id, local
+  history reserved id). No names or avatars stored.
+* Display resolves names dynamically: `MessagesController.getUser/getChat/getEncryptedChat` (loading from storage if needed);
+  the local history id resolves through `ProtectedDialogIdentity` (Reference B §28).
+* Migrated groups: rows keyed by the old basic-group id are merged into the channel's row at display time when
+  `chat.migrated_to` is known, and rewritten at the next rollup.
+* Topics: parent dialog only in v1.
+* Chat no longer exists / account deleted / secret chat gone: the row stays with "Deleted chat" / "Deleted account" and a
+  placeholder avatar; time is never dropped from category totals.
+* Protected chats: time is always counted. The Activity UI shows identity and time only (Protected Chats already never hides
+  identity); tapping a row opens the chat through `ProtectedChatGate`.
+
+### A10. Multi-account behavior
+
+* Every credit carries the account's `clientUserId` at that moment (`UserConfig.selectedAccount`).
+* The dashboard shows **all accounts combined** for totals, categories and charts (the question is about time in the app), and
+  Most Used chats from all accounts, with a small account avatar on rows when more than one account is logged in.
+* `activeAccountChanged` closes the current segment.
+* Account removal (`UserConfig.clearConfig`, next to `ProtectedChats.onAccountRemoved`): per-dialog rows of that user id are
+  re-keyed to `dialog_id = 0` (time stays in totals and categories; chat identities are dropped).
+
+### A11. Storage schema
+
+Feature-owned SQLite file `getNoBackupFilesDir()/usage/usage.db` via `org.telegram.SQLite.SQLiteDatabase` (bundled sqlite
+3.39.3 supports `ON CONFLICT DO UPDATE`), WAL, own `DispatchQueue("usageQueue")`. Not `SharedPreferences` (needs range
+queries and upserts), not `cache4.db` (wiped on logout and "clear database"), not a `StatsController`-style flat file (needs
+dialog-level rows).
+
+```sql
+CREATE TABLE meta(key TEXT PRIMARY KEY, value BLOB);     -- schema_version, created_at, last_rollup_day
+CREATE TABLE bucket(
+  day INTEGER NOT NULL,        -- local date yyyymmdd at credit time
+  hour INTEGER NOT NULL,       -- 0..23, or -1 after rollup
+  account INTEGER NOT NULL,    -- clientUserId
+  surface INTEGER NOT NULL,
+  dialog INTEGER NOT NULL,     -- 0 when not per-dialog
+  seconds INTEGER NOT NULL,
+  PRIMARY KEY(day, hour, account, surface, dialog)) WITHOUT ROWID;
+CREATE INDEX bucket_dialog ON bucket(account, dialog, day);
+CREATE TABLE daily(
+  day INTEGER NOT NULL, account INTEGER NOT NULL,
+  opens INTEGER NOT NULL DEFAULT 0, sessions INTEGER NOT NULL DEFAULT 0,
+  longest_session INTEGER NOT NULL DEFAULT 0,   -- seconds
+  messages_sent INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(day, account)) WITHOUT ROWID;
+```
+
+### A12. Aggregation and retention
+
+* Credits are split at local hour boundaries when they are booked (§13), so `bucket` always holds whole hours.
+* **Rollup** (run at most once per day, at the first flush after midnight, on `usageQueue`): rows older than **90 days** are
+  summed into `hour = -1` rows per `(day, account, surface, dialog)`; the hour-of-day chart only needs recent data.
+* Rows older than **2 years** keep categories but fold dialogs with less than 60 s on a day into `dialog = 0`.
+* Growth (bytes per row about 40 + index):
+
+| Usage | rows/day (hourly) | 30 days | 1 year | 5 years |
+| --- | --- | --- | --- | --- |
+| typical (2 h, ~10 chats) | ~60 | 0.1 MB | ~0.6 MB | ~2 MB |
+| heavy (8 h, ~40 chats, every hour) | ~300 | 0.55 MB | ~2.5 MB | ~7 MB |
+
+  Assumes ~60 bytes per row including the primary key. Without rollup heavy use would reach about 6.6 MB a year and 33 MB in
+  five years; rollup keeps it a few MB.
+
+### A13. Write / flush strategy
+
+* Accounting is in memory: `UsageAccountant` books credits into a `UsageLedger` (`HashMap<BucketKey, Integer>` seconds).
+* Flush (one transaction of upserts on `usageQueue`) when: the app goes to the background (`ForegroundDetector.onBecameBackground`),
+  the screen turns off, the dashboard opens, the account changes, or unflushed time reaches **5 minutes** (checked at accounting
+  events; no timer).
+* Crash/process-death loss is bounded by 5 minutes of foreground time; background flushes make loss after the app is left zero.
+* Clock: durations use `SystemClock.elapsedRealtime()`; the local day/hour of a credit uses `System.currentTimeMillis()` and the
+  default time zone **at booking time**. A wall-clock jump or time-zone change only moves where future credits are booked; an
+  interval is never double counted or negative because durations are monotonic. A credit spanning midnight is split.
+
+### A14. Performance and battery budget
+
+Hard constraints for implementation:
+
+* Per input event: one `long` store and one comparison on the UI thread. No allocation, no locking, no logging.
+* Per navigation event: mark dirty; at most one resolver run per UI frame (posted runnable, coalesced).
+* No timers, no `Handler` loops, no services, no alarms, no wake locks, no `JobScheduler`.
+* Disk writes only at flush boundaries (§13): typically a few per hour of use.
+* Dashboard queries on `usageQueue`, each bounded by the period's rows (< 10 ms on the heavy estimate).
+* No per-frame or per-scroll work; no reflection on hot paths.
+
+### A15. Dashboard UX
+
+`UsageReportActivity` (`UniversalFragment`, title "Activity"):
+
+1. **Segmented control** Today / Week / Month (Telegram's existing tab-style control used in statistics screens).
+2. **Summary**: total active time (large), comparison line "32 min less than yesterday" / "than last week" / "than last month",
+   using the same elapsed fraction of the previous period for Today ("by this time yesterday") to avoid unfair comparisons.
+3. **Chart**: Today: hours 0-23 stacked by category; Week: 7 days stacked; Month: days stacked.
+4. **Categories**: rows with category color dot, name, time, percent bar (non-overlapping, sums to the total).
+5. **Most Used**: top 10 chats (avatar, name, time; tap opens the chat). "Show more" up to 50.
+6. **More**: messages sent, app opens, longest session, calls total.
+7. Footer: "Activity is measured only on this device and never leaves it." and **Reset Activity** (confirm dialog: deletes
+   `usage.db` content).
+
+Empty state (first day, nothing yet): illustration-free text "Activity will appear here as you use Telegram." with the footer.
+
+### A16. Charts and metrics
+
+| Metric | v1 | Reason |
+| --- | --- | --- |
+| total active time + previous period | yes | core answer |
+| category breakdown | yes | core answer |
+| per-chat top list | yes | core answer |
+| time by hour (Today chart) | yes | cheap, from hourly buckets |
+| daily totals (Week/Month chart) | yes | cheap |
+| messages sent | yes | factual "communication" signal (see below) |
+| app opens (foreground transitions) | yes | cheap, understood |
+| longest session (continuous active time without a gap > 5 min or background) | yes | one number per day |
+| call duration | yes, as the Calls category | already measured |
+| time by day of week | no (later) | needs months of data to mean anything |
+| monthly totals across months | no (later) | Month view covers v1 |
+
+**Communication vs consumption:** a robust split by intent is not possible from the source: time in a group is reading and
+writing mixed, time in a private chat can be reading a long forward, and Telegram exposes no reliable signal of composing
+versus reading beyond messages sent. Showing "Communication 62%" would be fake precision. v1 shows the factual pieces instead:
+categories (Private Chats / Groups / Channels are understandable on their own) plus **messages sent** per period. A later
+version can add "time in chats where you wrote that day" (derivable from per-dialog sent counts) if wanted.
+
+Messages sent: counted at the existing `StatsController.incrementSentItemsCount(..., TYPE_MESSAGES, n)` call sites in
+`SendMessagesHelper` (server confirmed; forwards counted per message), plus the `SecretChatHelper` confirmation. Scheduled
+messages count when sent by the server.
+
+Charts: `StatisticActivity.ChartViewData` + `StatisticActivity.createChartData(json, VIEW_TYPE_STACKBAR, false)` +
+`UItem.asChart(...)`; series colors from existing `statisticChartLine_*` theme keys mapped per category.
+
+### A17. Settings integration
+
+* `SettingsActivity.fillItems`: one new `SettingCell.Factory.of(24, ..., R.drawable.<activity icon>, "Activity", "<today total>")`
+  placed after Data and Storage; `onClick` case 24 -> `presentSettingFragment(new UsageReportActivity())`.
+* Settings search: `ProfileActivity.SearchAdapter.onCreateSearchArray` entry id 1000 ("Activity") with `tg://settings/activity`
+  if `LinkManager` routes settings links (Phase A5 checks).
+* Legacy own-profile rows in `ProfileActivity` are not extended (the new `SettingsActivity` is the settings home in this build).
+
+### A18. Theme and accessibility
+
+* All colors from `Theme` keys (`windowBackgroundWhite`, `windowBackgroundWhiteBlackText`, `windowBackgroundWhiteGrayText`,
+  `statisticChartLine_*`); no hard-coded colors; observe `NotificationCenter.didSetNewTheme` through `UniversalFragment`.
+* Time formatting via `LocaleController` (plural-aware strings, `formatPluralString`); 24h/12h from `LocaleController.is24HourFormat`.
+* Content descriptions: summary row reads "Today, 3 hours 42 minutes"; category rows read name, time, percent; charts have a
+  text summary row for TalkBack.
+* RTL: `LayoutHelper` + `LocaleController.isRTL` like other settings screens.
+
+### A19. Lifecycle handling
+
+| Event | Effect |
+| --- | --- |
+| foreground (`ForegroundDetector.onBecameForeground`) | open session, count an app open, start segment on resolved surface |
+| background (`onBecameBackground`) | close segment, close session, flush |
+| screen off / on (`screenStateChanged`) | close / reopen segment |
+| activity pause without stop (permission dialog) | nothing; idle window applies |
+| navigation, tab settle, sheet, viewer, search, call start/end | close segment, resolve, open new segment |
+| account switch | close segment, flush, open with new account |
+| Protected Chats gate sheet over a chat | the chat stays the surface (sheet is a `BottomSheet`); time while authenticating is short and real |
+| configuration change / activity recreation | `ForegroundDetector` refcount keeps foreground; segment continues; resolver re-runs |
+
+### A20. Process-death handling
+
+In-memory ledger lost; at most 5 minutes of foreground time (§13). On start, no recovery is attempted; there is no "open
+segment" on disk to repair. The database is always consistent (transactions).
+
+### A21. Edge cases
+
+* Bubble chats (`BubbleActivity`): treated as the chat they show.
+* `ExternalActionActivity` / passcode screen: OTHER while the app lock (`PasscodeView`) covers content.
+* Split screen with Telegram visible but another app focused: no input -> idle after 60 s.
+* Tablet with chat list and chat both visible: the right pane chat wins (where the user reads and types); the left list gets time
+  only when the right pane is empty.
+* Main-tabs swipe (two tabs resumed): resolved after `onViewPagerScrollEnd`.
+* `RightSlidingDialogContainer` topics panel: Chat List.
+* Forward picker / share picker (`DialogsActivity` with `onlySelect`): OTHER (selection, not reading the list).
+* Day boundary while active: split at midnight.
+* Device reboot: `elapsedRealtime` resets; no open segment survives, so no artifact.
+* User changes clock backwards: new credits book under the new date; nothing negative.
+* Very long session without input but with video playing: counts (engaged passive).
+
+### A22. Testing architecture
+
+Pure core in `messenger/usage/`: `UsagePolicy`, `UsageSurface`, `UsageClassifier`, `UsageAccountant`, `UsageLedger`,
+`UsageClock` (interface: `elapsed()`, `wallMillis()`, `zone()`), `UsageReportMath` (period ranges, comparisons, percentages).
+Android adapters (`UsageTracker`, `UsageSurfaceResolver`, `UsageStore`) stay thin. Tests use a `FakeClock` and drive the
+accountant with event scripts.
+
+### A23. Unit tests (JVM, `TMessagesProj/src/test/java/org/telegram/messenger/usage/`)
+
+* `UsageAccountantIdleTest`: 2 min of inputs then 20 min silence -> 3 min; gap 59 s fully counted; gap 61 s counts 60 s.
+* `UsageAccountantForegroundTest`: background/screen-off stops crediting immediately; pause-without-stop does not.
+* `UsageAccountantSurfaceTest`: transitions credit the old surface up to the switch; no second credited twice (sum of
+  credits == wall active time for random scripts, property-style with a fixed seed).
+* `UsageAccountantPassiveTest`: video/story/voice extend; music does not; playback in background does not.
+* `UsageAccountantCallTest`: call exclusivity, screen off during call still counts, call end resumes surface.
+* `UsageAccountantClockTest`: midnight and hour splits, DST change, wall-clock jump forward/backward, time-zone change.
+* `UsageClassifierTest`: every row of §7 and the `ChatActivity` mode mapping; settings context; overlays priority.
+* `UsageLedgerTest` / `UsageRollupTest`: aggregation, rollup to `hour = -1`, dialog folding after 2 years.
+* `UsageAccountIsolationTest`: credits keyed per account user id; account removal re-keys to dialog 0.
+* `UsageReportMathTest`: Today vs "by this time yesterday", week/month ranges per locale first day of week, percentages
+  summing to 100 with rounding.
+* Negative controls: removing the idle cap must fail the 20-minute test; double-booking on surface change must fail the sum
+  property.
+
+### A24. Integration / device tests
+
+* Instrumented (`TMessagesProj_AppTests/src/androidTest`): `UsageStoreTest` against a real sqlite file (upserts, rollup,
+  reset, concurrent flush while querying).
+* Device QA script: (1) scroll list 2 min, leave phone untouched with screen on 5 min -> Chat List about 3 min; (2) read a
+  channel 5 min with occasional scrolls -> Channels; (3) open a photo then video -> Media; (4) stories 2 min -> Stories;
+  (5) 3-minute call with screen off at the ear -> Calls 3 min, nothing else in that period; (6) switch account mid-chat ->
+  split per account; (7) background for 10 min -> nothing; (8) tablet: list + chat -> chat; (9) reset clears; (10) theme
+  switch on the dashboard; (11) protected chat time appears without content; (12) Local History Chat time appears under
+  Local History.
+
+### A25. Implementation phases
+
+| Phase | Goal | Depends | Files | APIs | Tests | Gate | Not yet |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| A1 Core accounting | pure accountant, policy, clock, ledger, surfaces enum | — | `messenger/usage/UsagePolicy`, `UsageSurface`, `UsageClock`, `UsageAccountant`, `UsageLedger` | `onInput`, `onForeground/Background`, `onScreen`, `onSurface`, `onPassive`, `onCall`, `drain()` | §23 accountant tests | JVM tests green | Android hooks, storage, UI |
+| A2 Classification | classifier + Android resolver | A1 | `usage/UsageClassifier`, `UsageSurfaceResolver`, `DialogsActivity` (public `isSearchShown()`), Local History fragment types later | `classify(...)`, `resolve()` | classifier tests | resolver logs surfaces in debug builds on device (counts only) | storage, UI |
+| A3 Signals | wire input/foreground/screen/navigation/playback/calls into `UsageTracker` | A2 | `usage/UsageTracker`, `LaunchActivity` (`onUserInteraction`, `dispatchKeyEvent`), `BottomSheet`, `AlertDialog`, `PhotoViewer`, `SecretMediaViewer`, `StoryViewer`, `ArticleViewer`, `ChatActivityEnterView`, `BaseFragment` (next to `ProtectedChatGate` calls), `ActionBarLayout.onFragmentStackChanged`, `MainTabsActivity.onViewPagerScrollEnd`, `ApplicationLoader` (listener registration) | `UsageTracker.onUserInput()`, `onNavigationChanged()` | existing suites unchanged | device check: debug overlay or log of credited seconds per surface over QA steps 1-8 | persistence, UI |
+| A4 Persistence | store, flush, rollup, account removal, messages sent/opens/sessions | A3 | `usage/UsageStore`, `UserConfig.clearConfig`, `SendMessagesHelper` (3 sites), `SecretChatHelper` | `flush()`, `query(range)`, `reset()`, `onAccountRemoved(uid)` | rollup/isolation tests; instrumented `UsageStoreTest` | kill the process mid-use: loss <= 5 min; DB size check | UI |
+| A5 Dashboard | `UsageReportActivity`, Settings row, search entry, strings | A4 | `ui/UsageReportActivity`, `SettingsActivity`, `ProfileActivity.SearchAdapter`, `res/values/strings.xml`, icon drawable | — | report-math tests | QA 9-11, light/dark, RTL, TalkBack | Local History surface |
+| A6 Integration + hardening (Part 3) | Local History surface (needs LH4 from Part 2), tablet rules, backup rules, performance review | A5, LH4 | `UsageClassifier`, resolver, manifest rules shared with Local History | — | full suite | full QA §24 incl. 12 | — |
+
+### A26. Files / classes expected to change
+
+New: `messenger/usage/UsagePolicy`, `UsageSurface`, `UsageClock`, `UsageAccountant`, `UsageLedger`, `UsageClassifier`,
+`UsageSurfaceResolver`, `UsageTracker`, `UsageStore`, `UsageReportMath`; `ui/UsageReportActivity`.
+
+Existing (small hooks): `LaunchActivity`, `ApplicationLoader`, `BaseFragment`, `ActionBarLayout`, `MainTabsActivity`,
+`BottomSheet`, `AlertDialog`, `PhotoViewer`, `SecretMediaViewer`, `Stories/StoryViewer`, `ArticleViewer`,
+`Components/ChatActivityEnterView`, `DialogsActivity` (getter), `SendMessagesHelper`, `SecretChatHelper`, `UserConfig`,
+`SettingsActivity`, `ProfileActivity` (search array only), `res/values/strings.xml`, one drawable, manifest backup rules (shared).
+
+Not changed: `MessagesController`, `MessagesStorage`, `ConnectionsManager`, `ChatActivity` (classification only reads its
+public getters).
+
+### A27. Risks and open questions
+
+Product decisions needed:
+
+* **Q1** Idle window 60 s (recommended) or a different value?
+* **Q2** Calls count even with the screen off, as their own category (recommended)? Should long muted participation in group
+  calls / live streams count the same way?
+* **Q3** Music with Telegram in front: no extension beyond the idle window (recommended)?
+* **Q4** Dashboard totals across all accounts with per-chat rows tagged by account (recommended) vs per-account dashboards?
+* **Q5** Picture-in-picture video over other apps: not counted (recommended)?
+* **Q6** Should Saved Messages and Bots be top-level categories or folded into Other?
+
+Technical risks:
+
+* Input from windows without a hook is missed; mitigated by the hook list in §5 and the idle window, verified in QA.
+* Tablet multi-pane attribution is a heuristic (§21).
+* `MainTabsActivity` and upstream navigation changes can add new containers; the resolver is the single place to update.
+* Chart cell internals (`UniversalChartCell`) are upstream code; v1 relies on its "no token, no load" behavior (verified in R§6).
+
+### A28. Acceptance criteria
+
+1. Settings → Activity opens a native-looking screen in light and dark themes with Today / Week / Month, total, comparison,
+   chart, categories, Most Used, secondary metrics, empty state and reset.
+2. Category times never overlap and sum to the total; each active second is credited once (property test).
+3. The 2-minute-scroll / 20-minute-idle scenario reports about 3 minutes.
+4. Background, screen off and app switch stop accounting immediately; a connected call counts as Calls.
+5. Protected chats count time and show identity only; Local History time appears under Local History.
+6. No network request, no background service, no timer, no wake lock is added (code review + QA).
+7. Data lives in `no_backup`, survives restart and process death (bounded loss of 5 min), is reset by the user, and is
+   anonymized per account on logout.
+8. Storage stays within the §12 estimates under the heavy profile.
+9. All §23 tests pass, negative controls fail when the protected behavior is removed, existing test suites stay green.
+
+
+---
+
+## Reference B: Local History Chat specification
+
+Planning name: **Local History Chat** (final product name not chosen). Evidence: [local-history-chat-research.md](local-history-chat-research.md).
+Independent of Activity; the only coupling is one surface classification (B30). Phases LH1-LH5 are delivered in Part 2, LH6-LH8 in Part 3.
+Part 2 moves the enable switch and "Delete all local history" from LH8 into LH4 (see Part 2).
+
+### B1. Product scope
 
 One local conversation per Telegram account, shown in that account's chat list, that looks like a group. It preserves:
 
@@ -18,7 +561,7 @@ One local conversation per Telegram account, shown in that account's chat list, 
 The original private chat is untouched: no placeholder, no "deleted" marker, no change to Telegram's own edit display.
 All data stays on the device.
 
-## 2. Non-goals
+### B2. Non-goals
 
 * No anti-delete in the original chat, no change to `ChatActivity` or `messages_v2`.
 * No groups, supergroups, channels, topics, secret chats, bots, Saved Messages, service accounts, outgoing messages.
@@ -28,7 +571,7 @@ All data stays on the device.
 * No forwarding of preserved content as Telegram forwards (§10).
 * No inclusion of archived content in global search.
 
-## 3. Source eligibility
+### B3. Source eligibility
 
 Exactly one pure function decides; everything else calls it.
 
@@ -54,20 +597,20 @@ private users and are eligible (a business bot replying on the user's behalf is 
 tiny value (`bot`, `self`, `deleted`) so the function stays pure; the caller resolves it from `MC.getUser` or
 `MS.getUserSync` on the storage thread.
 
-## 4. Edit update flow (actual)
+### B4. Edit update flow (actual)
 
 R§1: `processUpdates` -> `processUpdateArray` (stage) collects `editingMessages` -> `MS.putMessages(res, dialogId, -2, 0, false,
 0, 0)` (storage) -> old row read and deserialized -> `REPLACE INTO messages_v2` -> old media deleted if replaced -> commit.
 The UI gets `replaceMessagesObjects` directly from stage; it is not used.
 
-## 5. Deletion update flow (actual)
+### B5. Deletion update flow (actual)
 
 R§2: `processUpdateArray` `deletedMessages[0]` (ids only) -> storage runnable -> `MS.markMessagesAsDeleted(0, ids, false, true, 0,
 0)` (reads rows by `mid IN (...) AND is_channel = 0`, queues file deletion, deletes rows) -> `updateDialogsWithDeletedMessages`.
 Push: `PushListenerController` `MESSAGE_DELETED` -> `MC.deleteMessagesByPush(dialogId, ids, channelId)` -> storage, same
 `markMessagesAsDeleted`.
 
-## 6. Remote vs local deletion
+### B6. Remote vs local deletion
 
 * Capture runs only on the two **remote entry points** (update key 0, push with `channelId == 0`), never inside
   `markMessagesAsDeletedInternal`, which local deletions share.
@@ -81,7 +624,7 @@ Push: `PushListenerController` `MESSAGE_DELETED` -> `MC.deleteMessagesByPush(dia
   `TL_updateDeleteMessages`. v1 archives them, but a single source dialog losing more than 20 messages in one update is stored
   with a shared `batch_id` and rendered as one collapsed entry ("37 messages removed from the chat with Alice", expandable).
 
-## 7. Capture points
+### B7. Capture points
 
 ### 7.1 Edits
 
@@ -144,7 +687,7 @@ if (key == 0) {   // TL_updateDeleteMessages only; channels never
 Cost when nothing is eligible: one indexed SELECT per update batch (the same rows `markMessagesAsDeletedInternal` reads a moment
 later, now in the page cache).
 
-## 8. Idempotency
+### B8. Idempotency
 
 | Event | Unique key | Effect of a replay |
 | --- | --- | --- |
@@ -156,7 +699,7 @@ later, now in the page cache).
 identity. The update path and the push path for the same deletion converge on the same key. A crash after our commit but before
 Telegram's commit replays the update; the old row is still the old one, so the diff and keys are identical.
 
-## 9. Event / revision model
+### B9. Event / revision model
 
 **Chosen: one feed entry per source message with an expandable revision history** (option B).
 
@@ -176,7 +719,7 @@ Telegram's commit replays the update; the old row is still the old one, so the d
 * Link previews: kept as stored (`TL_messageMediaWebPage` with its `webpage`), with photos subject to §10 like any media.
 * Captions and entities: part of the serialized message; rendered natively.
 
-## 10. Media preservation
+### B10. Media preservation
 
 States per archived media: `PRESERVED` (file in feature storage), `PENDING_COPY`, `NOT_DOWNLOADED` (never on device),
 `TOO_LARGE`, `OVER_BUDGET`, `LOST` (original vanished before the copy, e.g. cache cleanup), `EVICTED` (removed by the budget or
@@ -216,7 +759,7 @@ rewrites the stored message:
 
 This keeps `FileLoader`/`FileRefController` from ever requesting a file whose parent is the synthetic dialog.
 
-## 11. Synthetic-dialog architectures considered
+### B11. Synthetic-dialog architectures considered
 
 | # | Architecture | Collision | Network | ChatActivity/DB assumptions | Verdict |
 | --- | --- | --- | --- | --- | --- |
@@ -227,7 +770,7 @@ This keeps `FileLoader`/`FileRefController` from ever requesting a file whose pa
 | 5 | Local pseudo-group (`TLRPC.Chat` with fake id) | needs a fake chat id, which is a real-looking negative id | `getInputPeer` -> `inputPeerChat`, a real group's id | `getChat` consumers everywhere | rejected: most dangerous |
 | 6 | Saved Messages sub-dialog / server group | — | server-side | — | out of product scope |
 
-## 12. Chosen architecture
+### B12. Chosen architecture
 
 **Dedicated `LocalHistoryActivity` (a `BaseFragment`) built on the `ChannelAdminLogActivity` pattern, an adapter-level row in
 the chat list, a local-only identity, and a reserved id that exists only for Protected Chats and Activity.**
@@ -237,7 +780,7 @@ the chat list, a local-only identity, and a reserved id that exists only for Pro
 * Telegram's dialog model, `cache4.db` and the network layer never see the reserved id.
 * Data lives in a feature-owned SQLite file per account user id.
 
-## 13. Collision and network safety
+### B13. Collision and network safety
 
 Identity: `LocalDialogIds.LOCAL_HISTORY = 0x20004C4800000001L` (proof R§3), with `LocalDialogIds.isLocal(long)` (exact
 compare). One value for all accounts; account isolation comes from the account key, as in Protected Chats.
@@ -256,7 +799,7 @@ Guardrails (defense in depth on top of "never handed to Telegram code"):
 
 Dedicated tests in §34 (`LocalDialogIdsTest`, `LocalHistoryNetworkGuardTest`).
 
-## 14. Chat-list integration
+### B14. Chat-list integration
 
 * `DialogsAdapter`: new `VIEW_TYPE_LOCAL_HISTORY`. In `updateItemList`, only when `dialogsType == DIALOGS_TYPE_DEFAULT`,
   `folderId == 0`, the "All chats" filter (or no filter), `communityId == 0`, not `onlySelect`, and the feature is on with at
@@ -274,7 +817,7 @@ Dedicated tests in §34 (`LocalDialogIdsTest`, `LocalHistoryNetworkGuardTest`).
   last entry, unread) on every `updateItemList`; the repository posts `NotificationCenter.localHistoryChanged` (new global id)
   on change, and `DialogsActivity` observes it to call `dialogsAdapter.notifyDataSetChanged` through its normal update path.
 
-## 15. Rendering strategy
+### B15. Rendering strategy
 
 `LocalHistoryActivity`:
 
@@ -287,7 +830,7 @@ Dedicated tests in §34 (`LocalDialogIdsTest`, `LocalHistoryNetworkGuardTest`).
   `isEdited()`; v1 sets the flag and overrides the label text through a small hook `ChatMessageCell.setCustomStatusText`).
 * No input field. Action bar: name + subtitle ("12 deleted · 30 edited"), avatar, menu (Search, Clear history, Info).
 
-## 16. Group-style sender rendering
+### B16. Group-style sender rendering
 
 * `messageCell.isChat = true`; `eventId` = entry id so `MessageObject.needDrawAvatar()` is true; `peer_id` = `TL_peerUser`
   (source user), `from_id` = `TL_peerUser` (source user), `dialog_id` = `LOCAL_HISTORY`.
@@ -298,14 +841,14 @@ Dedicated tests in §34 (`LocalDialogIdsTest`, `LocalHistoryNetworkGuardTest`).
   names and photos would duplicate personal data. Captured fallback: the entry stores only the display name string at capture
   time (`source_name_snapshot`) used when the user cannot be resolved anymore (account deleted, user not in cache).
 
-## 17. Sender profile navigation
+### B17. Sender profile navigation
 
 Avatar / name tap -> the real `ProfileActivity` (`user_id` args) of the source user, exactly like the admin log. Long press on
 the avatar -> `AvatarPreviewer` as in the admin log. "Show in chat" (entry menu) opens the real private chat at the message id
 when the message still exists (edits), otherwise the chat without a jump. Both go through `ProtectedChatGate` like any route,
 so a protected source chat asks first.
 
-## 18. Editable local name and photo
+### B18. Editable local name and photo
 
 * Stored in the feature database `meta` table: `title` (default "Local History" placeholder until named), `photo_path`
   (a JPEG in the feature directory).
@@ -317,14 +860,14 @@ so a protected source chat asks first.
   verify `ImageUpdater` makes no upload request when its delegate handles `didUploadPhoto` locally; if it does, use
   `PhotoAlbumPickerActivity` + `PhotoCropActivity` directly.
 
-## 19. Local profile / info page
+### B19. Local profile / info page
 
 `LocalHistoryProfileActivity` (`UniversalFragment`): header (avatar, name), rows: Edit (name/photo), Lock Settings (opens
 `ChatLockSettingsActivity` with the local id when `ProtectedChats.isLockSettingsAvailable`), Saved media size + Delete saved
 media, Clear history, explanation text (what is archived, other-device ambiguity, stays on this device). Not `ProfileActivity`:
 that class is built around real peers (full user/chat loads, shared media, stories).
 
-## 20. Search
+### B20. Search
 
 * In-chat search (action bar search field): `LIKE` over `entry.search_text` (lowercased normalized text of all revisions),
   results scroll to the entry. Respects the chat's lock (the activity is gated).
@@ -332,13 +875,13 @@ that class is built around real peers (full user/chat loads, shared media, stori
   rows when protected. Archived message content is **never** in global message search (privacy; `DialogsSearchAdapter`
   message results come from the server and `cache4.db` anyway).
 
-## 21. Unread / read model
+### B21. Unread / read model
 
 * `meta.last_read_entry_seq`; unread = entries with `seq > last_read_entry_seq`. Opening the chat marks all read locally.
 * Badge style is muted; it does **not** count toward `MC.unreadUnmutedDialogs`, folder counters, the app icon badge, or
   "mark all as read" in Telegram.
 
-## 22. Media viewer
+### B22. Media viewer
 
 `PhotoViewer.getInstance().setParentActivity(this); openPhoto(messageObject, ..., provider)` with a provider over the local
 entries (as the admin log does). `eventId != 0` disables shared-media searches (`needSearchImageInArr = false`). Video and voice
@@ -347,7 +890,7 @@ media to the gallery uses `MediaController.saveFile` on the local path. Gate: Ph
 to Telegram chats, or "Delete" for these objects (its menu reads `messageObject` flags and the provider; Phase 5 verifies each
 menu item).
 
-## 23. Clear / delete local history
+### B23. Clear / delete local history
 
 * Per entry: long press -> "Delete from Local History" (also deletes its preserved files).
 * All: "Clear history" (confirm dialog) deletes every entry, revision, file, and resets unread. Atomic in one transaction;
@@ -357,7 +900,7 @@ menu item).
 * Interplay with capture: deletion and capture are serialized on the database; an event that arrives during "Clear" lands
   after it (new entry), which is correct.
 
-## 24. Multi-account behavior
+### B24. Multi-account behavior
 
 **One Local History Chat per account** (keyed by `clientUserId`, never by slot):
 
@@ -368,7 +911,7 @@ menu item).
   `LocalHistory.onAccountRemoved(userId)` right next to it: closes the database, deletes the user's directory on the feature
   queue. Default: delete (privacy, matches Telegram wiping `cache4.db` on logout). Logging back in starts empty.
 
-## 25. Storage schema and indexes
+### B25. Storage schema and indexes
 
 Feature-owned SQLite via `org.telegram.SQLite.SQLiteDatabase`, `PRAGMA journal_mode = WAL`, `secure_delete = ON` (as `cache4.db`).
 
@@ -425,7 +968,7 @@ Growth estimate (one entry ~3 KB including two serialized revisions, search text
 Media dominates and is capped by the
 1 GB budget. No automatic text retention limit in v1; the info page shows the size.
 
-## 26. Migration strategy
+### B26. Migration strategy
 
 * `meta.schema_version` with ordered migrations in `LocalHistoryDatabase.migrate()`; never destructive without a copy.
 * Telegram TL layer changes: blobs are deserialized with `TLRPC.Message.TLdeserialize`, which keeps old constructors (cache4.db
@@ -433,7 +976,7 @@ Media dominates and is capped by the
   as plain text. Test `RevisionBlobRoundTripTest` pins current constructors.
 * `cache4.db` migrations (`MS.LAST_DB_VERSION`) do not affect the feature database.
 
-## 27. Android backup and privacy
+### B27. Android backup and privacy
 
 * Location: `getNoBackupFilesDir()` (excluded from Auto Backup, key/value and device transfer by platform contract).
 * Today's manifest: custom key/value `BackupAgent` (only `saved_tokens*` preferences), `allowBackup="true"`, no
@@ -443,7 +986,7 @@ Media dominates and is capped by the
 * Never sent over the network, never put in `cache4.db`, never in logs (`FileLog` lines carry ids and counts only, never text).
 * Screenshots: the existing credential-level FLAG_SECURE rules apply; no new rule.
 
-## 28. Protected Chats integration
+### B28. Protected Chats integration
 
 Reuse, do not fork. Changes:
 
@@ -467,7 +1010,7 @@ Reuse, do not fork. Changes:
 Invariants kept: one credential, one state machine, keys `(userId, dialogId)`, nothing unlocks without the sheet, folder ids
 still unsupported. No new password.
 
-## 29. Lifecycle / navigation integration
+### B29. Lifecycle / navigation integration
 
 * Feature start: `LocalHistory.init(account)` lazily on first capture or first chat-list build after the account is activated
   (`UserConfig.isClientActivated`), opening the database on the feature queue (`DispatchQueue("localHistoryQueue")`).
@@ -477,14 +1020,14 @@ still unsupported. No new password.
 * Process death: capture is committed before Telegram's own commit (§7); copies resume from `PENDING_COPY` (§10).
 * Navigation: `LocalHistoryActivity` is presented through `presentFragment` (gate applies); Back is ordinary.
 
-## 30. Activity integration
+### B30. Activity integration
 
 * Activity classifies `LocalHistoryActivity` (and its profile/edit screens) as surface `LOCAL_HISTORY`, display category
-  "Local History", per-dialog key `LocalDialogIds.LOCAL_HISTORY` (see activity-plan §7-9).
+  "Local History", per-dialog key `LocalDialogIds.LOCAL_HISTORY` (see Reference A §7-9).
 * Not counted as a private chat. The Activity per-chat list shows it with its local name/avatar via the same identity resolver.
 * Protection does not stop accounting; Activity shows identity and time only, never content.
 
-## 31. Performance
+### B31. Performance
 
 * Capture fast path when the feature is off: one static boolean read. When on and the dialog is not a user dialog: one compare.
 * Eligible edit: diff + one small transaction (< 1 ms typical) on storage.
@@ -492,7 +1035,7 @@ still unsupported. No new password.
 * No timers, no services, no wake locks; copies only after a capture.
 * UI: paged loads, `MessageObject` creation off the UI thread, no full-table scans outside search.
 
-## 32. Race conditions
+### B32. Race conditions
 
 | Case | Handling |
 | --- | --- |
@@ -512,7 +1055,7 @@ still unsupported. No new password.
 | Telegram DB migration / cleanup / clear database | no effect on our database; edits for cleared rows are not visible (documented) |
 | our DB migration | versioned migrations; capture disabled until migration finished (captures during startup are queued in memory, bounded to 500, else dropped with a log line) |
 
-## 33. Security invariants
+### B33. Security invariants
 
 1. The reserved id never appears in `MC.allDialogs`, `dialogs_dict`, `cache4.db`, or any TL request (G1-G4).
 2. Archived `MessageObject`s are never outgoing, unread, view-counted, reactable, or downloadable from the network (G5, §10).
@@ -523,7 +1066,7 @@ still unsupported. No new password.
 7. Data is per account user id and removed with the account.
 8. Protected Chats state for the local id follows the same rules as any dialog.
 
-## 34. Unit-test architecture
+### B34. Unit-test architecture
 
 Pure Java under `TMessagesProj/src/test/java/org/telegram/messenger/localhistory/` (JUnit 4, as existing tests):
 
@@ -542,7 +1085,7 @@ Pure Java under `TMessagesProj/src/test/java/org/telegram/messenger/localhistory
   "local delete creates no entry" test must fail; remove the content diff -> markup-only edit test must fail; drop the
   `isLocal` admission -> protected local test must fail.
 
-## 35. Integration tests
+### B35. Integration tests
 
 The repo has an instrumented test module, `TMessagesProj_AppTests` (`src/androidTest/kotlin`, `AndroidJUnitRunner`, used today by
 the lyrics rendering tests). Integration tests go there, run on an emulator or device, never on a hosted CI runner unless the
@@ -559,7 +1102,7 @@ owner asks:
 
 Pure logic stays in JVM unit tests (§34) so most coverage runs without a device.
 
-## 36. Device QA
+### B36. Device QA
 
 Two accounts A (owner) and B (other), plus A on a second device:
 
@@ -577,7 +1120,7 @@ Two accounts A (owner) and B (other), plus A on a second device:
 12. Open the chat for 2 minutes -> Activity shows "Local History" time.
 13. Open/close/scroll the chat with a network proxy log: zero requests attributable to it.
 
-## 37. Implementation phases
+### B37. Implementation phases
 
 Each phase: build the debug flavor, run `./gradlew :TMessagesProj:testDebugUnitTest` (or the repo's existing unit-test task),
 commit, next phase. No phase triggers CI workflows by itself beyond the normal push policy chosen at implementation time.
@@ -587,13 +1130,13 @@ commit, next phase. No phase triggers CI workflows by itself beyond the normal p
 | LH1 Identity + guards | reserved id, classifier, network guards | — | `messenger/localhistory/LocalDialogIds.java`; `MC.getInputPeer/getInputUser/getInputChannel`; `SendMessagesHelper.sendMessage` | `LocalDialogIds.LOCAL_HISTORY`, `isLocal`, `guardInputPeer` | `LocalDialogIdsTest`, `LocalHistoryNetworkGuardTest` | tests green; no behavior change for real ids | storage, capture, UI |
 | LH2 Storage + model | feature DB, schema, repository, eligibility, diff | LH1 | `localhistory/LocalHistoryDatabase.java`, `LocalHistoryRepository.java`, `LocalHistoryEligibility.java`, `LocalHistoryDiff.java`, `LocalHistory.java` (per-account entry point, `onAccountRemoved`), `UserConfig.clearConfig` | repository interface (`recordEdit`, `recordDeletion`, `pageFeed`, `clear`, `deleteEntry`, `summary`) | eligibility, diff, ledger tests | DB created in `no_backup`; account removal deletes it | capture hooks, UI |
 | LH3 Capture | edit and deletion capture | LH2 | `MS.putMessages` (+`fromEditUpdate` overload), `MS.getMessagesForArchiveSync`, `MC.processUpdateArray` (edit call site, deletion block), `MC.deleteMessagesByPush`, `localhistory/LocalHistoryCapture.java` | `onEditStored`, `onRemoteDeleteBeforeStorage` | ledger tests through capture entry points with fixtures; negative controls | device QA 1-4, 7-8 via a temporary debug dump (`FileLog` counts only) | media copy, UI |
-| LH4 Chat list row + read-only feed | row, `LocalHistoryActivity` with text rendering, date separators, sender grouping, avatars, unread | LH3 | `DialogsAdapter`, `DialogCell` (local mode), `DialogsActivity.onItemClick`, `NotificationCenter.localHistoryChanged`, `ui/LocalHistoryActivity.java`, `localhistory/LocalHistoryRenderModel.java` | render model | render-model tests (flags cleared, ids, no remote locations) | QA 13 (no requests), row positions, theme switch | media, profile, lock |
+| LH4 Chat list row + read-only feed | row, `LocalHistoryActivity` with text rendering, date separators, sender grouping, avatars, unread | LH3 | `DialogsAdapter`, `DialogCell` (local mode), `DialogsActivity.onItemClick`, `NotificationCenter.localHistoryChanged`, `ui/LocalHistoryActivity.java`, `localhistory/LocalHistoryRenderModel.java`, `PrivacySettingsActivity` (enable switch + Delete all local history, moved here from LH8 so Part 2 is safe to test) | render model | render-model tests (flags cleared, ids, no remote locations) | QA 13 (no requests), row positions, theme switch | media, profile, lock |
 | LH5 Media | holds, copier, budget, viewer, save to gallery | LH4 | `FL.deleteFiles`, `localhistory/LocalHistoryMediaHolds.java`, `LocalHistoryMediaCopier.java`, viewer provider | `hold/isHeld/release` | media state tests | QA 5-6 | profile, lock |
 | LH6 Profile + identity | info page, edit name/photo, clear/delete, revision sheet, in-chat search | LH5 | `ui/LocalHistoryProfileActivity.java`, `ui/LocalHistoryEditActivity.java`, `ui/Components/LocalHistoryRevisionsSheet.java` | — | identity storage test | QA 9 | lock |
 | LH7 Protected Chats | §28 items 1-9 | LH6 | `ProtectedChats`, `ProtectedChatGate`, `ProtectedDialogIdentity` (new), `ProtectedChatsListActivity`, `ChatLockSettingsActivity`, `DialogCell`, `DialogsSearchAdapter` | `ProtectedDialogIdentity.resolve` | `ProtectedLocalIdentityTest`, existing Protected Chats suites unchanged and green | QA 10 | — |
-| LH8 Settings + hardening | enable/disable switch (Privacy and Security), hide row, backup rules, logging review, bulk entry UI | LH7 | `PrivacySettingsActivity` (or the new settings screen), `AndroidManifest.xml` + `res/xml/data_extraction_rules.xml`, `res/xml/backup_rules.xml` | — | full suite | full device QA §36 | — |
+| LH8 Hardening | hide-row option, backup rules, logging review, bulk entry UI (the enable switch is already in LH4) | LH7 | `AndroidManifest.xml` + `res/xml/data_extraction_rules.xml`, `res/xml/backup_rules.xml` | — | full suite | full device QA §36 | — |
 
-## 38. Files / classes expected to change
+### B38. Files / classes expected to change
 
 New (`messenger/localhistory/`): `LocalDialogIds`, `LocalHistory`, `LocalHistoryDatabase`, `LocalHistoryRepository`,
 `LocalHistoryEligibility`, `LocalHistoryDiff`, `LocalHistoryCapture`, `LocalHistoryRenderModel`, `LocalHistoryMediaHolds`,
@@ -609,7 +1152,7 @@ early returns), `SendMessagesHelper` (G2), `FileLoader.deleteFiles` (one line), 
 
 Not changed: `ChatActivity`, `ProfileActivity`, `MessagesStorage` schema, `ConnectionsManager`.
 
-## 39. Risks and open questions
+### B39. Risks and open questions
 
 Product decisions needed:
 
@@ -630,7 +1173,7 @@ Technical risks:
 * Upstream TL layer changes could break blob deserialization; plain-text fallback mitigates.
 * Copy window vs. keep-media cleanup produces `LOST` in rare cases.
 
-## 40. Acceptance criteria
+### B40. Acceptance criteria
 
 1. Edits and deletions by ordinary private users of incoming messages appear in exactly one Local History entry per message,
    with the full observed revision chain, in the right account only.

@@ -103,4 +103,4 @@ calls `ProtectedChats.onAccountRemoved(clientUserId)`) -> `appDidLogout` -> `MS.
     `showAsSheet` fragments are classified as fragments; window viewers take priority over fragments while visible.
 19. **Charts:** `ui/Charts` via `StatisticActivity.ChartViewData` + `UItem.asChart`.
 20. **Account switches / process recreation:** `activeAccountChanged` ends the current segment; in-memory accounting is lost on
-    process death after the last flush (bounded, §13 of the plan).
+    process death after the last flush (bounded, A13 of docs/implementation-plan.md).

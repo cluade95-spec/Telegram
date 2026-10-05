@@ -201,7 +201,7 @@ unknown negative id becomes `TL_inputPeerChat{-id}` (a real group the user may b
 * If it leaks into a `DialogObject` classifier it reads as a **folder**, which no Telegram code turns into a network peer
   (folders use `folder_id` ints). This is the least dangerous interpretation available; it is defense in depth, not the
   safety mechanism. The safety mechanism is that the id never enters `MessagesController`, `MessagesStorage` or
-  `ConnectionsManager` (plan §13).
+  `ConnectionsManager` (docs/implementation-plan.md, B13).
 
 ---
 
