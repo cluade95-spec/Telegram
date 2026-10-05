@@ -117,6 +117,7 @@ import androidx.viewpager.widget.ViewPager;
 import com.google.android.exoplayer2.ui.AspectRatioFrameLayout;
 
 import org.json.JSONObject;
+import org.telegram.messenger.usage.UsageTracker;
 import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.AnimationNotificationsLocker;
 import org.telegram.messenger.ApplicationLoader;
@@ -1016,6 +1017,7 @@ public class ArticleViewer extends IArticleViewer implements NotificationCenter.
 
         @Override
         public boolean dispatchTouchEvent(MotionEvent ev) {
+            UsageTracker.onUserInput();
             if (pinchToZoomHelper.isInOverlayMode()) {
                 ev.offsetLocation(-containerView.getX(), -containerView.getY());
                 return pinchToZoomHelper.onTouchEvent(ev);
@@ -5713,6 +5715,7 @@ public class ArticleViewer extends IArticleViewer implements NotificationCenter.
             wm.updateViewLayout(windowView, windowLayoutParams);
         }
         isVisible = true;
+        UsageTracker.onNavigationChanged();
         animationInProgress = 1;
 
         if (openingAbove) {
@@ -6015,6 +6018,7 @@ public class ArticleViewer extends IArticleViewer implements NotificationCenter.
 
     private void onClosed() {
         isVisible = false;
+        UsageTracker.onNavigationChanged();
         for (int i = 0; i < pages.length; i++) {
             pages[i].cleanup();
         }

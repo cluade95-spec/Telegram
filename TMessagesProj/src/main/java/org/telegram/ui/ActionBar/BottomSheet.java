@@ -59,6 +59,7 @@ import androidx.core.view.NestedScrollingParent;
 import androidx.core.view.NestedScrollingParentHelper;
 import androidx.core.view.ViewCompat;
 
+import org.telegram.messenger.usage.UsageTracker;
 import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.AnimationNotificationsLocker;
 import org.telegram.messenger.BuildConfig;
@@ -1947,6 +1948,7 @@ public class BottomSheet extends Dialog implements BaseFragment.AttachedSheet {
         if (dismissed) {
             return false;
         }
+        UsageTracker.onUserInput();
         return super.dispatchTouchEvent(ev);
     }
 

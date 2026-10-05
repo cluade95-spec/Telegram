@@ -61,6 +61,7 @@ import androidx.core.content.ContextCompat;
 import androidx.core.graphics.ColorUtils;
 import androidx.core.view.WindowInsetsCompat;
 
+import org.telegram.messenger.usage.UsageTracker;
 import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.AnimationNotificationsLocker;
 import org.telegram.messenger.ChatObject;
@@ -1571,6 +1572,7 @@ public class ActionBarMenuItem extends FrameLayout {
 
                 @Override
                 public void onTextChanged(CharSequence s, int start, int before, int count) {
+                    UsageTracker.onTextInput();
                     if (ignoreOnTextChange) {
                         ignoreOnTextChange = false;
                         return;

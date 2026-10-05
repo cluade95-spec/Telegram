@@ -5,6 +5,7 @@ final class UsageTestUtil {
     }
 
     static long totalSec(UsageAccountant a) {
+        a.tick();
         return a.ledger().totalMs() / 1000;
     }
 

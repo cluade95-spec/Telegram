@@ -1,6 +1,7 @@
 package org.telegram.messenger.usage;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 
 import org.junit.Test;
 
@@ -46,5 +47,20 @@ public class UsageAccountantIdleTest {
         c.advanceSec(600); // no input
         a.onSurface(UsageSurface.CHAT_LIST, 0);
         assertEquals(60, UsageTestUtil.totalSec(a));
+    }
+
+    @Test
+    public void continuousInputIsSettledInChunksSoProcessDeathLosesLittle() {
+        FakeClock c = new FakeClock();
+        UsageAccountant a = UsageTestUtil.started(c);
+        for (int i = 0; i < 60; i++) { // 30 minutes, input every 30 s, no navigation
+            c.advanceSec(30);
+            a.onInput();
+        }
+        // everything except the last open chunk (< flush threshold) is already in the ledger
+        long inLedger = a.ledger().totalMs();
+        assertTrue(inLedger >= 25 * 60_000L);
+        a.tick();
+        assertEquals(30 * 60, UsageTestUtil.totalSec(a));
     }
 }

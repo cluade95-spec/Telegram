@@ -93,6 +93,7 @@ import android.widget.Toast;
 import androidx.annotation.Nullable;
 
 import org.json.JSONObject;
+import org.telegram.messenger.usage.UsageTracker;
 import org.telegram.messenger.AccountInstance;
 import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.ApplicationLoader;
@@ -4782,6 +4783,7 @@ public class VoIPService extends Service implements SensorEventListener, AudioMa
 			FileLog.d("== Call " + getCallID() + " state changed to " + state + " ==");
 		}
 		currentState = state;
+		UsageTracker.onCallConnected(state == STATE_ESTABLISHED);
 		if (currentState == STATE_ESTABLISHED) {
 			destroyConverting();
 		}

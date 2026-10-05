@@ -84,10 +84,11 @@ public class UsageAccountantClockTest {
         FakeClock c = new FakeClock(wall("UTC", 2024, 3, 10, 12, 0));
         UsageAccountant a = UsageTestUtil.started(c);
         c.advanceSec(10);
-        a.onInput();
+        a.onSurface(UsageSurface.CHAT_LIST, 0); // settles under the old date
         c.wall -= 3 * 86_400_000L; // user sets the clock back three days
         c.elapsed += 10_000;
         a.onInput();
+        a.tick();
         UsageLedger.Snapshot s = a.drain();
         assertEquals(10, sec(s, 20240310, 12));
         assertEquals(10, sec(s, 20240307, 12));
@@ -98,10 +99,10 @@ public class UsageAccountantClockTest {
         FakeClock c = new FakeClock(wall("UTC", 2024, 3, 10, 12, 0));
         UsageAccountant a = UsageTestUtil.started(c);
         c.advanceSec(10);
-        a.onInput();
+        a.onSurface(UsageSurface.CHAT_LIST, 0);
         c.zone = TimeZone.getTimeZone("Asia/Tokyo");
         c.advanceSec(10);
-        a.onInput();
+        a.onSurface(UsageSurface.CHAT_LIST, 0);
         UsageLedger.Snapshot s = a.drain();
         assertEquals(10, sec(s, 20240310, 12));
         assertEquals(10, sec(s, 20240310, 21));

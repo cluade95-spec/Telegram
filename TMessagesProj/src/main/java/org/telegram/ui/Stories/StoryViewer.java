@@ -53,6 +53,7 @@ import androidx.viewpager.widget.ViewPager;
 import com.google.android.exoplayer2.ExoPlayer;
 import com.google.android.exoplayer2.ui.AspectRatioFrameLayout;
 
+import org.telegram.messenger.usage.UsageTracker;
 import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.AnimationNotificationsLocker;
 import org.telegram.messenger.BotWebViewVibrationEffect;
@@ -885,6 +886,7 @@ public class StoryViewer implements NotificationCenter.NotificationCenterDelegat
 
                 @Override
                 public boolean dispatchTouchEvent(MotionEvent ev) {
+                    UsageTracker.onUserInput();
                     boolean swipeToReplyCancelled = false;
                     PeerStoriesView peerStoriesView = storiesViewPager.getCurrentPeerView();
                     if (peerStoriesView != null && peerStoriesView.checkTextSelectionEvent(ev)) {
@@ -1823,6 +1825,7 @@ public class StoryViewer implements NotificationCenter.NotificationCenterDelegat
         if (!ATTACH_TO_FRAGMENT) {
             globalInstances.add(this);
         }
+        UsageTracker.onNavigationChanged();
         if (fragment != null) {
             AndroidUtilities.hideKeyboard(fragment.getFragmentView());
         }
@@ -2269,6 +2272,7 @@ public class StoryViewer implements NotificationCenter.NotificationCenterDelegat
     public void updatePlayingMode() {
         updatePipSource();
         if (storiesViewPager == null) {
+            UsageTracker.onStoriesPlaying(this, false);
             return;
         }
         boolean pause = isPaused();
@@ -2278,6 +2282,8 @@ public class StoryViewer implements NotificationCenter.NotificationCenterDelegat
         if (ArticleViewer.getInstance().isVisible()) {
             pause = true;
         }
+        UsageTracker.onStoriesPlaying(this, !pause);
+        UsageTracker.onNavigationChanged();
 
         storiesViewPager.setPaused(pause);
         if (playerHolder != null) {
@@ -2666,6 +2672,8 @@ public class StoryViewer implements NotificationCenter.NotificationCenterDelegat
         }
 
         globalInstances.remove(this);
+        UsageTracker.onStoriesPlaying(this, false);
+        UsageTracker.onNavigationChanged();
         doOnAnimationReadyRunnables.clear();
         selfStoriesViewsOffset = 0;
         lastStoryItem = null;

@@ -62,6 +62,7 @@ import androidx.core.math.MathUtils;
 import androidx.core.view.ViewCompat;
 import androidx.core.view.WindowInsetsCompat;
 
+import org.telegram.messenger.usage.UsageTracker;
 import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.AnimationNotificationsLocker;
 import org.telegram.messenger.BuildVars;
@@ -2360,6 +2361,7 @@ public class ActionBarLayout extends FrameLayout implements INavigationLayout, F
             onFragmentStackChangedListener.run();
         }
         ImageLoader.getInstance().onFragmentStackChanged();
+        UsageTracker.onNavigationChanged();
         checkBlackScreen(action);
     }
 

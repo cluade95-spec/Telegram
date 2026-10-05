@@ -140,6 +140,7 @@ import androidx.dynamicanimation.animation.SpringAnimation;
 import androidx.dynamicanimation.animation.SpringForce;
 import androidx.recyclerview.widget.DefaultItemAnimator;
 import androidx.recyclerview.widget.LinearLayoutManager;
+import org.telegram.messenger.usage.UsageTracker;
 import org.telegram.ui.recyclerview.LinearSmoothScrollerEnd;
 import androidx.recyclerview.widget.RecyclerView;
 
@@ -5572,6 +5573,7 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
                             PipInstance = Instance;
                             Instance = null;
                             isVisible = false;
+                            UsageTracker.onNavigationChanged();
                             isVisibleOrAnimating = false;
                             if (currentPlaceObject != null && !currentPlaceObject.imageReceiver.getVisible()) {
                                 currentPlaceObject.imageReceiver.setVisible(true, true);
@@ -8991,6 +8993,7 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
         Instance = null;
         switchingInlineMode = true;
         isVisible = false;
+        UsageTracker.onNavigationChanged();
         isVisibleOrAnimating = false;
         AndroidUtilities.cancelRunOnUIThread(hideActionBarRunnable);
         if (currentPlaceObject != null && !currentPlaceObject.imageReceiver.getVisible()) {
@@ -9444,6 +9447,7 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
 
         try {
             isVisible = true;
+            UsageTracker.onNavigationChanged();
             isVisibleOrAnimating = true;
             WindowManager wm = (WindowManager) parentActivity.getSystemService(Context.WINDOW_SERVICE);
             wm.addView(windowView, windowLayoutParams);
@@ -9515,6 +9519,7 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
                 PipInstance = Instance;
                 Instance = null;
                 isVisible = false;
+                UsageTracker.onNavigationChanged();
                 if (currentPlaceObject != null && !currentPlaceObject.imageReceiver.getVisible()) {
                     currentPlaceObject.imageReceiver.setVisible(true, true);
                 }
@@ -10246,6 +10251,7 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
         if ((videoPlayer != null ? videoPlayer.isPlaying() : photoViewerWebView.isPlaying()) && playbackState != ExoPlayer.STATE_ENDED) {
             if (!isPlaying) {
                 isPlaying = true;
+                UsageTracker.onVideoPlaying(this, true);
                 photoProgressViews[0].setBackgroundState(isCurrentVideo ? PROGRESS_NONE : PROGRESS_PAUSE, false, true);
                 photoProgressViews[0].setIndexedAlpha(1, !isCurrentVideo && (!isAccessibilityEnabled() || playerWasPlaying) && ((playerAutoStarted && !playerWasPlaying) || !isActionBarVisible) ? 0f : 1f, false);
                 playerWasPlaying = true;
@@ -10257,6 +10263,7 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
                 photoProgressViews[0].setBackgroundState(PROGRESS_PLAY, false, photoProgressViews[0].animAlphas[1] > 0f);
             }
             isPlaying = false;
+            UsageTracker.onVideoPlaying(this, false);
             AndroidUtilities.cancelRunOnUIThread(updateProgressRunnable);
             if (playbackState == ExoPlayer.STATE_ENDED) {
                 if (isCurrentVideo) {
@@ -11015,6 +11022,7 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
         }
         if (isPlaying) {
             isPlaying = false;
+            UsageTracker.onVideoPlaying(this, false);
             AndroidUtilities.cancelRunOnUIThread(updateProgressRunnable);
         }
         if (!onClose && !inPreview && !requestingPreview) {
@@ -17119,6 +17127,7 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
             }
 
             isVisible = true;
+            UsageTracker.onNavigationChanged();
             isVisibleOrAnimating = true;
 
             togglePhotosListView(false, false);
@@ -17154,6 +17163,7 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
             }
 
             isVisible = true;
+            UsageTracker.onNavigationChanged();
             isVisibleOrAnimating = true;
             togglePhotosListView(false, false);
             seekToProgressPending2 = 0;
@@ -17520,6 +17530,7 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
         }
 
         isVisible = true;
+        UsageTracker.onNavigationChanged();
         isVisibleOrAnimating = true;
 
         togglePhotosListView(false, false);
@@ -18646,6 +18657,7 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
             FileLoader.getInstance(currentAccount).cancelLoadFile(currentMessageObject.getDocument());
         }
         isVisible = false;
+        UsageTracker.onNavigationChanged();
         isVisibleOrAnimating = false;
         cropInitied = false;
         disableShowCheck = true;
@@ -23567,6 +23579,7 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
 
         @Override
         public boolean dispatchTouchEvent(MotionEvent ev) {
+            UsageTracker.onUserInput();
             if (videoPlayerControlVisible && isPlaying) {
                 switch (ev.getActionMasked()) {
                     case MotionEvent.ACTION_DOWN:

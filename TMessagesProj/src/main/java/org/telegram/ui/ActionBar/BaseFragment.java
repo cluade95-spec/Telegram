@@ -38,6 +38,7 @@ import androidx.core.graphics.ColorUtils;
 import androidx.core.graphics.Insets;
 import androidx.core.view.WindowInsetsCompat;
 
+import org.telegram.messenger.usage.UsageTracker;
 import org.telegram.messenger.AccountInstance;
 import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.ApplicationLoader;
@@ -534,6 +535,7 @@ public abstract class BaseFragment {
     public void onResume() {
         isPaused = false;
         ProtectedChatGate.onFragmentResumed(this);
+        UsageTracker.onNavigationChanged();
         if (actionBar != null) {
             actionBar.onResume();
         }
@@ -546,6 +548,7 @@ public abstract class BaseFragment {
     @CallSuper
     public void onPause() {
         ProtectedChatGate.onFragmentPaused(this);
+        UsageTracker.onNavigationChanged();
         if (actionBar != null) {
             actionBar.onPause();
         }

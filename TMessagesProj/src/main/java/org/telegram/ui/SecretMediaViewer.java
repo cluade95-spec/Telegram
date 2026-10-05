@@ -74,6 +74,7 @@ import com.google.android.exoplayer2.C;
 import com.google.android.exoplayer2.ExoPlayer;
 import com.google.android.exoplayer2.ui.AspectRatioFrameLayout;
 
+import org.telegram.messenger.usage.UsageTracker;
 import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.Emoji;
 import org.telegram.messenger.ImageLocation;
@@ -732,6 +733,12 @@ public class SecretMediaViewer implements NotificationCenter.NotificationCenterD
         scroller = new Scroller(activity);
 
         windowView = new FrameLayout(activity) {
+            @Override
+            public boolean dispatchTouchEvent(MotionEvent ev) {
+                UsageTracker.onUserInput();
+                return super.dispatchTouchEvent(ev);
+            }
+
             @Override
             protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
                 int widthSize = MeasureSpec.getSize(widthMeasureSpec);
@@ -1571,6 +1578,7 @@ public class SecretMediaViewer implements NotificationCenter.NotificationCenterD
         wm.addView(windowView, windowLayoutParams);
         secretDeleteTimer.invalidate();
         isVisible = true;
+        UsageTracker.onNavigationChanged();
 
         final Window window = parentActivity.getWindow();
         wasLightNavigationBar = AndroidUtilities.getLightNavigationBar(window);
@@ -1716,6 +1724,7 @@ public class SecretMediaViewer implements NotificationCenter.NotificationCenterD
         NotificationCenter.getInstance(currentAccount).removeObserver(this, NotificationCenter.updateMessageMedia);
         NotificationCenter.getInstance(currentAccount).removeObserver(this, NotificationCenter.didCreatedNewDeleteTask);
         isVisible = false;
+        UsageTracker.onNavigationChanged();
         currentProvider = null;
         if (currentThumb != null) {
             currentThumb.release();
@@ -2105,6 +2114,7 @@ public class SecretMediaViewer implements NotificationCenter.NotificationCenterD
                         object.imageReceiver.setVisible(true, true);
                     }
                     isVisible = false;
+                    UsageTracker.onNavigationChanged();
                     AndroidUtilities.runOnUIThread(() -> {
                         if (photoAnimationEndRunnable != null) {
                             photoAnimationEndRunnable.run();
@@ -2164,6 +2174,7 @@ public class SecretMediaViewer implements NotificationCenter.NotificationCenterD
 
     private void onPhotoClosed(PhotoViewer.PlaceProviderObject object) {
         isVisible = false;
+        UsageTracker.onNavigationChanged();
         currentProvider = null;
         disableShowCheck = false;
         releasePlayer();

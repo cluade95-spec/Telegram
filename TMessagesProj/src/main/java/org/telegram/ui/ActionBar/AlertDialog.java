@@ -56,6 +56,7 @@ import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.core.graphics.ColorUtils;
 
+import org.telegram.messenger.usage.UsageTracker;
 import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.ApplicationLoader;
 import org.telegram.messenger.FileLog;
@@ -320,6 +321,12 @@ public class AlertDialog extends Dialog implements Drawable.Callback, Notificati
     }
 
     private long shownAt;
+
+    @Override
+    public boolean dispatchTouchEvent(MotionEvent ev) {
+        UsageTracker.onUserInput();
+        return super.dispatchTouchEvent(ev);
+    }
 
     @Override
     public void show() {

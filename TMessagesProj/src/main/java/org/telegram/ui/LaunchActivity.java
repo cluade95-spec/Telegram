@@ -92,6 +92,7 @@ import com.google.firebase.appindexing.Action;
 import com.google.firebase.appindexing.FirebaseUserActions;
 import com.google.firebase.appindexing.builders.AssistActionBuilder;
 
+import org.telegram.messenger.usage.UsageTracker;
 import org.telegram.PhoneFormat.PhoneFormat;
 import org.telegram.messenger.AccountInstance;
 import org.telegram.messenger.AndroidUtilities;
@@ -6733,6 +6734,7 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
     @Override
     public void onUserInteraction() {
         super.onUserInteraction();
+        UsageTracker.onUserInput();
         voipLaunchedInBackground = false;
     }
 
@@ -8458,6 +8460,7 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
 
     @Override
     public boolean dispatchKeyEvent(KeyEvent event) {
+        UsageTracker.onUserInput();
         int keyCode = event.getKeyCode();
         if (event.getKeyCode() == KeyEvent.KEYCODE_VOLUME_UP || event.getKeyCode() == KeyEvent.KEYCODE_VOLUME_DOWN) {
             BaseFragment baseFragment = getLastFragment();

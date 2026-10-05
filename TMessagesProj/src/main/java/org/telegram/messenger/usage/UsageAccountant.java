@@ -32,9 +32,15 @@ public final class UsageAccountant {
 
     // events
 
+    /**
+     * Hot path (every touch): while inputs keep arriving within the idle window the open segment is contiguous, so
+     * one long store is enough; the segment is only settled after a gap or once it has grown to the flush threshold.
+     */
     public void onInput() {
         long now = clock.elapsed();
-        settle(now);
+        if (now - lastInputAt > UsagePolicy.IDLE_MS || now - segStart >= UsagePolicy.FLUSH_THRESHOLD_MS) {
+            settle(now);
+        }
         lastInputAt = now;
     }
 

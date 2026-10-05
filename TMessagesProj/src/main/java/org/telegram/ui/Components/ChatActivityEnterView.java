@@ -114,6 +114,7 @@ import androidx.dynamicanimation.animation.DynamicAnimation;
 import androidx.dynamicanimation.animation.SpringAnimation;
 import androidx.dynamicanimation.animation.SpringForce;
 import androidx.interpolator.view.animation.FastOutSlowInInterpolator;
+import org.telegram.messenger.usage.UsageTracker;
 import org.telegram.ui.recyclerview.ChatListItemAnimator;
 import androidx.recyclerview.widget.LinearLayoutManager;
 
@@ -5882,6 +5883,7 @@ public class ChatActivityEnterView extends FrameLayout implements
 
             @Override
             public void onTextChanged(CharSequence charSequence, int start, int before, int count) {
+                UsageTracker.onTextInput();
                 if (ignorePrevTextChange) {
                     return;
                 }
