@@ -11815,6 +11815,16 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
         return folderId == 1;
     }
 
+    /** Read by the Activity feature to tell the chat list from its search. */
+    public boolean isSearchShown() {
+        return searchIsShowed;
+    }
+
+    /** True for pickers (forward, share): selecting a destination, not reading the list. */
+    public boolean isSelectMode() {
+        return onlySelect;
+    }
+
     public boolean isCommunity() {
         return communityId != 0;
     }
