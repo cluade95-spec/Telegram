@@ -81,7 +81,7 @@ public class LocalHistoryRowCell extends FrameLayout {
 
     public void setData(LocalHistory.Summary summary) {
         setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundWhite));
-        String name = summary != null && summary.title != null && !summary.title.isEmpty() ? summary.title : LocaleController.getString(R.string.LocalHistoryTitle);
+        String name = LocalHistory.getInstance(UserConfig.selectedAccount).getTitle();
         title.setText(name);
         boolean photoHidden = org.telegram.messenger.ProtectedChats.shouldHideContent(UserConfig.selectedAccount, org.telegram.messenger.localhistory.LocalDialogIds.LOCAL_HISTORY);
         avatar.setPhoto(photoHidden ? null : LocalHistory.getInstance(UserConfig.selectedAccount).getPhoto(), 56);

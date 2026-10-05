@@ -90,6 +90,7 @@ public class DialogsSearchAdapter extends RecyclerListView.SelectionAdapter {
     public final static int VIEW_TYPE_INVITE_CONTACT_CELL = 8;
     public final static int VIEW_TYPE_PUBLIC_POST = 9;
     public final static int VIEW_TYPE_EMPTY_RESULT = 10;
+    public final static int VIEW_TYPE_LOCAL_HISTORY = 11;
 
     public static enum Filter {
         All(0, R.string.SearchMessagesFilterAll, R.string.SearchMessagesFilterAllFrom),
@@ -1058,6 +1059,7 @@ public class DialogsSearchAdapter extends RecyclerListView.SelectionAdapter {
                 }
             }
             MessagesController.getInstance(currentAccount).putUsers(encUsers, true);
+            addLocalHistoryHit(result, names);
             searchResult = result;
             searchResultNames = names;
          //   searchContacts = contacts;
@@ -1068,6 +1070,25 @@ public class DialogsSearchAdapter extends RecyclerListView.SelectionAdapter {
                 delegate.runResultsEnterAnimation();
             }
         });
+    }
+
+    /**
+     * The Local History chat is found by its name only (plan B20); archived text never reaches global search. The
+     * LocalHistory instance itself is the list item, so no index arithmetic of this adapter changes.
+     */
+    private void addLocalHistoryHit(ArrayList<Object> result, ArrayList<CharSequence> names) {
+        if (dialogsType != DialogsActivity.DIALOGS_TYPE_DEFAULT || folderId != 0 || lastSearchText == null) {
+            return;
+        }
+        org.telegram.messenger.localhistory.LocalHistory localHistory = org.telegram.messenger.localhistory.LocalHistory.getInstance(currentAccount);
+        String query = org.telegram.messenger.localhistory.LocalHistorySearch.normalize(lastSearchText);
+        if (query.isEmpty() || !localHistory.isEnabled() || localHistory.isRowHidden()
+                || !localHistory.getTitle().toLowerCase(java.util.Locale.ROOT).contains(query)) {
+            return;
+        }
+        localHistory.ensureSummary();
+        result.add(0, localHistory);
+        names.add(0, null);
     }
 
     public boolean isHashtagSearch() {
@@ -1629,6 +1650,9 @@ public class DialogsSearchAdapter extends RecyclerListView.SelectionAdapter {
             case VIEW_TYPE_TOPIC_CELL:
                 view = new TopicSearchCell(mContext);
                 break;
+            case VIEW_TYPE_LOCAL_HISTORY:
+                view = new org.telegram.ui.Cells.LocalHistoryRowCell(mContext);
+                break;
             case VIEW_TYPE_LOADING:
                 FlickerLoadingView flickerLoadingView = new FlickerLoadingView(mContext);
                 flickerLoadingView.setViewType(FlickerLoadingView.DIALOG_TYPE);
@@ -1718,6 +1742,12 @@ public class DialogsSearchAdapter extends RecyclerListView.SelectionAdapter {
     @Override
     public void onBindViewHolder(RecyclerView.ViewHolder holder, int position) {
         switch (holder.getItemViewType()) {
+            case VIEW_TYPE_LOCAL_HISTORY: {
+                org.telegram.ui.Cells.LocalHistoryRowCell cell = (org.telegram.ui.Cells.LocalHistoryRowCell) holder.itemView;
+                cell.setData(org.telegram.messenger.localhistory.LocalHistory.getInstance(currentAccount).getSummary());
+                cell.setDivider(true);
+                break;
+            }
             case VIEW_TYPE_PROFILE_CELL: {
                 ProfileSearchCell cell = (ProfileSearchCell) holder.itemView;
                 cell.setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundWhite));
@@ -2264,7 +2294,7 @@ public class DialogsSearchAdapter extends RecyclerListView.SelectionAdapter {
         int localMessagesCount = (searchForumResultMessages.isEmpty() ? 0 : searchForumResultMessages.size() + 1);
 
         if (i >= 0 && i < localCount) {
-            return VIEW_TYPE_PROFILE_CELL;
+            return searchResult.get(i) instanceof org.telegram.messenger.localhistory.LocalHistory ? VIEW_TYPE_LOCAL_HISTORY : VIEW_TYPE_PROFILE_CELL;
         }
         i -= localCount;
         if (i >= 0 && i < localServerCount) {

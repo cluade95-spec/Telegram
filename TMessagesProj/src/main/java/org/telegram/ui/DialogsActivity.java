@@ -8398,6 +8398,9 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
         }
         if (searchViewPager != null && adapter == searchViewPager.dialogsSearchAdapter) {
             Object item = searchViewPager.dialogsSearchAdapter.getItem(position);
+            if (item instanceof LocalHistory) {
+                return false;
+            }
             if (!searchViewPager.dialogsSearchAdapter.isSearchWas()) {
                 AlertDialog.Builder builder = new AlertDialog.Builder(getParentActivity());
                 builder.setTitle(LocaleController.getString(R.string.ClearSearchSingleAlertTitle));
@@ -13519,6 +13522,10 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
         });
         searchViewPager.searchListView.setOnItemClickListener((view, position, x, y) -> {
             Object item = searchViewPager.dialogsSearchAdapter.getItem(position);
+            if (item instanceof LocalHistory) {
+                presentFragment(new LocalHistoryActivity());
+                return;
+            }
             if (item instanceof TLRPC.TL_sponsoredPeer) {
                 final TLRPC.TL_sponsoredPeer peer = (TLRPC.TL_sponsoredPeer) item;
                 final long did = DialogObject.getPeerDialogId(peer.peer);
