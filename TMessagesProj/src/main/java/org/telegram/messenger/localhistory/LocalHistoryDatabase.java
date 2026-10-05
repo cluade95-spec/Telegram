@@ -413,6 +413,92 @@ public class LocalHistoryDatabase implements LocalHistoryRepository {
         }
     }
 
+    private int scalar(String sql, Object... args) {
+        if (!open()) {
+            return 0;
+        }
+        try {
+            Integer n = db.executeInt(sql, args);
+            return n == null ? 0 : n;
+        } catch (Throwable e) {
+            FileLog.e(e);
+            return 0;
+        }
+    }
+
+    @Override
+    public synchronized int deletedCount() {
+        return scalar("SELECT COUNT(*) FROM entry WHERE deleted_at IS NOT NULL");
+    }
+
+    @Override
+    public synchronized int editedCount() {
+        return scalar("SELECT COUNT(*) FROM entry WHERE edit_count > 0");
+    }
+
+    @Override
+    public synchronized int countAfter(int lastEventAt) {
+        return scalar("SELECT COUNT(*) FROM entry WHERE last_event_at > ?", lastEventAt);
+    }
+
+    @Override
+    public synchronized String getMeta(String key) {
+        if (!open()) {
+            return null;
+        }
+        SQLiteCursor c = null;
+        try {
+            c = db.queryFinalized("SELECT value FROM meta WHERE key = ?", key);
+            if (c.next() && !c.isNull(0)) {
+                byte[] bytes = c.byteArrayValue(0);
+                return bytes == null ? null : new String(bytes, java.nio.charset.StandardCharsets.UTF_8);
+            }
+        } catch (Throwable e) {
+            FileLog.e(e);
+        } finally {
+            if (c != null) {
+                c.dispose();
+            }
+        }
+        return null;
+    }
+
+    @Override
+    public synchronized void setMeta(String key, String value) {
+        if (!open()) {
+            return;
+        }
+        SQLitePreparedStatement s = null;
+        NativeByteBuffer buffer = null;
+        try {
+            if (value == null) {
+                s = db.executeFast("DELETE FROM meta WHERE key = ?");
+                s.requery();
+                s.bindString(1, key);
+                s.step();
+                return;
+            }
+            s = db.executeFast("REPLACE INTO meta(key, value) VALUES(?, ?)");
+            s.requery();
+            s.bindString(1, key);
+            byte[] bytes = value.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            buffer = new NativeByteBuffer(bytes.length);
+            buffer.writeBytes(bytes);
+            buffer.position(0);
+            s.bindByteBuffer(2, buffer);
+            s.step();
+        } catch (Throwable e) {
+            FileLog.e(e);
+        } finally {
+            if (buffer != null) {
+                buffer.reuse();
+            }
+            if (s != null) {
+                s.dispose();
+            }
+        }
+    }
+
     @Override
     public synchronized void deleteEntry(long entryId) {
         if (!open()) {

@@ -68,7 +68,9 @@ public class LocalHistoryCapture {
             if (b == null || a == null) {
                 return;
             }
-            LocalHistory.getInstance(currentAccount).getLedger().recordEdit(b, a, now);
+            if (LocalHistory.getInstance(currentAccount).getLedger().recordEdit(b, a, now) != 0) {
+                LocalHistory.getInstance(currentAccount).refreshSummary();
+            }
             FileLog.d("local history: edit captured");
         } catch (Throwable e) {
             FileLog.e(e);
@@ -105,6 +107,9 @@ public class LocalHistoryCapture {
             }
             if (!removed.isEmpty()) {
                 int n = LocalHistory.getInstance(currentAccount).getLedger().recordDeletions(removed, now);
+                if (n > 0) {
+                    LocalHistory.getInstance(currentAccount).refreshSummary();
+                }
                 FileLog.d("local history: " + n + " removals captured");
             }
         } catch (Throwable e) {

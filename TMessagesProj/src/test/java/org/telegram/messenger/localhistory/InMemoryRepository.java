@@ -123,6 +123,55 @@ class InMemoryRepository implements LocalHistoryRepository {
         return entries.size();
     }
 
+    private final java.util.Map<String, String> meta = new java.util.HashMap<>();
+
+    @Override
+    public int deletedCount() {
+        int n = 0;
+        for (Entry e : entries) {
+            if (e.isDeleted()) {
+                n++;
+            }
+        }
+        return n;
+    }
+
+    @Override
+    public int editedCount() {
+        int n = 0;
+        for (Entry e : entries) {
+            if (e.editCount > 0) {
+                n++;
+            }
+        }
+        return n;
+    }
+
+    @Override
+    public int countAfter(int lastEventAt) {
+        int n = 0;
+        for (Entry e : entries) {
+            if (e.lastEventAt > lastEventAt) {
+                n++;
+            }
+        }
+        return n;
+    }
+
+    @Override
+    public String getMeta(String key) {
+        return meta.get(key);
+    }
+
+    @Override
+    public void setMeta(String key, String value) {
+        if (value == null) {
+            meta.remove(key);
+        } else {
+            meta.put(key, value);
+        }
+    }
+
     @Override
     public void deleteEntry(long id) {
         entries.removeIf(e -> e.id == id);

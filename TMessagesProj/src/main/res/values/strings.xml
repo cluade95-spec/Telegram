@@ -11327,4 +11327,23 @@
     <string name="UsageCatLocalHistory">Local History</string>
     <string name="UsageCatOther">Other</string>
     <string name="UsageSettingsSubtitle">Time spent in Telegram on this device</string>
+    <string name="LocalHistoryTitle">Local History</string>
+    <string name="LocalHistorySettingInfo">Keep a copy of messages that other people edit or remove in your private chats. Saved only on this device and never sent anywhere. Removals you make on your other devices also appear here.</string>
+    <string name="LocalHistoryDeleteAll">Delete all local history</string>
+    <string name="LocalHistoryDeleteAllConfirm">Delete everything saved in Local History on this device? This can\'t be undone.</string>
+    <string name="LocalHistoryClearConfirm">Clear Local History? All saved edits and removals will be deleted from this device.</string>
+    <string name="LocalHistoryTurnOffTitle">Turn off Local History?</string>
+    <string name="LocalHistoryTurnOffText">New edits and removals will no longer be saved. Delete what was saved so far?</string>
+    <string name="LocalHistoryKeep">Keep</string>
+    <string name="LocalHistoryEmpty">Nothing here yet. Messages that people edit or remove in your private chats will appear here.</string>
+    <string name="LocalHistorySubtitle">%1$d removed · %2$d edited</string>
+    <string name="LocalHistoryStatusEdited">Edited · %1$d versions</string>
+    <string name="LocalHistoryStatusRemoved">Removed from the chat · %1$s</string>
+    <string name="LocalHistoryStatusEditedRemoved">Edited · Removed from the chat · %1$s</string>
+    <string name="LocalHistoryPreviewRemoved">%1$s removed a message</string>
+    <string name="LocalHistoryPreviewEdited">%1$s edited a message</string>
+    <string name="LocalHistoryBatch">%1$d messages removed from the chat with %2$s</string>
+    <string name="LocalHistoryMediaNotSaved">%1$s · not saved</string>
+    <string name="LocalHistoryDeleteEntry">Delete from Local History</string>
+    <string name="LocalHistoryUnknownSender">Someone</string>
 </resources>

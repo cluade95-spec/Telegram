@@ -72,6 +72,17 @@ public interface LocalHistoryRepository {
 
     int entryCount();
 
+    int deletedCount();
+
+    int editedCount();
+
+    /** Entries whose last event is strictly after {@code lastEventAt}. */
+    int countAfter(int lastEventAt);
+
+    String getMeta(String key);
+
+    void setMeta(String key, String value);
+
     void deleteEntry(long entryId);
 
     /** Removes every entry, revision and media row. */

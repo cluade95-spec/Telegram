@@ -52,7 +52,9 @@ import org.telegram.tgnet.TLRPC;
 import org.telegram.tgnet.tl.TL_chatlists;
 import org.telegram.ui.ActionBar.ActionBar;
 import org.telegram.ui.ActionBar.Theme;
+import org.telegram.messenger.localhistory.LocalHistory;
 import org.telegram.ui.Cells.ArchiveHintCell;
+import org.telegram.ui.Cells.LocalHistoryRowCell;
 import org.telegram.ui.Cells.DialogCell;
 import org.telegram.ui.Cells.DialogMeUrlCell;
 import org.telegram.ui.Cells.DialogsEmptyCell;
@@ -110,7 +112,8 @@ public class DialogsAdapter extends RecyclerListView.SelectionAdapter implements
             VIEW_TYPE_GRAY_SECTION = 20,
             VIEW_TYPE_FORWARD_TO_STORIES_CELL = 21,
             VIEW_TYPE_HEADER_3 = 22,
-            VIEW_TYPE_DIALOG_COMMUNITY = 23;
+            VIEW_TYPE_DIALOG_COMMUNITY = 23,
+            VIEW_TYPE_LOCAL_HISTORY = 24;
 
     private Context mContext;
     private ArchiveHintCell archiveHintCell;
@@ -373,6 +376,14 @@ public class DialogsAdapter extends RecyclerListView.SelectionAdapter implements
             }
         }
 
+        LocalHistory.Summary localSummary;
+
+        public ItemInternal(int viewType, LocalHistory.Summary summary) {
+            super(viewType, true);
+            this.localSummary = summary;
+            stableId = 2;
+        }
+
         public ItemInternal(int viewTypeMeUrl, TLRPC.RecentMeUrl recentMeUrl) {
             super(viewTypeMeUrl, true);
             this.recentMeUrl = recentMeUrl;
@@ -440,7 +451,7 @@ public class DialogsAdapter extends RecyclerListView.SelectionAdapter implements
             if (viewType == VIEW_TYPE_LAST_EMPTY) {
                 return false;
             }
-            return true;
+            return true; // VIEW_TYPE_LOCAL_HISTORY is a single row, so the view type decides
         }
 
         @Override
@@ -646,6 +657,9 @@ public class DialogsAdapter extends RecyclerListView.SelectionAdapter implements
     public RecyclerView.ViewHolder onCreateViewHolder(ViewGroup viewGroup, int viewType) {
         View view;
         switch (viewType) {
+            case VIEW_TYPE_LOCAL_HISTORY:
+                view = new LocalHistoryRowCell(mContext);
+                break;
             case VIEW_TYPE_DIALOG_COMMUNITY:
                 DialogCell dialogCell2 = new DialogCell(parentFragment, mContext, true, false, currentAccount, null);
                 if (communityId != 0) {
@@ -893,6 +907,10 @@ public class DialogsAdapter extends RecyclerListView.SelectionAdapter implements
     @Override
     public void onBindViewHolder(RecyclerView.ViewHolder holder, int i) {
         switch (holder.getItemViewType()) {
+            case VIEW_TYPE_LOCAL_HISTORY: {
+                ((LocalHistoryRowCell) holder.itemView).setData(itemInternals.get(i).localSummary);
+                break;
+            }
             case VIEW_TYPE_FORWARD_TO_STORIES_CELL: {
                 TLRPC.Dialog nextDialog = (TLRPC.Dialog) getItem(i + 1);
 
@@ -1771,12 +1789,23 @@ public class DialogsAdapter extends RecyclerListView.SelectionAdapter implements
         }
 
         if (!stopUpdate) {
+            LocalHistory.Summary localSummary = localHistorySummary(filter);
+            boolean localHistoryAdded = false;
             for (int k = 0; k < array.size(); k++) {
                 if (dialogsType == DialogsActivity.DIALOGS_TYPE_ADD_USERS_TO && array.get(k) instanceof DialogsActivity.DialogsHeader) {
                     itemInternals.add(new ItemInternal(VIEW_TYPE_HEADER_2, array.get(k)));
                 } else {
-                    itemInternals.add(new ItemInternal(VIEW_TYPE_DIALOG, array.get(k)));
+                    TLRPC.Dialog dialog = array.get(k);
+                    // the Local History row sits after pinned dialogs, where its last event sorts by date
+                    if (localSummary != null && !localHistoryAdded && !dialog.pinned && !dialog.isFolder && dialog.last_message_date < localSummary.lastEventAt) {
+                        itemInternals.add(new ItemInternal(VIEW_TYPE_LOCAL_HISTORY, localSummary));
+                        localHistoryAdded = true;
+                    }
+                    itemInternals.add(new ItemInternal(VIEW_TYPE_DIALOG, dialog));
                 }
+            }
+            if (localSummary != null && !localHistoryAdded && dialogsCount > 0 && messagesController.isDialogsEndReached(folderId)) {
+                itemInternals.add(new ItemInternal(VIEW_TYPE_LOCAL_HISTORY, localSummary));
             }
 
             if (communityId == 0 && !forceShowEmptyCell && dialogsType != 7 && dialogsType != 8 && !MessagesController.getInstance(currentAccount).isDialogsEndReached(folderId)) {
@@ -1808,6 +1837,20 @@ public class DialogsAdapter extends RecyclerListView.SelectionAdapter implements
                 }
             }
         }
+    }
+
+    /** The summary to show as the Local History row, or null when the row does not belong in this list. */
+    private LocalHistory.Summary localHistorySummary(MessagesController.DialogFilter filter) {
+        if (dialogsType != DialogsActivity.DIALOGS_TYPE_DEFAULT || folderId != 0 || communityId != 0 || isOnlySelect
+                || collapsedView || isTransitionSupport || requestPeerType != null || (filter != null && !filter.isDefault())) {
+            return null;
+        }
+        LocalHistory localHistory = LocalHistory.getInstance(currentAccount);
+        if (!localHistory.isEnabled()) {
+            return null;
+        }
+        localHistory.ensureSummary();
+        return localHistory.getSummary();
     }
 
     public int getItemHeight(int position) {

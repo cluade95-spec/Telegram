@@ -237,6 +237,7 @@ import org.telegram.ui.Components.FolderDrawable;
 import org.telegram.ui.Components.ForegroundColorSpanThemable;
 import org.telegram.ui.Components.Forum.ForumUtilities;
 import org.telegram.ui.Components.FragmentContextView;
+import org.telegram.messenger.localhistory.LocalHistory;
 import org.telegram.ui.Components.ItemOptions;
 import org.telegram.ui.Components.JoinGroupAlert;
 import org.telegram.ui.Components.LayoutHelper;
@@ -2914,6 +2915,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
             }
             observersGroup
                 .add(NotificationCenter.dialogsNeedReload)
+                .add(NotificationCenter.localHistoryChanged)
                 .add(NotificationCenter.dialogFiltersUpdated)
                 .add(NotificationCenter.updateInterfaces)
                 .add(NotificationCenter.encryptedChatUpdated)
@@ -7912,6 +7914,10 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
                 MessagesController.DialogFilter dialogFilter = getMessagesController().selectedDialogFilter[dialogsType == DIALOGS_TYPE_FOLDER1 ? 0 : 1];
                 filterId = dialogFilter == null ? 0 : dialogFilter.id;
             }
+            if (adapter.getItemViewType(position) == DialogsAdapter.VIEW_TYPE_LOCAL_HISTORY) {
+                presentFragment(new LocalHistoryActivity());
+                return;
+            }
             Object object = dialogsAdapter.getItem(position);
             if (delegate != null && dialogsAdapter.isAllowForwardAsStories() && adapter.getItemViewType(position) == DialogsAdapter.VIEW_TYPE_FORWARD_TO_STORIES_CELL) {
                 delegate.didSelectStories(this);
@@ -8317,12 +8323,37 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
         updateVisibleRows(MessagesController.UPDATE_MASK_SELECT_DIALOG);
     }
 
+    private void showLocalHistoryOptions() {
+        if (getParentActivity() == null) {
+            return;
+        }
+        final LocalHistory localHistory = LocalHistory.getInstance(currentAccount);
+        AlertDialog.Builder builder = new AlertDialog.Builder(getParentActivity());
+        builder.setItems(new CharSequence[]{LocaleController.getString(R.string.MarkAsRead), LocaleController.getString(R.string.ClearHistory)}, (dialog, which) -> {
+            if (which == 0) {
+                localHistory.markAllRead();
+            } else {
+                AlertDialog.Builder confirm = new AlertDialog.Builder(getParentActivity());
+                confirm.setTitle(LocaleController.getString(R.string.LocalHistoryTitle));
+                confirm.setMessage(LocaleController.getString(R.string.LocalHistoryClearConfirm));
+                confirm.setPositiveButton(LocaleController.getString(R.string.ClearHistory), (d, w) -> localHistory.clearHistory());
+                confirm.setNegativeButton(LocaleController.getString(R.string.Cancel), null);
+                showDialog(confirm.create());
+            }
+        });
+        showDialog(builder.create());
+    }
+
     private boolean onItemLongClick(RecyclerListView listView, View view, int position, float x, float y, int dialogsType, RecyclerListView.Adapter adapter) {
         if (getParentActivity() == null || view instanceof DialogsHintCell) {
             return false;
         }
         if (adapter.getItemViewType(position) == DialogsAdapter.VIEW_TYPE_FORWARD_TO_STORIES_CELL) {
             return false;
+        }
+        if (adapter instanceof DialogsAdapter && adapter.getItemViewType(position) == DialogsAdapter.VIEW_TYPE_LOCAL_HISTORY) {
+            showLocalHistoryOptions();
+            return true;
         }
 
         if (!actionBar.isActionModeShowed() && !AndroidUtilities.isTablet() && !onlySelect && view instanceof DialogCell && !getMessagesController().isForum(((DialogCell) view).getDialogId()) && !rightSlidingDialogContainer.hasFragment()) {
@@ -10668,6 +10699,16 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
     public void didReceivedNotification(int id, int account, Object... args) {
         if (id == NotificationCenter.protectedChatsChanged) {
             onProtectedChatsChanged();
+            return;
+        }
+        if (id == NotificationCenter.localHistoryChanged) {
+            if (viewPages != null && !onlySelect) {
+                for (int a = 0; a < viewPages.length; a++) {
+                    if (viewPages[a] != null && viewPages[a].dialogsAdapter != null && viewPages[a].dialogsAdapter.getDialogsType() == DIALOGS_TYPE_DEFAULT) {
+                        viewPages[a].dialogsAdapter.notifyDataSetChanged();
+                    }
+                }
+            }
             return;
         }
         if (id == NotificationCenter.dialogsNeedReload) {

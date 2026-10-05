@@ -51,6 +51,7 @@ import org.telegram.tgnet.ConnectionsManager;
 import org.telegram.tgnet.TLRPC;
 import org.telegram.tgnet.tl.TL_account;
 import org.telegram.ui.ActionBar.ActionBar;
+import org.telegram.messenger.localhistory.LocalHistory;
 import org.telegram.ui.ActionBar.AlertDialog;
 import org.telegram.ui.ActionBar.BackDrawable;
 import org.telegram.ui.ActionBar.BaseFragment;
@@ -160,6 +161,10 @@ public class PrivacySettingsActivity extends BaseFragment implements Notificatio
     @Keep
     private int secretWebpageRow;
     private int secretDetailRow;
+    private int localHistorySectionRow;
+    private int localHistoryRow;
+    private int localHistoryDeleteRow;
+    private int localHistoryDetailRow;
     private int rowCount;
 
     private final ArrayList<BotBiometry.Bot> biometryBots = new ArrayList<>();
@@ -506,6 +511,18 @@ public class PrivacySettingsActivity extends BaseFragment implements Notificatio
                 if (view instanceof TextCheckCell) {
                     ((TextCheckCell) view).setChecked(getMessagesController().secretWebpagePreview == 1);
                 }
+            } else if (position == localHistoryRow) {
+                toggleLocalHistory(view);
+            } else if (position == localHistoryDeleteRow) {
+                if (getParentActivity() == null) {
+                    return;
+                }
+                AlertDialog.Builder deleteAll = new AlertDialog.Builder(getParentActivity());
+                deleteAll.setTitle(getString(R.string.LocalHistoryDeleteAll));
+                deleteAll.setMessage(getString(R.string.LocalHistoryDeleteAllConfirm));
+                deleteAll.setPositiveButton(getString(R.string.Delete), (d, w) -> LocalHistory.getInstance(currentAccount).deleteAll());
+                deleteAll.setNegativeButton(getString(R.string.Cancel), null);
+                showDialog(deleteAll.create());
             } else if (position == contactsDeleteRow) {
                 if (getParentActivity() == null) {
                     return;
@@ -795,9 +812,44 @@ public class PrivacySettingsActivity extends BaseFragment implements Notificatio
         secretMapRow = rowCount++;
         secretWebpageRow = rowCount++;
         secretDetailRow = rowCount++;
+        localHistorySectionRow = rowCount++;
+        localHistoryRow = rowCount++;
+        localHistoryDeleteRow = rowCount++;
+        localHistoryDetailRow = rowCount++;
         if (listAdapter != null && notify) {
             listAdapter.notifyDataSetChanged();
         }
+    }
+
+    private void toggleLocalHistory(View view) {
+        final LocalHistory localHistory = LocalHistory.getInstance(currentAccount);
+        if (!localHistory.isEnabled()) {
+            localHistory.setEnabled(true);
+            if (view instanceof TextCheckCell) {
+                ((TextCheckCell) view).setChecked(true);
+            }
+            return;
+        }
+        if (getParentActivity() == null) {
+            return;
+        }
+        AlertDialog.Builder builder = new AlertDialog.Builder(getParentActivity());
+        builder.setTitle(getString(R.string.LocalHistoryTurnOffTitle));
+        builder.setMessage(getString(R.string.LocalHistoryTurnOffText));
+        builder.setPositiveButton(getString(R.string.Delete), (d, w) -> {
+            localHistory.setEnabled(false);
+            localHistory.deleteAll();
+            if (view instanceof TextCheckCell) {
+                ((TextCheckCell) view).setChecked(false);
+            }
+        });
+        builder.setNegativeButton(getString(R.string.LocalHistoryKeep), (d, w) -> {
+            localHistory.setEnabled(false);
+            if (view instanceof TextCheckCell) {
+                ((TextCheckCell) view).setChecked(false);
+            }
+        });
+        showDialog(builder.create());
     }
 
     public PrivacySettingsActivity setCurrentPassword(TL_account.Password currentPassword) {
@@ -1037,6 +1089,7 @@ public class PrivacySettingsActivity extends BaseFragment implements Notificatio
                     position == newChatsRow && !getContactsController().getLoadingGlobalSettings() ||
                     position == emailLoginRow || position == paymentsClearRow || position == secretMapRow ||
                     position == contactsSyncRow || position == passportRow || position == contactsDeleteRow ||
+                    position == localHistoryRow || position == localHistoryDeleteRow ||
                     position == contactsSuggestRow || position == autoDeleteMesages || position == botsBiometryRow;
         }
 
@@ -1227,6 +1280,8 @@ public class PrivacySettingsActivity extends BaseFragment implements Notificatio
                         secretMapUpdate = false;
                     } else if (position == contactsDeleteRow) {
                         textCell.setText(getString("SyncContactsDelete", R.string.SyncContactsDelete), true);
+                    } else if (position == localHistoryDeleteRow) {
+                        textCell.setText(getString(R.string.LocalHistoryDeleteAll), false);
                     }
                     textCell.setDrawLoading(showLoading, loadingLen, animated);
                     break;
@@ -1254,6 +1309,8 @@ public class PrivacySettingsActivity extends BaseFragment implements Notificatio
                         privacyCell.setText(getString("SuggestContactsInfo", R.string.SuggestContactsInfo));
                     } else if (position == newChatsSectionRow) {
                         privacyCell.setText(getString("ArchiveAndMuteInfo", R.string.ArchiveAndMuteInfo));
+                    } else if (position == localHistoryDetailRow) {
+                        privacyCell.setText(getString(R.string.LocalHistorySettingInfo));
                     }
                     break;
                 case 2:
@@ -1272,6 +1329,8 @@ public class PrivacySettingsActivity extends BaseFragment implements Notificatio
                         headerCell.setText(getString("Contacts", R.string.Contacts));
                     } else if (position == newChatsHeaderRow) {
                         headerCell.setText(getString("NewChatsFromNonContacts", R.string.NewChatsFromNonContacts));
+                    } else if (position == localHistorySectionRow) {
+                        headerCell.setText(getString(R.string.LocalHistoryTitle));
                     }
                     break;
                 case 3:
@@ -1284,6 +1343,8 @@ public class PrivacySettingsActivity extends BaseFragment implements Notificatio
                         textCheckCell.setTextAndCheck(getString("SuggestContacts", R.string.SuggestContacts), newSuggest, false);
                     } else if (position == newChatsRow) {
                         textCheckCell.setTextAndCheck(getString("ArchiveAndMute", R.string.ArchiveAndMute), archiveChats, false);
+                    } else if (position == localHistoryRow) {
+                        textCheckCell.setTextAndCheck(getString(R.string.LocalHistoryTitle), LocalHistory.getInstance(currentAccount).isEnabled(), true);
                     }
                     break;
                 case 5:
@@ -1393,11 +1454,11 @@ public class PrivacySettingsActivity extends BaseFragment implements Notificatio
                     position == deleteAccountRow || position == webSessionsRow || position == groupsRow || position == paymentsClearRow ||
                     position == secretMapRow || position == contactsDeleteRow || position == botsBiometryRow) {
                 return 0;
-            } else if (position == privacyShadowRow || position == deleteAccountDetailRow || position == groupsDetailRow || position == sessionsDetailRow || position == secretDetailRow || position == botsDetailRow || position == contactsDetailRow || position == newChatsSectionRow) {
+            } else if (position == privacyShadowRow || position == deleteAccountDetailRow || position == groupsDetailRow || position == sessionsDetailRow || position == secretDetailRow || position == botsDetailRow || position == contactsDetailRow || position == newChatsSectionRow || position == localHistoryDetailRow) {
                 return 1;
-            } else if (position == securitySectionRow || position == advancedSectionRow || position == privacySectionRow || position == secretSectionRow || position == botsSectionRow || position == contactsSectionRow || position == newChatsHeaderRow) {
+            } else if (position == securitySectionRow || position == advancedSectionRow || position == privacySectionRow || position == secretSectionRow || position == botsSectionRow || position == contactsSectionRow || position == newChatsHeaderRow || position == localHistorySectionRow) {
                 return 2;
-            } else if (position == secretWebpageRow || position == contactsSyncRow || position == contactsSuggestRow || position == newChatsRow) {
+            } else if (position == secretWebpageRow || position == contactsSyncRow || position == contactsSuggestRow || position == newChatsRow || position == localHistoryRow) {
                 return 3;
             } else if (position == botsAndWebsitesShadowRow) {
                 return 4;
