@@ -77,6 +77,39 @@ import java.util.List;
 
 public class EditTextBoldCursor extends EditTextEffects {
 
+    @Override
+    public android.view.inputmethod.InputConnection onCreateInputConnection(android.view.inputmethod.EditorInfo info) {
+        android.view.inputmethod.InputConnection connection = super.onCreateInputConnection(info);
+        if (connection == null) return null;
+        return new android.view.inputmethod.InputConnectionWrapper(connection, false) {
+            @Override public boolean commitText(CharSequence text, int cursor) {
+                org.telegram.messenger.usage.UsageTracker.onUserInput();
+                return super.commitText(text, cursor);
+            }
+            @Override public boolean setComposingText(CharSequence text, int cursor) {
+                org.telegram.messenger.usage.UsageTracker.onUserInput();
+                return super.setComposingText(text, cursor);
+            }
+            @Override public boolean deleteSurroundingText(int before, int after) {
+                org.telegram.messenger.usage.UsageTracker.onUserInput();
+                return super.deleteSurroundingText(before, after);
+            }
+            @android.annotation.TargetApi(24)
+            @Override public boolean deleteSurroundingTextInCodePoints(int before, int after) {
+                org.telegram.messenger.usage.UsageTracker.onUserInput();
+                return super.deleteSurroundingTextInCodePoints(before, after);
+            }
+            @Override public boolean sendKeyEvent(android.view.KeyEvent event) {
+                org.telegram.messenger.usage.UsageTracker.onUserInput();
+                return super.sendKeyEvent(event);
+            }
+            @Override public boolean performEditorAction(int action) {
+                org.telegram.messenger.usage.UsageTracker.onUserInput();
+                return super.performEditorAction(action);
+            }
+        };
+    }
+
     private static Field mEditor;
     private static Field mShowCursorField;
     private static Field mScrollYField;

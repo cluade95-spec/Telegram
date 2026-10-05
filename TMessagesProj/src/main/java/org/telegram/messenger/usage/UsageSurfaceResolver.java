@@ -3,6 +3,7 @@ package org.telegram.messenger.usage;
 import android.app.Activity;
 import android.view.View;
 import org.telegram.messenger.ChatObject;
+import org.telegram.messenger.DialogObject;
 import org.telegram.messenger.UserConfig;
 import org.telegram.messenger.UserObject;
 import org.telegram.ui.ActionBar.BaseFragment;
@@ -48,14 +49,20 @@ public final class UsageSurfaceResolver {
         long account = UserConfig.getInstance(slot).getClientUserId();
         boolean media = PhotoViewer.hasInstance() && PhotoViewer.getInstance().isVisible()
                 || SecretMediaViewer.hasInstance() && SecretMediaViewer.getInstance().isVisible();
-        boolean stories = top != null && top.getLastStoryViewer() != null && top.getLastStoryViewer().isShown();
+        StoryViewer activeStory = top == null ? null : top.getLastStoryViewer();
+        boolean stories = activeStory != null && activeStory.isShown();
         if (!stories) {
             for (StoryViewer viewer : StoryViewer.globalInstances) {
-                if (viewer.isShown()) { stories = true; break; }
+                if (viewer.isShown()) { stories = true; activeStory = viewer; break; }
             }
         }
         boolean article = ArticleViewer.hasInstance() && ArticleViewer.getInstance().isVisible()
                 || top != null && top.getLastSheet() instanceof ArticleViewer.Sheet && top.getLastSheet().isShown();
+        if (PhotoViewer.hasInstance() && PhotoViewer.getInstance().isVisible()) slot = PhotoViewer.getInstance().getUsageAccount();
+        else if (SecretMediaViewer.hasInstance() && SecretMediaViewer.getInstance().isVisible()) slot = SecretMediaViewer.getInstance().getUsageAccount();
+        else if (stories) slot = activeStory.currentAccount;
+        else if (ArticleViewer.hasInstance() && ArticleViewer.getInstance().isVisible()) slot = ArticleViewer.getInstance().getUsageAccount();
+        account = UserConfig.getInstance(slot).getClientUserId();
         boolean locked = host instanceof LaunchActivity && ((LaunchActivity) host).isUsagePasscodeVisible();
         return UsageClassifier.classify(account, facts(top),
                 new UsageClassifier.OverlayFacts(connectedCallAccount, media, stories, article, locked),
@@ -92,7 +99,7 @@ public final class UsageSurfaceResolver {
         if (fragment instanceof ChatActivity) {
             ChatActivity chat = (ChatActivity) fragment;
             return new UsageClassifier.FragmentFacts(UsageClassifier.Kind.CHAT, chat.getDialogId(), chat.getChatMode(),
-                    chat.getCurrentEncryptedChat() != null, UserObject.isUserSelf(chat.getCurrentUser()), UserObject.isBot(chat.getCurrentUser()),
+                    chat.getCurrentEncryptedChat() != null || DialogObject.isEncryptedDialog(chat.getDialogId()), UserObject.isUserSelf(chat.getCurrentUser()), UserObject.isBot(chat.getCurrentUser()),
                     ChatObject.isChannelAndNotMegaGroup(chat.getCurrentChat()), ChatObject.isMonoForum(chat.getCurrentChat()), false, false);
         }
         if (fragment instanceof DialogsActivity) {
@@ -100,6 +107,7 @@ public final class UsageSurfaceResolver {
             return new UsageClassifier.FragmentFacts(UsageClassifier.Kind.LIST, 0, 0, false, false, false, false, false,
                     dialogs.isUsageSearchShown(), dialogs.isUsageSelectionOnly());
         }
+        if (fragment instanceof org.telegram.ui.Components.HashtagActivity) return UsageClassifier.FragmentFacts.of(UsageClassifier.Kind.SEARCH);
         if (fragment instanceof TopicsFragment) return UsageClassifier.FragmentFacts.of(UsageClassifier.Kind.TOPICS);
         if (fragment instanceof ProfileActivity || fragment instanceof ProfileActivity2) return UsageClassifier.FragmentFacts.of(UsageClassifier.Kind.PROFILE);
         if (fragment instanceof SettingsActivity) return UsageClassifier.FragmentFacts.of(UsageClassifier.Kind.SETTINGS);

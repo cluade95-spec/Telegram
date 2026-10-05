@@ -272,6 +272,7 @@ public class ApplicationLoader extends Application {
             DownloadController.getInstance(a);
         }
         BillingController.getInstance().startConnection();
+        AndroidUtilities.runOnUIThread(org.telegram.messenger.usage.UsageTracker::init);
     }
 
     public ApplicationLoader() {

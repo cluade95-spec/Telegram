@@ -7518,6 +7518,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
             searchAnimator = null;
         }
         searchIsShowed = show;
+        org.telegram.messenger.usage.UsageTracker.onNavigationChanged();
         blur3_InvalidateBlur();
         if (show) {
             boolean onlyDialogsAdapter;

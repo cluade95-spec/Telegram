@@ -117,6 +117,12 @@ import java.util.Locale;
 public class SecretMediaViewer implements NotificationCenter.NotificationCenterDelegate, GestureDetector.OnGestureListener, GestureDetector.OnDoubleTapListener {
 
     private class FrameLayoutDrawer extends FrameLayout {
+        @Override
+        public boolean dispatchTouchEvent(MotionEvent event) {
+            org.telegram.messenger.usage.UsageTracker.onUserInput();
+            return super.dispatchTouchEvent(event);
+        }
+
         public FrameLayoutDrawer(Context context) {
             super(context);
             setWillNotDraw(false);
@@ -594,9 +600,11 @@ public class SecretMediaViewer implements NotificationCenter.NotificationCenterD
                     if (videoPlayer.isPlaying() && playbackState != ExoPlayer.STATE_ENDED) {
                         if (!isPlaying) {
                             isPlaying = true;
+                            org.telegram.messenger.usage.UsageTracker.onNavigationChanged();
                         }
                     } else if (isPlaying) {
                         isPlaying = false;
+                        org.telegram.messenger.usage.UsageTracker.onNavigationChanged();
                         if (playbackState == ExoPlayer.STATE_ENDED) {
                             videoWatchedOneTime = true;
                             if (closeVideoAfterWatch) {
@@ -717,6 +725,7 @@ public class SecretMediaViewer implements NotificationCenter.NotificationCenterD
             videoTextureView = null;
         }
         isPlaying = false;
+        org.telegram.messenger.usage.UsageTracker.onNavigationChanged();
     }
 
     private WindowVisibilityManager.Controller activityVisibilityController;
@@ -1571,6 +1580,7 @@ public class SecretMediaViewer implements NotificationCenter.NotificationCenterD
         wm.addView(windowView, windowLayoutParams);
         secretDeleteTimer.invalidate();
         isVisible = true;
+        org.telegram.messenger.usage.UsageTracker.onNavigationChanged();
 
         final Window window = parentActivity.getWindow();
         wasLightNavigationBar = AndroidUtilities.getLightNavigationBar(window);
@@ -1695,6 +1705,14 @@ public class SecretMediaViewer implements NotificationCenter.NotificationCenterD
         }
     }
 
+    public boolean isUsageVideoPlaying() {
+        return isVisible && isPlaying;
+    }
+
+    public int getUsageAccount() {
+        return currentAccount;
+    }
+
     public boolean isVisible() {
         return isVisible;
     }
@@ -1716,6 +1734,7 @@ public class SecretMediaViewer implements NotificationCenter.NotificationCenterD
         NotificationCenter.getInstance(currentAccount).removeObserver(this, NotificationCenter.updateMessageMedia);
         NotificationCenter.getInstance(currentAccount).removeObserver(this, NotificationCenter.didCreatedNewDeleteTask);
         isVisible = false;
+        org.telegram.messenger.usage.UsageTracker.onNavigationChanged();
         currentProvider = null;
         if (currentThumb != null) {
             currentThumb.release();
@@ -2105,6 +2124,7 @@ public class SecretMediaViewer implements NotificationCenter.NotificationCenterD
                         object.imageReceiver.setVisible(true, true);
                     }
                     isVisible = false;
+                    org.telegram.messenger.usage.UsageTracker.onNavigationChanged();
                     AndroidUtilities.runOnUIThread(() -> {
                         if (photoAnimationEndRunnable != null) {
                             photoAnimationEndRunnable.run();
@@ -2164,6 +2184,7 @@ public class SecretMediaViewer implements NotificationCenter.NotificationCenterD
 
     private void onPhotoClosed(PhotoViewer.PlaceProviderObject object) {
         isVisible = false;
+        org.telegram.messenger.usage.UsageTracker.onNavigationChanged();
         currentProvider = null;
         disableShowCheck = false;
         releasePlayer();

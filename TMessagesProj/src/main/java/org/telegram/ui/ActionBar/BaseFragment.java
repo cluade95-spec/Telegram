@@ -368,6 +368,7 @@ public abstract class BaseFragment {
         if (sheetsStack == null || sheetsStack.isEmpty())
             return;
         updateSheetsVisibility();
+        org.telegram.messenger.usage.UsageTracker.onNavigationChanged();
     }
 
     public void setParentFragment(BaseFragment fragment) {
@@ -497,6 +498,8 @@ public abstract class BaseFragment {
     @CallSuper
     public void onFragmentDestroy() {
         ProtectedChatGate.onFragmentDestroyed(this);
+        org.telegram.messenger.usage.UsageSurfaceResolver.forget(this);
+        org.telegram.messenger.usage.UsageTracker.onNavigationChanged();
         getConnectionsManager().cancelRequestsForGuid(classGuid);
         getMessagesStorage().cancelTasksForGuid(classGuid);
         isFinished = true;
@@ -534,6 +537,7 @@ public abstract class BaseFragment {
     public void onResume() {
         isPaused = false;
         ProtectedChatGate.onFragmentResumed(this);
+        org.telegram.messenger.usage.UsageTracker.onNavigationChanged();
         if (actionBar != null) {
             actionBar.onResume();
         }
@@ -546,6 +550,7 @@ public abstract class BaseFragment {
     @CallSuper
     public void onPause() {
         ProtectedChatGate.onFragmentPaused(this);
+        org.telegram.messenger.usage.UsageTracker.onNavigationChanged();
         if (actionBar != null) {
             actionBar.onPause();
         }
@@ -756,6 +761,7 @@ public abstract class BaseFragment {
     public void onBecomeFullyVisible() {
         isFullyVisible = true;
         ProtectedChatGate.onFragmentSettled(this);
+        org.telegram.messenger.usage.UsageTracker.onNavigationChanged();
         AccessibilityManager mgr = (AccessibilityManager) ApplicationLoader.applicationContext.getSystemService(Context.ACCESSIBILITY_SERVICE);
         if (mgr.isEnabled()) {
             ActionBar actionBar = getActionBar();
@@ -772,6 +778,7 @@ public abstract class BaseFragment {
             c.run();
         }
         updateSheetsVisibility();
+        org.telegram.messenger.usage.UsageTracker.onNavigationChanged();
         checkSystemBarColors();
     }
 
@@ -802,7 +809,9 @@ public abstract class BaseFragment {
     public void onBecomeFullyHidden() {
         isFullyVisible = false;
         ProtectedChatGate.onFragmentSettled(this);
+        org.telegram.messenger.usage.UsageTracker.onNavigationChanged();
         updateSheetsVisibility();
+        org.telegram.messenger.usage.UsageTracker.onNavigationChanged();
     }
 
     public AnimatorSet onCustomTransitionAnimation(boolean isOpen, Runnable callback) {
@@ -1317,6 +1326,7 @@ public abstract class BaseFragment {
             }
             sheetsStack.add(storyViewer);
             updateSheetsVisibility();
+            org.telegram.messenger.usage.UsageTracker.onNavigationChanged();
         }
         return storyViewer;
     }
@@ -1341,6 +1351,7 @@ public abstract class BaseFragment {
             }
             sheetsStack.add(storyViewer);
             updateSheetsVisibility();
+            org.telegram.messenger.usage.UsageTracker.onNavigationChanged();
         }
         return storyViewer;
     }
@@ -1362,6 +1373,7 @@ public abstract class BaseFragment {
         if (sheetsStack == null) return;
         sheetsStack.remove(sheet);
         updateSheetsVisibility();
+        org.telegram.messenger.usage.UsageTracker.onNavigationChanged();
     }
 
     public void addSheet(BaseFragment.AttachedSheet sheet) {
@@ -1374,6 +1386,7 @@ public abstract class BaseFragment {
         }
         sheetsStack.add(sheet);
         updateSheetsVisibility();
+        org.telegram.messenger.usage.UsageTracker.onNavigationChanged();
     }
 
     public StoryViewer createOverlayStoryViewer() {
@@ -1386,6 +1399,7 @@ public abstract class BaseFragment {
         }
         sheetsStack.add(storyViewer);
         updateSheetsVisibility();
+        org.telegram.messenger.usage.UsageTracker.onNavigationChanged();
         return storyViewer;
     }
 

@@ -3055,6 +3055,7 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
 
         @Override
         public boolean dispatchTouchEvent(MotionEvent ev) {
+            org.telegram.messenger.usage.UsageTracker.onUserInput();
             textSelectionHelper.getOverlayView(getContext()).checkCancelAction(ev);
             if (textSelectionHelper.isInSelectionMode()) {
                 if (textSelectionHelper.getOverlayView(getContext()).onTouchEvent(ev)) {
@@ -5572,6 +5573,7 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
                             PipInstance = Instance;
                             Instance = null;
                             isVisible = false;
+                            org.telegram.messenger.usage.UsageTracker.onNavigationChanged();
                             isVisibleOrAnimating = false;
                             if (currentPlaceObject != null && !currentPlaceObject.imageReceiver.getVisible()) {
                                 currentPlaceObject.imageReceiver.setVisible(true, true);
@@ -8991,6 +8993,7 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
         Instance = null;
         switchingInlineMode = true;
         isVisible = false;
+        org.telegram.messenger.usage.UsageTracker.onNavigationChanged();
         isVisibleOrAnimating = false;
         AndroidUtilities.cancelRunOnUIThread(hideActionBarRunnable);
         if (currentPlaceObject != null && !currentPlaceObject.imageReceiver.getVisible()) {
@@ -9444,6 +9447,7 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
 
         try {
             isVisible = true;
+            org.telegram.messenger.usage.UsageTracker.onNavigationChanged();
             isVisibleOrAnimating = true;
             WindowManager wm = (WindowManager) parentActivity.getSystemService(Context.WINDOW_SERVICE);
             wm.addView(windowView, windowLayoutParams);
@@ -9515,6 +9519,7 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
                 PipInstance = Instance;
                 Instance = null;
                 isVisible = false;
+                org.telegram.messenger.usage.UsageTracker.onNavigationChanged();
                 if (currentPlaceObject != null && !currentPlaceObject.imageReceiver.getVisible()) {
                     currentPlaceObject.imageReceiver.setVisible(true, true);
                 }
@@ -10246,6 +10251,7 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
         if ((videoPlayer != null ? videoPlayer.isPlaying() : photoViewerWebView.isPlaying()) && playbackState != ExoPlayer.STATE_ENDED) {
             if (!isPlaying) {
                 isPlaying = true;
+                org.telegram.messenger.usage.UsageTracker.onNavigationChanged();
                 photoProgressViews[0].setBackgroundState(isCurrentVideo ? PROGRESS_NONE : PROGRESS_PAUSE, false, true);
                 photoProgressViews[0].setIndexedAlpha(1, !isCurrentVideo && (!isAccessibilityEnabled() || playerWasPlaying) && ((playerAutoStarted && !playerWasPlaying) || !isActionBarVisible) ? 0f : 1f, false);
                 playerWasPlaying = true;
@@ -10257,6 +10263,7 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
                 photoProgressViews[0].setBackgroundState(PROGRESS_PLAY, false, photoProgressViews[0].animAlphas[1] > 0f);
             }
             isPlaying = false;
+            org.telegram.messenger.usage.UsageTracker.onNavigationChanged();
             AndroidUtilities.cancelRunOnUIThread(updateProgressRunnable);
             if (playbackState == ExoPlayer.STATE_ENDED) {
                 if (isCurrentVideo) {
@@ -11015,6 +11022,7 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
         }
         if (isPlaying) {
             isPlaying = false;
+            org.telegram.messenger.usage.UsageTracker.onNavigationChanged();
             AndroidUtilities.cancelRunOnUIThread(updateProgressRunnable);
         }
         if (!onClose && !inPreview && !requestingPreview) {
@@ -17119,6 +17127,7 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
             }
 
             isVisible = true;
+            org.telegram.messenger.usage.UsageTracker.onNavigationChanged();
             isVisibleOrAnimating = true;
 
             togglePhotosListView(false, false);
@@ -17154,6 +17163,7 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
             }
 
             isVisible = true;
+            org.telegram.messenger.usage.UsageTracker.onNavigationChanged();
             isVisibleOrAnimating = true;
             togglePhotosListView(false, false);
             seekToProgressPending2 = 0;
@@ -17520,6 +17530,7 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
         }
 
         isVisible = true;
+        org.telegram.messenger.usage.UsageTracker.onNavigationChanged();
         isVisibleOrAnimating = true;
 
         togglePhotosListView(false, false);
@@ -18646,6 +18657,7 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
             FileLoader.getInstance(currentAccount).cancelLoadFile(currentMessageObject.getDocument());
         }
         isVisible = false;
+        org.telegram.messenger.usage.UsageTracker.onNavigationChanged();
         isVisibleOrAnimating = false;
         cropInitied = false;
         disableShowCheck = true;
@@ -18781,6 +18793,14 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
 
     private boolean allowLoopingOnPause() {
         return AndroidUtilities.isInPictureInPictureMode(parentActivity);
+    }
+
+    public boolean isUsageVideoPlaying() {
+        return isVisible() && isPlaying && parentActivity != null && !AndroidUtilities.isInPictureInPictureMode(parentActivity);
+    }
+
+    public int getUsageAccount() {
+        return currentAccount;
     }
 
     public boolean isVisible() {
@@ -23558,6 +23578,7 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
 
         @Override
         public boolean dispatchKeyEvent(KeyEvent event) {
+            if (event.getAction() == KeyEvent.ACTION_DOWN) org.telegram.messenger.usage.UsageTracker.onUserInput();
             int keyCode = event.getKeyCode();
             if (!muteVideo && sendPhotoType != SELECT_TYPE_AVATAR && isCurrentVideo && videoPlayer != null && event.getRepeatCount() == 0 && event.getAction() == KeyEvent.ACTION_DOWN && (event.getKeyCode() == KeyEvent.KEYCODE_VOLUME_UP || event.getKeyCode() == KeyEvent.KEYCODE_VOLUME_DOWN)) {
                 videoPlayer.setVolume(1.0f);
@@ -23567,6 +23588,7 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
 
         @Override
         public boolean dispatchTouchEvent(MotionEvent ev) {
+            org.telegram.messenger.usage.UsageTracker.onUserInput();
             if (videoPlayerControlVisible && isPlaying) {
                 switch (ev.getActionMasked()) {
                     case MotionEvent.ACTION_DOWN:
@@ -23690,6 +23712,7 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
 
         @Override
         public boolean dispatchKeyEventPreIme(KeyEvent event) {
+            if (event.getAction() == KeyEvent.ACTION_DOWN) org.telegram.messenger.usage.UsageTracker.onUserInput();
             if (event != null && event.getKeyCode() == KeyEvent.KEYCODE_BACK && event.getAction() == KeyEvent.ACTION_UP) {
                 if (textSelectionHelper.isInSelectionMode()) {
                     textSelectionHelper.clear();

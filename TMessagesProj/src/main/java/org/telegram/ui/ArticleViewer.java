@@ -1016,6 +1016,7 @@ public class ArticleViewer extends IArticleViewer implements NotificationCenter.
 
         @Override
         public boolean dispatchTouchEvent(MotionEvent ev) {
+            org.telegram.messenger.usage.UsageTracker.onUserInput();
             if (pinchToZoomHelper.isInOverlayMode()) {
                 ev.offsetLocation(-containerView.getX(), -containerView.getY());
                 return pinchToZoomHelper.onTouchEvent(ev);
@@ -1409,6 +1410,7 @@ public class ArticleViewer extends IArticleViewer implements NotificationCenter.
 
         @Override
         public boolean dispatchKeyEventPreIme(KeyEvent event) {
+            if (event.getAction() == KeyEvent.ACTION_DOWN) org.telegram.messenger.usage.UsageTracker.onUserInput();
             if (event != null && event.getKeyCode() == KeyEvent.KEYCODE_BACK && event.getAction() == KeyEvent.ACTION_UP) {
                 if (actionBar.searchEditText.isFocused()) {
                     actionBar.searchEditText.clearFocus();
@@ -2436,6 +2438,7 @@ public class ArticleViewer extends IArticleViewer implements NotificationCenter.
 
                     @Override
                     public boolean dispatchTouchEvent(MotionEvent ev) {
+                        org.telegram.messenger.usage.UsageTracker.onUserInput();
                         TextSelectionHelper.TextSelectionOverlay selectionOverlay = textSelectionHelperBottomSheet.getOverlayView(getContext());
                         MotionEvent textSelectionEv = MotionEvent.obtain(ev);
                         textSelectionEv.offsetLocation(-linearLayout.getX(), -linearLayout.getY());
@@ -5713,6 +5716,7 @@ public class ArticleViewer extends IArticleViewer implements NotificationCenter.
             wm.updateViewLayout(windowView, windowLayoutParams);
         }
         isVisible = true;
+        org.telegram.messenger.usage.UsageTracker.onNavigationChanged();
         animationInProgress = 1;
 
         if (openingAbove) {
@@ -6015,6 +6019,7 @@ public class ArticleViewer extends IArticleViewer implements NotificationCenter.
 
     private void onClosed() {
         isVisible = false;
+        org.telegram.messenger.usage.UsageTracker.onNavigationChanged();
         for (int i = 0; i < pages.length; i++) {
             pages[i].cleanup();
         }
@@ -6157,6 +6162,10 @@ public class ArticleViewer extends IArticleViewer implements NotificationCenter.
         parentActivity = null;
         parentFragment = null;
         Instance = null;
+    }
+
+    public int getUsageAccount() {
+        return currentAccount;
     }
 
     public boolean isVisible() {
@@ -9715,6 +9724,7 @@ public class ArticleViewer extends IArticleViewer implements NotificationCenter.
 
         @Override
         public boolean dispatchTouchEvent(MotionEvent ev) {
+            org.telegram.messenger.usage.UsageTracker.onUserInput();
             final int action = ev.getActionMasked();
             if (action == MotionEvent.ACTION_DOWN) {
                 if (parent.canStartSelection(this)) {
@@ -16231,6 +16241,7 @@ public class ArticleViewer extends IArticleViewer implements NotificationCenter.
 
             @Override
             public boolean dispatchTouchEvent(MotionEvent ev) {
+                org.telegram.messenger.usage.UsageTracker.onUserInput();
                 if (ev.getAction() == MotionEvent.ACTION_DOWN && ev.getY() < (attachedToActionBar ? 0 : getListTop())) {
                     dismiss(true);
                     return true;

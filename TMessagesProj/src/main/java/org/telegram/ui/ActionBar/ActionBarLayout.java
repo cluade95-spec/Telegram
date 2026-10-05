@@ -2357,6 +2357,7 @@ public class ActionBarLayout extends FrameLayout implements INavigationLayout, F
     }
 
     private void onFragmentStackChanged(String action) {
+        org.telegram.messenger.usage.UsageTracker.onNavigationChanged();
         if (onFragmentStackChangedListener != null) {
             onFragmentStackChangedListener.run();
         }

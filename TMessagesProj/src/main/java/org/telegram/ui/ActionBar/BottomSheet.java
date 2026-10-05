@@ -1944,6 +1944,7 @@ public class BottomSheet extends Dialog implements BaseFragment.AttachedSheet {
 
     @Override
     public boolean dispatchTouchEvent(@NonNull MotionEvent ev) {
+        org.telegram.messenger.usage.UsageTracker.onUserInput();
         if (dismissed) {
             return false;
         }
@@ -2433,6 +2434,7 @@ public class BottomSheet extends Dialog implements BaseFragment.AttachedSheet {
 
     @Override
     public boolean dispatchKeyEvent(@NonNull KeyEvent event) {
+        if (event.getAction() == KeyEvent.ACTION_DOWN) org.telegram.messenger.usage.UsageTracker.onUserInput();
         return super.dispatchKeyEvent(event);
     }
 

@@ -435,6 +435,7 @@ public class StoryViewer implements NotificationCenter.NotificationCenterDelegat
             WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS |
             WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON;
         isClosed = false;
+        org.telegram.messenger.usage.UsageTracker.onNavigationChanged();
         unreadStateChanged = false;
 
         BaseFragment fragment = LaunchActivity.getLastFragment();
@@ -885,6 +886,7 @@ public class StoryViewer implements NotificationCenter.NotificationCenterDelegat
 
                 @Override
                 public boolean dispatchTouchEvent(MotionEvent ev) {
+                    org.telegram.messenger.usage.UsageTracker.onUserInput();
                     boolean swipeToReplyCancelled = false;
                     PeerStoriesView peerStoriesView = storiesViewPager.getCurrentPeerView();
                     if (peerStoriesView != null && peerStoriesView.checkTextSelectionEvent(ev)) {
@@ -1117,6 +1119,7 @@ public class StoryViewer implements NotificationCenter.NotificationCenterDelegat
 
                 @Override
                 public boolean dispatchKeyEventPreIme(KeyEvent event) {
+                    if (event.getAction() == KeyEvent.ACTION_DOWN) org.telegram.messenger.usage.UsageTracker.onUserInput();
                     if (event.getKeyCode() == KeyEvent.KEYCODE_VOLUME_UP || event.getKeyCode() == KeyEvent.KEYCODE_VOLUME_DOWN) {
                         dispatchVolumeEvent(event);
                         return true;
@@ -2266,6 +2269,12 @@ public class StoryViewer implements NotificationCenter.NotificationCenterDelegat
         );
     }
 
+    private boolean usagePlaying;
+
+    public boolean isUsagePlaying() {
+        return isShown() && usagePlaying && !paused;
+    }
+
     public void updatePlayingMode() {
         updatePipSource();
         if (storiesViewPager == null) {
@@ -2279,6 +2288,10 @@ public class StoryViewer implements NotificationCenter.NotificationCenterDelegat
             pause = true;
         }
 
+        if (usagePlaying != !pause) {
+            usagePlaying = !pause;
+            org.telegram.messenger.usage.UsageTracker.onNavigationChanged();
+        }
         storiesViewPager.setPaused(pause);
         if (playerHolder != null) {
             if (pause) {
@@ -2492,6 +2505,7 @@ public class StoryViewer implements NotificationCenter.NotificationCenterDelegat
         }
         AndroidUtilities.hideKeyboard(windowView);
         isClosed = true;
+        org.telegram.messenger.usage.UsageTracker.onNavigationChanged();
         fullyVisible = false;
         progressToOpen = 0;
         progressToDismiss = 0;
@@ -2674,6 +2688,7 @@ public class StoryViewer implements NotificationCenter.NotificationCenterDelegat
     public void close(boolean backAnimation) {
         AndroidUtilities.hideKeyboard(windowView);
         isClosed = true;
+        org.telegram.messenger.usage.UsageTracker.onNavigationChanged();
         invalidateOutRect = true;
         updatePlayingMode();
         startCloseAnimation(backAnimation);
@@ -2818,6 +2833,7 @@ public class StoryViewer implements NotificationCenter.NotificationCenterDelegat
     }
 
     public void dispatchKeyEvent(KeyEvent event) {
+        if (event.getAction() == KeyEvent.ACTION_DOWN) org.telegram.messenger.usage.UsageTracker.onUserInput();
         if (event.getKeyCode() == KeyEvent.KEYCODE_VOLUME_UP || event.getKeyCode() == KeyEvent.KEYCODE_VOLUME_DOWN) {
             dispatchVolumeEvent(event);
         }
@@ -3033,6 +3049,7 @@ public class StoryViewer implements NotificationCenter.NotificationCenterDelegat
 
     public void onResume() {
         paused = false;
+        org.telegram.messenger.usage.UsageTracker.onNavigationChanged();
         if (!ArticleViewer.getInstance().isVisible()) {
             PeerStoriesView peerView = getCurrentPeerView();
             if (peerView != null) {
@@ -3049,6 +3066,7 @@ public class StoryViewer implements NotificationCenter.NotificationCenterDelegat
 
     public void onPause() {
         paused = true;
+        org.telegram.messenger.usage.UsageTracker.onNavigationChanged();
         if (playerHolder != null) {
             playerHolder.release(null);
             playerHolder = null;

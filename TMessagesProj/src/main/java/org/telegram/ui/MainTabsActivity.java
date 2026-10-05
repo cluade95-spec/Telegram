@@ -724,6 +724,7 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
 
     @Override
     protected void onViewPagerScrollEnd() {
+        org.telegram.messenger.usage.UsageTracker.onNavigationChanged();
         if (tabsView != null) {
             selectTab(viewPager.getCurrentPosition(), true);
             setGestureSelectedOverride(0, false);

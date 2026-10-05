@@ -30,6 +30,12 @@ import org.telegram.ui.MessageSendPreview;
 
 public class PasscodeViewDialog extends Dialog {
 
+    @Override
+    public boolean dispatchTouchEvent(android.view.MotionEvent event) {
+        org.telegram.messenger.usage.UsageTracker.onUserInput();
+        return super.dispatchTouchEvent(event);
+    }
+
     public final Context context;
 
     private final FrameLayout windowView;
@@ -48,6 +54,7 @@ public class PasscodeViewDialog extends Dialog {
             @Override
             protected void onHidden() {
                 PasscodeViewDialog.super.dismiss();
+                org.telegram.messenger.usage.UsageTracker.onNavigationChanged();
                 if (LaunchActivity.instance == null) return;
                 DrawerLayoutContainer drawerLayoutContainer = LaunchActivity.instance.drawerLayoutContainer;
                 drawerLayoutContainer.setScaleX(1f);

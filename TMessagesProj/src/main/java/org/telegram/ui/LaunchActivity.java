@@ -1441,6 +1441,7 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
             MediaController.getInstance().cleanupPlayer(true, true);
         }
         passcodeDialog.show();
+        org.telegram.messenger.usage.UsageTracker.onNavigationChanged();
         passcodeDialog.passcodeView.onShow(overlayPasscodeViews.isEmpty() && fingerprint, animated, x, y, () -> {
             actionBarLayout.getView().setVisibility(View.INVISIBLE);
             if (AndroidUtilities.isTablet()) {
@@ -6742,6 +6743,7 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
     public void onUserInteraction() {
         super.onUserInteraction();
         voipLaunchedInBackground = false;
+        org.telegram.messenger.usage.UsageTracker.onUserInput();
     }
 
     @Override
@@ -6847,6 +6849,7 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
     @Override
     public void onPictureInPictureModeChanged(boolean isInPictureInPictureMode, @NonNull Configuration newConfig) {
         super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig);
+        org.telegram.messenger.usage.UsageTracker.onNavigationChanged();
         pipActivityHandler.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig);
 
         if (!isInPictureInPictureMode && !isStarted) {
@@ -8466,6 +8469,7 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
 
     @Override
     public boolean dispatchKeyEvent(KeyEvent event) {
+        if (event.getAction() == KeyEvent.ACTION_DOWN) org.telegram.messenger.usage.UsageTracker.onUserInput();
         int keyCode = event.getKeyCode();
         if (event.getKeyCode() == KeyEvent.KEYCODE_VOLUME_UP || event.getKeyCode() == KeyEvent.KEYCODE_VOLUME_DOWN) {
             BaseFragment baseFragment = getLastFragment();

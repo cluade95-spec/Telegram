@@ -212,6 +212,12 @@ public class BubbleActivity extends BasePermissionsActivity implements INavigati
     }
 
     @Override
+    public void onUserInteraction() {
+        super.onUserInteraction();
+        org.telegram.messenger.usage.UsageTracker.onUserInput();
+    }
+
+    @Override
     protected void onPause() {
         super.onPause();
         actionBarLayout.onPause();

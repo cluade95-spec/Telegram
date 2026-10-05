@@ -88,6 +88,18 @@ import java.util.Map;
 
 public class AlertDialog extends Dialog implements Drawable.Callback, NotificationCenter.NotificationCenterDelegate {
 
+    @Override
+    public boolean dispatchTouchEvent(MotionEvent event) {
+        org.telegram.messenger.usage.UsageTracker.onUserInput();
+        return super.dispatchTouchEvent(event);
+    }
+
+    @Override
+    public boolean dispatchKeyEvent(android.view.KeyEvent event) {
+        if (event.getAction() == android.view.KeyEvent.ACTION_DOWN) org.telegram.messenger.usage.UsageTracker.onUserInput();
+        return super.dispatchKeyEvent(event);
+    }
+
     public static final int ALERT_TYPE_MESSAGE = 0;
     public static final int ALERT_TYPE_LOADING = 2;
     public static final int ALERT_TYPE_SPINNER = 3;
