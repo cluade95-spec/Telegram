@@ -14,6 +14,7 @@ import android.os.SystemClock;
 import android.util.Base64;
 import android.util.LongSparseArray;
 
+import org.telegram.messenger.usage.UsageTracker;
 import org.telegram.tgnet.ConnectionsManager;
 import org.telegram.tgnet.SerializedData;
 import org.telegram.tgnet.TLRPC;
@@ -460,6 +461,7 @@ public class UserConfig extends BaseController {
 
     public void clearConfig() {
         ProtectedChats.onAccountRemoved(getClientUserId());
+        UsageTracker.onAccountRemoved(getClientUserId());
         getPreferences().edit().clear().apply();
         SyncedLyricsController.getInstance(currentAccount).clear();
 

@@ -15,6 +15,7 @@ import android.text.TextUtils;
 import android.util.SparseArray;
 import android.util.SparseIntArray;
 
+import org.telegram.messenger.usage.UsageTracker;
 import org.telegram.SQLite.SQLiteCursor;
 import org.telegram.messenger.support.LongSparseIntArray;
 import org.telegram.tgnet.ConnectionsManager;
@@ -747,6 +748,7 @@ public class SecretChatHelper extends BaseController {
                         TLRPC.messages_SentEncryptedMessage res = (TLRPC.messages_SentEncryptedMessage) response;
                         if (isSecretVisibleMessage(newMsgObj)) {
                             newMsgObj.date = res.date;
+                            UsageTracker.onMessagesSent(getUserConfig().getClientUserId(), 1);
                         }
                         int existFlags;
                         if (newMsg != null && res.file instanceof TLRPC.TL_encryptedFile) {

@@ -103,8 +103,13 @@ public final class UsageAccountant {
     }
 
     public void onMessagesSent(int n) {
+        onMessagesSent(account, n);
+    }
+
+    /** The confirmation can belong to an account that is not the selected one. */
+    public void onMessagesSent(long accountUserId, int n) {
         long wall = clock.wallMillis();
-        ledger.addMessagesSent(UsageDays.dayOfLocal(wall + clock.zone().getOffset(wall)), account, n);
+        ledger.addMessagesSent(UsageDays.dayOfLocal(wall + clock.zone().getOffset(wall)), accountUserId, n);
     }
 
     /** Settles the open segment (used by flush triggers and the dashboard). */

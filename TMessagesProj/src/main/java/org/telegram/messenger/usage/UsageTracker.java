@@ -148,19 +148,30 @@ public final class UsageTracker implements NotificationCenter.NotificationCenter
         }
     }
 
-    /** A message was confirmed sent by the server (any thread). */
-    public static void onMessagesSent(int count) {
+    /** Messages were confirmed sent by the server for the account with this clientUserId (any thread). */
+    public static void onMessagesSent(long accountUserId, int count) {
         UsageTracker t = instance;
-        if (t != null && count > 0) {
-            t.onUi(() -> t.accountant.onMessagesSent(count));
+        if (t != null && count > 0 && accountUserId != 0) {
+            t.onUi(() -> t.accountant.onMessagesSent(accountUserId, count));
         }
     }
 
-    /** Settles and drains everything credited so far; the dashboard and flush triggers call this. */
+    /** Logout: flush what is in memory first, then anonymize the account's per-dialog rows (order kept on the UI thread). */
+    public static void onAccountRemoved(long accountUserId) {
+        UsageTracker t = instance;
+        if (t != null) {
+            t.onUi(() -> {
+                t.flush();
+                UsageStore.getInstance().onAccountRemoved(accountUserId);
+            });
+        }
+    }
+
+    /** Flushes in-memory time to the store, then reports (dashboard open, reset). */
     public static void flushNow() {
         UsageTracker t = instance;
         if (t != null) {
-            t.flush();
+            t.onUi(t::flush);
         }
     }
 
