@@ -163,6 +163,8 @@ public class PrivacySettingsActivity extends BaseFragment implements Notificatio
     private int secretDetailRow;
     private int localHistorySectionRow;
     private int localHistoryRow;
+    private int localHistoryShowRow;
+    private int localHistoryOpenRow;
     private int localHistoryDeleteRow;
     private int localHistoryDetailRow;
     private int rowCount;
@@ -513,6 +515,14 @@ public class PrivacySettingsActivity extends BaseFragment implements Notificatio
                 }
             } else if (position == localHistoryRow) {
                 toggleLocalHistory(view);
+            } else if (position == localHistoryShowRow) {
+                final LocalHistory localHistory = LocalHistory.getInstance(currentAccount);
+                localHistory.setRowHidden(!localHistory.isRowHidden());
+                if (view instanceof TextCheckCell) {
+                    ((TextCheckCell) view).setChecked(!localHistory.isRowHidden());
+                }
+            } else if (position == localHistoryOpenRow) {
+                presentFragment(new LocalHistoryActivity());
             } else if (position == localHistoryDeleteRow) {
                 if (getParentActivity() == null) {
                     return;
@@ -814,6 +824,8 @@ public class PrivacySettingsActivity extends BaseFragment implements Notificatio
         secretDetailRow = rowCount++;
         localHistorySectionRow = rowCount++;
         localHistoryRow = rowCount++;
+        localHistoryShowRow = rowCount++;
+        localHistoryOpenRow = rowCount++;
         localHistoryDeleteRow = rowCount++;
         localHistoryDetailRow = rowCount++;
         if (listAdapter != null && notify) {
@@ -1089,7 +1101,7 @@ public class PrivacySettingsActivity extends BaseFragment implements Notificatio
                     position == newChatsRow && !getContactsController().getLoadingGlobalSettings() ||
                     position == emailLoginRow || position == paymentsClearRow || position == secretMapRow ||
                     position == contactsSyncRow || position == passportRow || position == contactsDeleteRow ||
-                    position == localHistoryRow || position == localHistoryDeleteRow ||
+                    position == localHistoryRow || position == localHistoryShowRow || position == localHistoryOpenRow || position == localHistoryDeleteRow ||
                     position == contactsSuggestRow || position == autoDeleteMesages || position == botsBiometryRow;
         }
 
@@ -1280,6 +1292,8 @@ public class PrivacySettingsActivity extends BaseFragment implements Notificatio
                         secretMapUpdate = false;
                     } else if (position == contactsDeleteRow) {
                         textCell.setText(getString("SyncContactsDelete", R.string.SyncContactsDelete), true);
+                    } else if (position == localHistoryOpenRow) {
+                        textCell.setText(getString(R.string.LocalHistoryOpen), true);
                     } else if (position == localHistoryDeleteRow) {
                         textCell.setText(getString(R.string.LocalHistoryDeleteAll), false);
                     }
@@ -1345,6 +1359,8 @@ public class PrivacySettingsActivity extends BaseFragment implements Notificatio
                         textCheckCell.setTextAndCheck(getString("ArchiveAndMute", R.string.ArchiveAndMute), archiveChats, false);
                     } else if (position == localHistoryRow) {
                         textCheckCell.setTextAndCheck(getString(R.string.LocalHistoryTitle), LocalHistory.getInstance(currentAccount).isEnabled(), true);
+                    } else if (position == localHistoryShowRow) {
+                        textCheckCell.setTextAndCheck(getString(R.string.LocalHistoryShowInList), !LocalHistory.getInstance(currentAccount).isRowHidden(), true);
                     }
                     break;
                 case 5:
@@ -1458,7 +1474,7 @@ public class PrivacySettingsActivity extends BaseFragment implements Notificatio
                 return 1;
             } else if (position == securitySectionRow || position == advancedSectionRow || position == privacySectionRow || position == secretSectionRow || position == botsSectionRow || position == contactsSectionRow || position == newChatsHeaderRow || position == localHistorySectionRow) {
                 return 2;
-            } else if (position == secretWebpageRow || position == contactsSyncRow || position == contactsSuggestRow || position == newChatsRow || position == localHistoryRow) {
+            } else if (position == secretWebpageRow || position == contactsSyncRow || position == contactsSuggestRow || position == newChatsRow || position == localHistoryRow || position == localHistoryShowRow) {
                 return 3;
             } else if (position == botsAndWebsitesShadowRow) {
                 return 4;

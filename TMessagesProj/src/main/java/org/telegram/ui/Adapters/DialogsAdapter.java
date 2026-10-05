@@ -1846,7 +1846,7 @@ public class DialogsAdapter extends RecyclerListView.SelectionAdapter implements
             return null;
         }
         LocalHistory localHistory = LocalHistory.getInstance(currentAccount);
-        if (!localHistory.isEnabled()) {
+        if (!localHistory.isEnabled() || localHistory.isRowHidden()) {
             return null;
         }
         localHistory.ensureSummary();

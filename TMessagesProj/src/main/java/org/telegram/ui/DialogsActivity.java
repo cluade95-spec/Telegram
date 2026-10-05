@@ -8341,6 +8341,10 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
             items.add(LocaleController.getString(R.string.ClearHistory));
             actions.add(1);
         }
+        if (!locked) {
+            items.add(LocaleController.getString(R.string.LocalHistoryHideRow));
+            actions.add(3);
+        }
         if (ProtectedChats.isSupportedDialog(localId)) {
             items.add(LocaleController.getString(isProtected ? R.string.ChatPasscodeUnprotect : R.string.ChatPasscodeProtect));
             actions.add(2);
@@ -8349,6 +8353,8 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
             final int action = actions.get(which);
             if (action == 0) {
                 localHistory.markAllRead();
+            } else if (action == 3) {
+                localHistory.setRowHidden(true);
             } else if (action == 2) {
                 final ArrayList<Long> ids = new ArrayList<>();
                 ids.add(localId);

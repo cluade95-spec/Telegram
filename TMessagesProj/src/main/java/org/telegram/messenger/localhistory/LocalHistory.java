@@ -18,6 +18,7 @@ import java.util.List;
 public class LocalHistory {
 
     private static final String KEY_ENABLED = "localHistoryEnabled";
+    private static final String KEY_ROW_HIDDEN = "localHistoryRowHidden";
     private static final LocalHistory[] instances = new LocalHistory[UserConfig.MAX_ACCOUNT_COUNT];
 
     private static final String META_LAST_READ_AT = "last_read_at";
@@ -261,6 +262,16 @@ public class LocalHistory {
             enabledLoaded = true;
         }
         return enabled;
+    }
+
+    /** The chat-list row can be hidden; the chat stays reachable from Settings and the feature keeps working. */
+    public boolean isRowHidden() {
+        return UserConfig.getInstance(currentAccount).getPreferences().getBoolean(KEY_ROW_HIDDEN, false);
+    }
+
+    public void setRowHidden(boolean hidden) {
+        UserConfig.getInstance(currentAccount).getPreferences().edit().putBoolean(KEY_ROW_HIDDEN, hidden).apply();
+        AndroidUtilities.runOnUIThread(() -> NotificationCenter.getInstance(currentAccount).postNotificationName(NotificationCenter.localHistoryChanged));
     }
 
     public void setEnabled(boolean value) {

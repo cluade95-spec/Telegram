@@ -11348,6 +11348,9 @@
     <string name="LocalHistoryMediaTooLarge">%1$s · too large to save</string>
     <string name="LocalHistoryDeleteEntry">Delete from Local History</string>
     <string name="LocalHistoryUnknownSender">Someone</string>
+    <string name="LocalHistoryShowInList">Show in chat list</string>
+    <string name="LocalHistoryOpen">Open Local History</string>
+    <string name="LocalHistoryHideRow">Hide from chat list</string>
     <string name="LocalHistorySearchEmpty">No matches</string>
     <string name="LocalHistoryVersions">Version history</string>
     <string name="LocalHistoryVersionOriginal">Original</string>
