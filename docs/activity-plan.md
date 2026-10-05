@@ -32,7 +32,8 @@ reporting, Telegram API changes, uploads, background services, periodic wakeups,
   Screen: `ScreenReceiver` / `NotificationCenter.screenStateChanged` (R§2).
 * Surface: no single "visible fragment" notion; main tabs live in `MainTabsActivity` outside the stack; tablets show up to three
   layouts; viewers are separate windows (R§3).
-* Calls: `VoIPService` state and `didStartedCall` / `didEndCall` (R§3).
+* Calls: `VoIPService.StateListener` observes actual connection state; `didStartedCall` / `didEndCall` discover and detach
+  the service, not connected-call boundaries (R§3).
 * Messages sent: existing confirmed-send counting points in `SendMessagesHelper` (R§5).
 * UI: `UniversalFragment` + `UItem.asChart` + `ui/Charts` work without network (R§6).
 
@@ -132,8 +133,11 @@ Three pieces, all central:
   2. top fragment: top of `sheetFragmentsStack`, else on tablets the layers layout if visible, else the right layout's last
      fragment if non-empty and not `tabletFullSize`, else `actionBarLayout.getLastFragmentIncludeMainTabs()`; `BubbleActivity`
      when it is the foreground activity;
-  3. settings context: `SettingsActivity` is in the stack below the top fragment and the top is not a chat, profile, chat list,
-     story or viewer (no list of settings classes needed).
+  3. settings context: inspect the active `MainTabsActivity` tab and carry explicit settings origin through settings
+     navigation. Settings is a nested tab, and tablet settings navigation can replace the right pane's stack, so do not infer
+     context from a `SettingsActivity` below the top fragment. Inherit origin only for otherwise-generic settings pages;
+     chats, profiles, lists, search, stories and viewers retain their own classification. Context ends when navigation leaves
+     that origin and is tracked separately across tablet panes.
 
 Fragment kinds recognized by type: `ChatActivity`, `DialogsActivity`, `TopicsFragment`, `ProfileActivity`/`ProfileActivity2`,
 `SettingsActivity`, `LocalHistoryActivity` (and its profile/edit screens), `CallLogActivity` (OTHER), `ContactsActivity` (OTHER).
@@ -146,7 +150,10 @@ the dialog's surface.
 
 Resolution triggers (each just marks the resolver dirty; one coalesced UI-thread runnable resolves): `BaseFragment.onResume` /
 `onPause` (next to the existing `ProtectedChatGate` calls), `ActionBarLayout.onFragmentStackChanged`, `MainTabsActivity.onViewPagerScrollEnd`,
-viewer open/close, `StoryViewer` open/close, `DialogsActivity.showSearch`, call start/end, `activeAccountChanged`.
+viewer open/close, `StoryViewer` open/close, `DialogsActivity.showSearch`, actual call-state transitions, `activeAccountChanged`.
+Attach a `VoIPService.StateListener` to the discovered service (registration immediately reports its current state).
+Only `STATE_ESTABLISHED` grants exclusive Calls ownership; leaving that state closes Calls and reevaluates normal activity.
+Dialing, ringing and connecting do not count as Calls. Detach on service replacement/end and clear stale ownership.
 
 ## 9. Per-dialog accounting
 
@@ -305,7 +312,7 @@ Charts: `StatisticActivity.ChartViewData` + `StatisticActivity.createChartData(j
 | background (`onBecameBackground`) | close segment, close session, flush |
 | screen off / on (`screenStateChanged`) | close / reopen segment |
 | activity pause without stop (permission dialog) | nothing; idle window applies |
-| navigation, tab settle, sheet, viewer, search, call start/end | close segment, resolve, open new segment |
+| navigation, tab settle, sheet, viewer, search, connected-call state change | close segment, resolve, open new segment |
 | account switch | close segment, flush, open with new account |
 | Protected Chats gate sheet over a chat | the chat stays the surface (sheet is a `BottomSheet`); time while authenticating is short and real |
 | configuration change / activity recreation | `ForegroundDetector` refcount keeps foreground; segment continues; resolver re-runs |

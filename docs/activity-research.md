@@ -41,6 +41,8 @@ There is no existing app-wide "last user activity" timestamp.
 * **`MainTabsActivity`** (`ViewPagerActivity`) hosts Chats / Contacts / Calls-or-Settings / own Profile as tabs that are **not**
   in an `ActionBarLayout` stack; `ViewPagerActivity.getCurrentVisibleFragment()` and `onViewPagerScrollEnd()` give the settled
   tab. During a swipe two tabs are resumed.
+  `MainTabsActivity.createBaseFragmentAt` creates `SettingsActivity` as a nested tab. `SettingsActivity.presentSettingFragment`
+  can replace the tablet right pane's stack; settings origin cannot be inferred by looking for Settings underneath a page.
 * Tablet: `actionBarLayout` (left), `rightActionBarLayout` (right pane), `layersActionBarLayout` (modal layer) can be on screen
   together; there is no helper for "the visible top" across them.
 * `RightSlidingDialogContainer` (topics side panel in `DialogsActivity`) resumes its fragment in preview mode.
@@ -50,7 +52,10 @@ There is no existing app-wide "last user activity" timestamp.
   `ArticleViewer.isVisible()`, `StoryViewer.isShown()` (fragment-attached via `BaseFragment.getLastStoryViewer()`, or
   `StoryViewer.globalInstances`).
 * Calls: `VoIPService.getSharedInstance()`, `getCallState()` (`STATE_ESTABLISHED`), `getCallDuration()`, `groupCall`;
-  `NotificationCenter.didStartedCall` / `didEndCall` (global).
+  `NotificationCenter.didStartedCall` / `didEndCall` (global) identify the service lifecycle. `startOutgoingCall` posts
+  `didStartedCall` in `STATE_REQUESTING`, before connection. `dispatchStateChanged` reports actual transitions to
+  `StateListener.onStateChanged`; `registerStateListener` immediately reports the current nonzero state and
+  `unregisterStateListener` removes it. Activity must observe these transitions for exclusive connected-call ownership.
 * Playback: `MediaController.getPlayingMessageObject()`, `isMessagePaused()`, `messagePlayingDidStart` /
   `messagePlayingPlayStateChanged` / `messagePlayingDidReset`.
 
