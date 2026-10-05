@@ -155,6 +155,8 @@ import org.telegram.messenger.MediaController;
 import org.telegram.messenger.MediaDataController;
 import org.telegram.messenger.MessageObject;
 import org.telegram.messenger.MessagesController;
+import org.telegram.messenger.ProfileContentPolicy;
+import org.telegram.messenger.ProtectedChats;
 import org.telegram.messenger.MessagesStorage;
 import org.telegram.messenger.NotificationCenter;
 import org.telegram.messenger.NotificationsController;
@@ -375,6 +377,8 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
     private StickerEmptyView emptyView;
     private boolean sharedMediaLayoutAttached;
     private SharedMediaLayout.SharedMediaPreloader sharedMediaPreloader;
+    /** Message content of a locked protected dialog is withheld from this profile now (see refreshProtectedContent). */
+    private boolean protectedContentWithheld;
     private boolean preloadedChannelEmojiStatuses;
     private StarRatingView ratingView;
 
@@ -600,6 +604,7 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
     private final static int delete_group = 45;
     private final static int enable_no_forwards = 46;
     private final static int disable_no_forwards = 47;
+    private final static int lock_settings = 48;
 
     private Rect rect = new Rect();
 
@@ -2244,6 +2249,7 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
         getNotificationCenter().addObserver(this, NotificationCenter.profileMusicUpdated);
         getNotificationCenter().addObserver(this, NotificationCenter.updatedChatRanks);
         NotificationCenter.getGlobalInstance().addObserver(this, NotificationCenter.emojiLoaded);
+        NotificationCenter.getGlobalInstance().addObserver(this, NotificationCenter.protectedChatsChanged);
         updateRowsIds();
         if (listAdapter != null) {
             listAdapter.notifyDataSetChanged();
@@ -2385,6 +2391,7 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
         getNotificationCenter().removeObserver(this, NotificationCenter.profileMusicUpdated);
         getNotificationCenter().removeObserver(this, NotificationCenter.updatedChatRanks);
         NotificationCenter.getGlobalInstance().removeObserver(this, NotificationCenter.emojiLoaded);
+        NotificationCenter.getGlobalInstance().removeObserver(this, NotificationCenter.protectedChatsChanged);
         if (avatarsViewPager != null) {
             avatarsViewPager.onDestroy();
         }
@@ -2739,6 +2746,11 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
                         getMediaDataController().installShortcut(did, MediaDataController.SHORTCUT_TYPE_USER_OR_CHAT);
                     } catch (Exception e) {
                         FileLog.e(e);
+                    }
+                } else if (id == lock_settings) {
+                    final long lockDialogId = lockSettingsDialogId();
+                    if (lockDialogId != 0) {
+                        presentFragment(new ChatLockSettingsActivity(lockDialogId));
                     }
                 } else if (id == call_item || id == video_call_item) {
                     onCallClicked(id == video_call_item);
@@ -9039,9 +9051,33 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
         isInLandscapeMode = size.x > size.y;
     }
 
+    /**
+     * Protection changed (a chat locked, unlocked, protected or unprotected). Only message content
+     * appears or disappears (ProfileContentPolicy): the profile keeps all its rows and sections,
+     * Stories and Gifts included. Does nothing unless the content withheld has changed.
+     */
+    private void refreshProtectedContent() {
+        final boolean withheld = sharedMediaPreloader != null && sharedMediaPreloader.isContentWithheld();
+        if (withheld == protectedContentWithheld) {
+            return;
+        }
+        protectedContentWithheld = withheld;
+        if (listAdapter != null) {
+            updateRowsIds();
+            listAdapter.notifyDataSetChanged();
+        }
+        if (sharedMediaLayout != null && sharedMediaPreloader != null) {
+            sharedMediaLayout.setNewMediaCounts(sharedMediaPreloader.getLastMediaCount());
+        }
+    }
+
     @SuppressWarnings("unchecked")
     @Override
     public void didReceivedNotification(int id, int account, final Object... args) {
+        if (id == NotificationCenter.protectedChatsChanged) {
+            refreshProtectedContent();
+            return;
+        }
         if (id == NotificationCenter.uploadStoryEnd || id == NotificationCenter.chatWasBoostedByUser) {
             checkCanSendStoryForPosting();
         } else if (id == NotificationCenter.updateInterfaces) {
@@ -9246,6 +9282,12 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
                 if (imageUpdater != null) {
                     if (listAdapter != null && !TextUtils.equals(userInfo.about, currentBio)) {
                         listAdapter.notifyItemChanged(bioRow);
+                    }
+                    // The own profile has no shared-media section while Saved Messages is locked and
+                    // nothing else would fill it. The info that has just arrived says whether there are
+                    // Stories or Gifts, so look again: they must never wait for the profile to reopen.
+                    if (ProfileContentPolicy.rebuildWhenUserInfoArrives(sharedMediaRow >= 0)) {
+                        updateListAnimated(false);
                     }
                 } else {
                     if (!openAnimationInProgress && !isCallAvailable) {
@@ -10573,7 +10615,7 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
                 }
             }
             if (!hasMedia) {
-                hasMedia = sharedMediaPreloader.hasSavedMessages;
+                hasMedia = sharedMediaPreloader.hasSavedMessages();
             }
             if (!hasMedia) {
                 hasMedia = sharedMediaPreloader.hasPreviews;
@@ -10591,6 +10633,12 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
         if (!hasMedia && chatInfo != null) {
             hasMedia = chatInfo.stories_pinned_available;
         }
+        // While Saved Messages is locked its messages are withheld: the media counts and the Saved
+        // Messages tab already come without them from the preloader. Stories, Gifts and everything
+        // else stay. Only an own profile whose section would then hold nothing but those messages
+        // has no section.
+        protectedContentWithheld = sharedMediaPreloader != null && sharedMediaPreloader.isContentWithheld();
+        final boolean savedMessagesLocked = myProfile && userId != 0 && userId == getUserConfig().getClientUserId() && ProtectedChats.isLockedProtected(currentAccount, userId);
         if (!hasMedia) {
             if (chatId != 0 && MessagesController.ChannelRecommendations.hasRecommendations(currentAccount, -chatId)) {
                 hasMedia = true;
@@ -10820,7 +10868,7 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
                     reportDividerRow = rowCount++;
                 }
 
-                if (hasMedia || (user != null && user.bot && user.bot_can_edit && user.bot_has_main_app) || userInfo != null && userInfo.common_chats_count != 0 || myProfile) {
+                if (ProfileContentPolicy.showSharedMediaSection(hasMedia || (user != null && user.bot && user.bot_can_edit && user.bot_has_main_app) || userInfo != null && userInfo.common_chats_count != 0, myProfile, savedMessagesLocked)) {
                     sharedMediaRow = rowCount++;
                 } else if (lastSectionRow == -1 && needSendMessage) {
                     sendMessageRow = rowCount++;
@@ -12117,6 +12165,7 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
                     linkItem = otherItem.addSubItem(copy_link_profile, R.drawable.msg_link2, getString(R.string.ProfileCopyLink));
                     updateItemsUsername();
                 }
+                addLockSettingsItem();
                 selfUser = true;
             } else {
                 if (user.bot && user.bot_can_edit) {
@@ -12196,6 +12245,7 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
                 if (!isBot && getContactsController().contactsDict.get(userId) != null) {
                     otherItem.addSubItem(add_shortcut, R.drawable.msg_home, LocaleController.getString(R.string.AddShortcut));
                 }
+                addLockSettingsItem();
             }
         } else if (chatId != 0) {
             TLRPC.Chat chat = getMessagesController().getChat(chatId);
@@ -12248,6 +12298,7 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
                     if (topicId == 0) {
                         otherItem.addSubItem(add_shortcut, R.drawable.msg_home, LocaleController.getString(R.string.AddShortcut));
                     }
+                    addLockSettingsItem();
                     if (chat.creator) {
                         otherItem.addColoredGap();
                         otherItem.addSubItem(leave_group, R.drawable.msg_leave, getString(R.string.LeaveMega));
@@ -12278,6 +12329,7 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
                     if (topicId == 0) {
                         otherItem.addSubItem(add_shortcut, R.drawable.msg_home, LocaleController.getString(R.string.AddShortcut));
                     }
+                    addLockSettingsItem();
                     if (currentChat.creator) {
                         otherItem.addColoredGap();
                         otherItem.addSubItem(leave_group, R.drawable.msg_leave, getString(R.string.LeaveChannel));
@@ -12314,6 +12366,7 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
                 if (topicId == 0) {
                     otherItem.addSubItem(add_shortcut, R.drawable.msg_home, LocaleController.getString(R.string.AddShortcut));
                 }
+                addLockSettingsItem();
                 otherItem.addSubItem(leave_group, R.drawable.msg_leave, LocaleController.getString(R.string.DeleteAndExit));
                 leaveAction = true;
             }
@@ -12442,6 +12495,31 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
             sharedMediaLayout.getSearchItem().requestLayout();
         }
         updateStoriesViewBounds(false);
+    }
+
+    /**
+     * The dialog the chat's own Lock Settings belong to, found the way the other profile actions find it
+     * (the secret chat itself, the user, the group or channel; a topic has its parent's), or 0 when
+     * Lock Settings are not offered for it. Protection status stays with {@link ProtectedChats}.
+     */
+    private long lockSettingsDialogId() {
+        final long did;
+        if (currentEncryptedChat != null) {
+            did = DialogObject.makeEncryptedDialogId(currentEncryptedChat.id);
+        } else if (userId != 0) {
+            did = userId;
+        } else if (chatId != 0) {
+            did = -chatId;
+        } else {
+            return 0;
+        }
+        return ProtectedChats.isLockSettingsAvailable(currentAccount, did) ? did : 0;
+    }
+
+    private void addLockSettingsItem() {
+        if (lockSettingsDialogId() != 0) {
+            otherItem.addSubItem(lock_settings, R.drawable.msg_settings, LocaleController.getString(R.string.ChatLockSettings));
+        }
     }
 
     private void createAutoDeleteItem(Context context) {

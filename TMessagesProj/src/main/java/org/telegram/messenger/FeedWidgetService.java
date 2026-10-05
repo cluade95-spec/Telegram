@@ -161,6 +161,12 @@ class FeedRemoteViewsFactory implements RemoteViewsService.RemoteViewsFactory, N
                 messages.clear();
                 ArrayList<MessageObject> messArr = (ArrayList<MessageObject>) args[2];
                 messages.addAll(messArr);
+                for (int i = messages.size() - 1; i >= 0; i--) {
+                    // The widget stays on the home screen: never show content of protected chats.
+                    if (ProtectedChats.shouldHideContent(accountInstance.getCurrentAccount(), messages.get(i).getDialogId())) {
+                        messages.remove(i);
+                    }
+                }
                 countDownLatch.countDown();
             }
         }

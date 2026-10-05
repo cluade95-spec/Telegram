@@ -124,6 +124,8 @@ import org.telegram.messenger.MessagesStorage;
 import org.telegram.messenger.NotificationCenter;
 import org.telegram.messenger.NotificationsController;
 import org.telegram.messenger.R;
+import org.telegram.messenger.ProtectedChats;
+import org.telegram.messenger.ProtectedChatsState;
 import org.telegram.messenger.SharedConfig;
 import org.telegram.messenger.UserConfig;
 import org.telegram.messenger.UserObject;
@@ -218,6 +220,7 @@ import org.telegram.ui.Stories.recorder.ButtonWithCounterView;
 import org.telegram.ui.bots.BotWebViewSheet;
 import org.telegram.ui.Components.Bulletin;
 import org.telegram.ui.Components.BulletinFactory;
+import org.telegram.ui.Components.ProtectedChatAuthSheet;
 import org.telegram.ui.Components.ChatActivityEnterView;
 import org.telegram.ui.Components.ChatAvatarContainer;
 import org.telegram.ui.Components.CombinedDrawable;
@@ -574,6 +577,10 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
     private ActionBarMenuItem pinItem;
     @Nullable
     private ActionBarMenuItem muteItem;
+    private ActionBarMenuItem relockItem;
+    private ActionBarMenuSubItem protectItem;
+    private ActionBarMenuSubItem unprotectItem;
+    private ArrayList<Long> pendingProtectDialogs;
     @Nullable
     private ActionBarMenuItem archive2Item;
     @Nullable
@@ -710,6 +717,9 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
     private final static int add_to_folder = 109;
     private final static int remove_from_folder = 110;
     private final static int community_ungroup = 111;
+    private final static int protect_chat = 113;
+    private final static int unprotect_chat = 114;
+    private final static int relock_chat = 115;
 
     private final static int ARCHIVE_ITEM_STATE_PINNED = 0;
     private final static int ARCHIVE_ITEM_STATE_SHOWED = 1;
@@ -2894,6 +2904,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
             currentConnectionState = getConnectionsManager().getConnectionState();
 
             globalObserversGroup.add(NotificationCenter.emojiLoaded);
+            globalObserversGroup.add(NotificationCenter.protectedChatsChanged);
             if (!onlySelect) {
                 globalObserversGroup.add(NotificationCenter.closeSearchByActiveAction);
                 globalObserversGroup.add(NotificationCenter.proxySettingsChanged);
@@ -4014,6 +4025,12 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
                     hideActionMode(false);
                 } else if (id == pin || id == read || id == delete || id == clear || id == mute || id == archive || id == block || id == archive2 || id == pin2) {
                     performSelectedDialogsAction(selectedDialogs, id, true, false);
+                } else if (id == relock_chat) {
+                    relockSelectedChats();
+                } else if (id == protect_chat) {
+                    protectSelectedChats();
+                } else if (id == unprotect_chat) {
+                    unprotectSelectedChats();
                 }
             }
         });
@@ -4965,7 +4982,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
                     for (int i = 0; i < selectedDialogs.size(); i++) {
                         topicKeys.add(MessagesStorage.TopicKey.of(selectedDialogs.get(i), 0));
                     }
-                    delegate.didSelectDialogs(DialogsActivity.this, topicKeys, message, false, notify, scheduleDate, scheduleRepeatPeriod, null);
+                    notifyDelegate(topicKeys, message, false, notify, scheduleDate, scheduleRepeatPeriod, null, false);
                 }
 
                 @Override
@@ -5141,7 +5158,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
                 for (int i = 0; i < selectedDialogs.size(); i++) {
                     topicKeys.add(MessagesStorage.TopicKey.of(selectedDialogs.get(i), 0));
                 }
-                delegate.didSelectDialogs(DialogsActivity.this, topicKeys, commentView.getFieldText(), false, notify, scheduleDate, scheduleRepeatPeriod, null);
+                notifyDelegate(topicKeys, commentView.getFieldText(), false, notify, scheduleDate, scheduleRepeatPeriod, null, false);
             });
             writeButton.setOnLongClickListener(this::onSendLongClick);
             writeButton.setVisibility(View.GONE);
@@ -6741,6 +6758,8 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
 
         pinItem = actionMode.addItemWithWidth(pin, R.drawable.msg_pin, dp(48));
         muteItem = actionMode.addItemWithWidth(mute, R.drawable.msg_mute, dp(48));
+        relockItem = actionMode.addItemWithWidth(relock_chat, R.drawable.msg_secret, dp(48), LocaleController.getString(R.string.ChatPasscodeLockNow));
+        relockItem.setVisibility(View.GONE);
         archive2Item = actionMode.addItemWithWidth(archive2, R.drawable.msg_archive, dp(48));
         deleteItem = actionMode.addItemWithWidth(delete, R.drawable.msg_delete, dp(48), LocaleController.getString(R.string.Delete));
 
@@ -6753,6 +6772,10 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
         readItem = otherItem.addSubItem(read, R.drawable.msg_markread, LocaleController.getString(R.string.MarkAsRead));
         clearItem = otherItem.addSubItem(clear, R.drawable.msg_clear, LocaleController.getString(R.string.ClearHistory));
         blockItem = otherItem.addSubItem(block, R.drawable.msg_block, LocaleController.getString(R.string.BlockUser));
+        protectItem = otherItem.addSubItem(protect_chat, R.drawable.msg_secret, LocaleController.getString(R.string.ChatPasscodeProtect));
+        unprotectItem = otherItem.addSubItem(unprotect_chat, R.drawable.menu_unlock, LocaleController.getString(R.string.ChatPasscodeUnprotect));
+        protectItem.setVisibility(View.GONE);
+        unprotectItem.setVisibility(View.GONE);
 
         muteItem.setOnLongClickListener(e -> {
             performSelectedDialogsAction(selectedDialogs, mute, true, true);
@@ -6762,6 +6785,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
         actionModeViews.add(pinItem);
         actionModeViews.add(archive2Item);
         actionModeViews.add(muteItem);
+        actionModeViews.add(relockItem);
         actionModeViews.add(deleteItem);
         actionModeViews.add(otherItem);
 
@@ -7023,6 +7047,18 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
     @Override
     public void onResume() {
         super.onResume();
+        if (pendingProtectDialogs != null) {
+            // Back from the existing passcode setup flow: continue only if a credential really exists now.
+            final ArrayList<Long> ids = pendingProtectDialogs;
+            pendingProtectDialogs = null;
+            if (SharedConfig.hasPasscode()) {
+                AndroidUtilities.runOnUIThread(() -> {
+                    if (ProtectedChats.isFeatureEnabled() || ProtectedChats.enableFeature() == ProtectedChatsState.Result.OK) {
+                        authenticateChats(ids, ProtectedChatAuthSheet.Mode.PROTECT);
+                    }
+                }, 300);
+            }
+        }
         if (dialogStoriesCell != null) {
             dialogStoriesCell.onResume();
         }
@@ -9985,6 +10021,120 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
                 pin2Item.setText(LocaleController.getString(R.string.DialogUnpin));
             }
         }
+        updateProtectionItems();
+    }
+
+    // ---- individual chat protection -------------------------------------------------------
+
+    private void updateProtectionItems() {
+        if (relockItem == null || protectItem == null || unprotectItem == null) {
+            return;
+        }
+        final int total = selectedDialogs.size();
+        int protectedCount = 0, unprotectedSupported = 0, relockable = 0;
+        for (int a = 0; a < total; a++) {
+            final long did = selectedDialogs.get(a);
+            if (!ProtectedChats.isSupportedDialog(did)) {
+                continue;
+            }
+            if (ProtectedChats.isProtected(currentAccount, did)) {
+                protectedCount++;
+                if (ProtectedChats.canManuallyRelock(currentAccount, did)) {
+                    relockable++;
+                }
+            } else {
+                unprotectedSupported++;
+            }
+        }
+        final boolean featureAvailable = ProtectedChats.isFeatureEnabled() || !SharedConfig.hasPasscode();
+        protectItem.setVisibility(total > 0 && unprotectedSupported == total && featureAvailable && communityId == 0 && !onlySelect ? View.VISIBLE : View.GONE);
+        unprotectItem.setVisibility(total > 0 && protectedCount == total && !onlySelect ? View.VISIBLE : View.GONE);
+        relockItem.setVisibility(relockable > 0 && !onlySelect ? View.VISIBLE : View.GONE);
+    }
+
+    /** Quick action: ends the temporary authorization right away. Makes access stricter, so no authentication. */
+    private void relockSelectedChats() {
+        boolean any = false;
+        for (long did : new ArrayList<>(selectedDialogs)) {
+            if (ProtectedChats.canManuallyRelock(currentAccount, did)) {
+                ProtectedChats.relock(currentAccount, did);
+                any = true;
+            }
+        }
+        hideActionMode(true);
+        if (any) {
+            try {
+                fragmentView.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP, HapticFeedbackConstants.FLAG_IGNORE_GLOBAL_SETTING);
+            } catch (Exception ignore) {
+            }
+            BulletinFactory.of(this).createSimpleBulletin(R.raw.passcode_lock_close, LocaleController.getString(R.string.ChatPasscodeLocked)).show();
+        }
+    }
+
+    private void protectSelectedChats() {
+        if (getParentActivity() == null) {
+            return;
+        }
+        final ArrayList<Long> ids = new ArrayList<>(selectedDialogs);
+        if (!SharedConfig.hasPasscode()) {
+            // The existing passcode setup remains the only place a credential is created.
+            AlertDialog dialog = new AlertDialog.Builder(getParentActivity(), getResourceProvider())
+                    .setTitle(LocaleController.getString(R.string.ChatPasscodeRequiredTitle))
+                    .setMessage(LocaleController.getString(R.string.ChatPasscodeRequiredMessage))
+                    .setNegativeButton(LocaleController.getString(R.string.Cancel), null)
+                    .setPositiveButton(LocaleController.getString(R.string.ChatPasscodeRequiredButton), (d, w) -> {
+                        pendingProtectDialogs = ids;
+                        presentFragment(PasscodeActivity.determineOpenFragment());
+                    })
+                    .create();
+            showDialog(dialog);
+            return;
+        }
+        if (!ProtectedChats.isFeatureEnabled() && ProtectedChats.enableFeature() != ProtectedChatsState.Result.OK) {
+            return;
+        }
+        authenticateChats(ids, ProtectedChatAuthSheet.Mode.PROTECT);
+    }
+
+    private void unprotectSelectedChats() {
+        authenticateChats(new ArrayList<>(selectedDialogs), ProtectedChatAuthSheet.Mode.UNPROTECT);
+    }
+
+    private void authenticateChats(ArrayList<Long> ids, ProtectedChatAuthSheet.Mode mode) {
+        if (getParentActivity() == null || ids.isEmpty()) {
+            return;
+        }
+        final CharSequence title = ids.size() == 1 ? ProtectedChatGate.getTitle(currentAccount, ids.get(0)) : LocaleController.formatPluralString("Chats", ids.size());
+        ProtectedChatAuthSheet.show(getParentActivity(), getResourceProvider(), mode, title, new ProtectedChatAuthSheet.Callback() {
+            @Override
+            public void onAuthenticated(ProtectedChatsState.AuthProof proof) {
+                final ProtectedChatsState.Result result = mode == ProtectedChatAuthSheet.Mode.PROTECT
+                        ? ProtectedChats.protectMany(currentAccount, ids, proof)
+                        : ProtectedChats.unprotectMany(currentAccount, ids, proof);
+                if (result == ProtectedChatsState.Result.OK) {
+                    hideActionMode(true);
+                    BulletinFactory.of(DialogsActivity.this).createSimpleBulletin(
+                            mode == ProtectedChatAuthSheet.Mode.PROTECT ? R.raw.passcode_lock_close : R.raw.passcode_lock,
+                            LocaleController.getString(mode == ProtectedChatAuthSheet.Mode.PROTECT ? R.string.ChatPasscodeProtected : R.string.ChatPasscodeUnprotected)).show();
+                }
+            }
+        });
+    }
+
+    private void onProtectedChatsChanged() {
+        if (viewPages != null) {
+            for (int a = 0; a < viewPages.length; a++) {
+                if (viewPages[a] != null && viewPages[a].dialogsAdapter != null) {
+                    viewPages[a].dialogsAdapter.notifyDataSetChanged();
+                }
+            }
+        }
+        if (searchViewPager != null && searchViewPager.dialogsSearchAdapter != null) {
+            searchViewPager.dialogsSearchAdapter.notifyDataSetChanged();
+        }
+        if (actionBar != null && actionBar.isActionModeShowed()) {
+            updateCounters(false);
+        }
     }
 
     private boolean validateSlowModeDialog(long dialogId) {
@@ -10514,6 +10664,10 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
     @SuppressWarnings("unchecked")
     @Override
     public void didReceivedNotification(int id, int account, Object... args) {
+        if (id == NotificationCenter.protectedChatsChanged) {
+            onProtectedChatsChanged();
+            return;
+        }
         if (id == NotificationCenter.dialogsNeedReload) {
             if (viewPages == null || dialogsListFrozen) {
                 return;
@@ -11569,7 +11723,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
                         topicKeys.add(MessagesStorage.TopicKey.of(selectedDialogs.get(i), 0));
                     }
                     PhotoViewer.getInstance().closePhoto(true, false);
-                    delegate.didSelectDialogs(DialogsActivity.this, topicKeys, commentView.getFieldText(), false, notify, scheduleDate, scheduleRepeatPeriod, null);
+                    notifyDelegate(topicKeys, commentView.getFieldText(), false, notify, scheduleDate, scheduleRepeatPeriod, null, false);
                     return;
                 }
                 PhotoViewer.getInstance().closePhoto(true, false);
@@ -11710,6 +11864,46 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
             }
         }
         return true;
+    }
+
+    /** A picker whose selection is forwarded (or shared) into the chosen chats. */
+    public boolean isForwardPicker() {
+        return onlySelect && initialDialogsType == DIALOGS_TYPE_FORWARD;
+    }
+
+    /**
+     * Every forward picker hands its selection to the delegate here. A destination that is protected
+     * and locked asks for authentication first, except the user's own Saved Messages, which only
+     * receives (it is neither unlocked nor opened). After a successful unlock the same selection,
+     * with the same messages, destinations (topics included) and options, goes to the delegate again,
+     * once; a cancelled unlock sends nothing and leaves the picker as it was.
+     *
+     * @param resetWhenHandled the delegate is dropped once it reports the selection handled
+     */
+    private boolean notifyDelegate(ArrayList<MessagesStorage.TopicKey> dids, CharSequence message, boolean param, boolean notify, int scheduleDate, int scheduleRepeatPeriod, TopicsFragment topicsFragment, boolean resetWhenHandled) {
+        if (initialDialogsType == DIALOGS_TYPE_FORWARD && ProtectedChatGate.holdForDestinations(getParentActivity(), currentAccount, dids, true, () -> {
+            if (delegate != null && !isFinished) {
+                notifyDelegate(dids, message, param, notify, scheduleDate, scheduleRepeatPeriod, topicsFragment, resetWhenHandled);
+            }
+        })) {
+            return false;
+        }
+        // The forward belongs to the chat that opened this picker (see ProtectedGateLifecycle). While
+        // the delegate runs the picker may finish itself, return to that chat (a deposit into Saved
+        // Messages with its success and tag interaction, a forward into the same chat, a send to
+        // several chats) or open a destination chat over it; what it did decides how the chat's
+        // authorization continues, and Back from the destination returns to the chat.
+        final ProtectedChatGate.Handover handover = isForwardPicker() ? ProtectedChatGate.forwardHandOver(this) : null;
+        boolean handled = false;
+        try {
+            handled = delegate.didSelectDialogs(DialogsActivity.this, dids, message, param, notify, scheduleDate, scheduleRepeatPeriod, topicsFragment);
+        } finally {
+            ProtectedChatGate.forwardSettled(this, handover, handled);
+        }
+        if (handled && resetWhenHandled && resetDelegate) {
+            delegate = null;
+        }
+        return handled;
     }
 
     public void didSelectResult(final long dialogId, long topicId, boolean useAlert, final boolean param) {
@@ -11870,10 +12064,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
             if (delegate != null) {
                 ArrayList<MessagesStorage.TopicKey> dids = new ArrayList<>();
                 dids.add(MessagesStorage.TopicKey.of(dialogId, topicId));
-                boolean res = delegate.didSelectDialogs(DialogsActivity.this, dids, null, param, notify, scheduleDate, scheduleRepeatPeriod, topicsFragment);
-                if (res && resetDelegate) {
-                    delegate = null;
-                }
+                notifyDelegate(dids, null, param, notify, scheduleDate, scheduleRepeatPeriod, topicsFragment, true);
             } else {
                 finishFragment();
             }
@@ -11954,7 +12145,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
                 final ArrayList<MessagesStorage.TopicKey> topicKeys = new ArrayList<>();
                 for (int i = 0; i < selectedDialogs.size(); i++)
                     topicKeys.add(MessagesStorage.TopicKey.of(selectedDialogs.get(i), 0));
-                delegate.didSelectDialogs(DialogsActivity.this, topicKeys, commentView.getFieldText(), false, notify, scheduleDate, scheduleRepeatPeriod, null);
+                notifyDelegate(topicKeys, commentView.getFieldText(), false, notify, scheduleDate, scheduleRepeatPeriod, null, false);
             })
             .addIf(canSchedule, R.drawable.msg_calendar2, LocaleController.getString(R.string.ScheduleMessage), () -> {
                 AlertsCreator.createScheduleDatePickerDialog(getParentActivity(), onlyMyselfFinal ? getUserConfig().getClientUserId() : -1, new AlertsCreator.ScheduleDatePickerDelegate() {
@@ -11969,7 +12160,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
                         for (int i = 0; i < selectedDialogs.size(); i++) {
                             topicKeys.add(MessagesStorage.TopicKey.of(selectedDialogs.get(i), 0));
                         }
-                        delegate.didSelectDialogs(DialogsActivity.this, topicKeys, commentView.getFieldText(), false, notify, scheduleDate, scheduleRepeatPeriod, null);
+                        notifyDelegate(topicKeys, commentView.getFieldText(), false, notify, scheduleDate, scheduleRepeatPeriod, null, false);
                     }
                 }, getResourceProvider());
             })
@@ -14096,7 +14287,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
     }
 
     private void checkUi_itemPasscodeVisibility() {
-        final float factor0 = SharedConfig.passcodeHash.isEmpty() ? 0 : 1;
+        final float factor0 = !SharedConfig.isAppLockEnabled() ? 0 : 1;
         final float factor1 = 1f - animatorSearchVisible.getFloatValue();
         final float factor2 = 1f - getRightSlidingProgress();
         final float factor3 = 1f - animatorDoneButtonVisible.getFloatValue();

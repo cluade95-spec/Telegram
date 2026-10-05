@@ -77,7 +77,7 @@ public class ExternalActionActivity extends Activity implements INavigationLayou
         requestWindowFeature(Window.FEATURE_NO_TITLE);
         setTheme(R.style.Theme_TMessages);
         getWindow().setBackgroundDrawable(new ActivityWindowEmptyBackgroundDrawable());
-        if (!SharedConfig.passcodeHash.isEmpty() && !SharedConfig.allowScreenCapture) {
+        if (SharedConfig.hasPasscode() && !SharedConfig.allowScreenCapture) {
             try {
                 getWindow().setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE);
                 AndroidUtilities.logFlagSecure();
@@ -88,7 +88,7 @@ public class ExternalActionActivity extends Activity implements INavigationLayou
 
         super.onCreate(savedInstanceState);
 
-        if (!SharedConfig.passcodeHash.isEmpty() && SharedConfig.appLocked) {
+        if (SharedConfig.isAppLockEnabled() && SharedConfig.appLocked) {
             SharedConfig.lastPauseTime = (int) (SystemClock.elapsedRealtime() / 1000);
         }
 
@@ -553,7 +553,7 @@ public class ExternalActionActivity extends Activity implements INavigationLayou
             AndroidUtilities.cancelRunOnUIThread(lockRunnable);
             lockRunnable = null;
         }
-        if (!SharedConfig.passcodeHash.isEmpty()) {
+        if (SharedConfig.isAppLockEnabled()) {
             SharedConfig.lastPauseTime = (int) (SystemClock.elapsedRealtime() / 1000);
             lockRunnable = new Runnable() {
                 @Override

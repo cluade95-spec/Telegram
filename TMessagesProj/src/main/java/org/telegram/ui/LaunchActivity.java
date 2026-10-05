@@ -126,6 +126,7 @@ import org.telegram.messenger.MessagesController;
 import org.telegram.messenger.MessagesStorage;
 import org.telegram.messenger.NotificationCenter;
 import org.telegram.messenger.NotificationsController;
+import org.telegram.messenger.ProtectedChats;
 import org.telegram.messenger.OpenAttachedMenuBotReceiver;
 import org.telegram.messenger.PushListenerController;
 import org.telegram.messenger.R;
@@ -436,7 +437,7 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
         getWindow().setBackgroundDrawable(new ActivityWindowEmptyBackgroundDrawable());
         getWindow().setFormat(PixelFormat.OPAQUE);
 
-        flagSecureReason = new FlagSecureReason(getWindow(), () -> SharedConfig.passcodeHash.length() > 0 && !SharedConfig.allowScreenCapture);
+        flagSecureReason = new FlagSecureReason(getWindow(), () -> SharedConfig.hasPasscode() && !SharedConfig.allowScreenCapture);
         flagSecureReason.attach();
 
         super.onCreate(savedInstanceState);
@@ -445,7 +446,7 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
         }
         Theme.createCommonChatResources();
         Theme.createDialogsResources(this);
-        if (SharedConfig.passcodeHash.length() != 0 && SharedConfig.appLocked) {
+        if (SharedConfig.isAppLockEnabled() && SharedConfig.appLocked) {
             SharedConfig.lastPauseTime = (int) (SystemClock.elapsedRealtime() / 1000);
         }
         AndroidUtilities.fillStatusBarHeight(this, false);
@@ -569,6 +570,7 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
             .add(NotificationCenter.needCheckSystemBarColors)
             .add(NotificationCenter.closeOtherAppActivities)
             .add(NotificationCenter.didSetPasscode)
+            .add(NotificationCenter.protectedChatsChanged)
             .add(NotificationCenter.didSetNewWallpapper)
             .add(NotificationCenter.screenStateChanged)
             .add(NotificationCenter.showBulletin)
@@ -6200,6 +6202,17 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
     public boolean didSelectDialogs(DialogsActivity dialogsFragment, ArrayList<MessagesStorage.TopicKey> dids, CharSequence message, boolean param, boolean _notify, int _scheduleDate, int scheduleRepeatPeriod, TopicsFragment topicsFragment) {
         final int account = dialogsFragment != null ? dialogsFragment.getCurrentAccount() : currentAccount;
 
+        // Content shared from outside (share sheet, Direct Share shortcut, share picker) lands in the
+        // chat it is sent to, so a locked protected chat needs the same authentication that opening it
+        // needs, Saved Messages included (unlike an in-app forward, a share opens its chat). After the
+        // unlock the same selection goes through again, once. The message is copied because this
+        // method assigns it later (a lambda can only capture a variable that is never reassigned).
+        final CharSequence selectedMessage = message;
+        if (ProtectedChatGate.holdForDestinations(this, account, dids, false,
+                () -> didSelectDialogs(dialogsFragment, dids, selectedMessage, param, _notify, _scheduleDate, scheduleRepeatPeriod, topicsFragment))) {
+            return false;
+        }
+
         if (exportingChatUri != null) {
             Uri uri = exportingChatUri;
             ArrayList<Uri> documentsUris = documentsUrisArray != null ? new ArrayList<>(documentsUrisArray) : null;
@@ -6614,7 +6627,8 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
 
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
-        if (SharedConfig.passcodeHash.length() != 0 && SharedConfig.lastPauseTime != 0) {
+        ProtectedChats.onReturnedFromActivityResult();
+        if (SharedConfig.isAppLockEnabled() && SharedConfig.lastPauseTime != 0) {
             SharedConfig.lastPauseTime = 0;
             if (BuildVars.LOGS_ENABLED) {
                 FileLog.d("reset lastPauseTime onActivityResult");
@@ -6791,6 +6805,9 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
     protected void onStop() {
         super.onStop();
         isStarted = false;
+        // The activity is no longer visible: the app is in the background. (onPause alone is not: a
+        // system permission dialog pauses the activity and leaves it on screen.)
+        ProtectedChats.onAppPaused();
         pipActivityHandler.onStop();
         Browser.unbindCustomTabsService(this);
         ApplicationLoader.mainInterfaceStopped = true;
@@ -7291,6 +7308,8 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
             }
         } else if (id == NotificationCenter.didSetPasscode) {
             flagSecureReason.invalidate();
+        } else if (id == NotificationCenter.protectedChatsChanged) {
+            closeLockedProtectedChats();
         } else if (id == NotificationCenter.reloadInterface) {
             boolean last = mainFragmentsStack.size() > 1 && mainFragmentsStack.get(mainFragmentsStack.size() - 1) instanceof ProfileActivity;
             if (last) {
@@ -7548,6 +7567,7 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
             if (ApplicationLoader.isScreenOn) {
                 onPasscodeResume();
             } else {
+                ProtectedChats.onAppPaused();
                 onPasscodePause();
             }
         } else if (id == NotificationCenter.needCheckSystemBarColors) {
@@ -8116,6 +8136,19 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
         }
     }
 
+    /** Pops open chats whose protected-chat authorization expired or was revoked. */
+    public void closeLockedProtectedChats() {
+        if (!ProtectedChats.hasAnyProtectedChat()) {
+            return;
+        }
+        ArrayList<INavigationLayout> layouts = new ArrayList<>();
+        layouts.add(actionBarLayout);
+        layouts.add(rightActionBarLayout);
+        layouts.add(layersActionBarLayout);
+        layouts.addAll(sheetFragmentsStack);
+        ProtectedChatGate.closeLockedFragments(layouts);
+    }
+
     private void onPasscodePause() {
         if (lockRunnable != null) {
             if (BuildVars.LOGS_ENABLED) {
@@ -8124,7 +8157,7 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
             AndroidUtilities.cancelRunOnUIThread(lockRunnable);
             lockRunnable = null;
         }
-        if (SharedConfig.passcodeHash.length() != 0) {
+        if (SharedConfig.isAppLockEnabled()) {
             SharedConfig.lastPauseTime = (int) (SystemClock.elapsedRealtime() / 1000);
             lockRunnable = new Runnable() {
                 @Override
@@ -8175,6 +8208,8 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
     }
 
     private void onPasscodeResume() {
+        ProtectedChats.onAppResumed();
+        closeLockedProtectedChats();
         if (lockRunnable != null) {
             if (BuildVars.LOGS_ENABLED) {
                 FileLog.d("cancel lockRunnable onPasscodeResume");

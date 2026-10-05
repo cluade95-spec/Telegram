@@ -38,6 +38,7 @@ import org.telegram.messenger.ApplicationLoader;
 import org.telegram.messenger.ChatObject;
 import org.telegram.messenger.ContactsController;
 import org.telegram.messenger.DialogObject;
+import org.telegram.messenger.ProtectedChats;
 import org.telegram.messenger.FileLoader;
 import org.telegram.messenger.LocaleController;
 import org.telegram.messenger.MessageObject;
@@ -176,6 +177,8 @@ public class HomeScreen extends Screen
             long dialogId = mo.getDialogId();
             if (DialogObject.isEncryptedDialog(dialogId)) continue;
             if (UserObject.isReplyUser(dialogId)) continue;
+            // The list shows the messages and replies into the chat without opening it.
+            if (!ProtectedChats.allowsExternalInteraction(currentAccount, dialogId)) continue;
             ArrayList<MessageObject> bucket = grouped.get(dialogId);
             if (bucket == null) {
                 bucket = new ArrayList<>();

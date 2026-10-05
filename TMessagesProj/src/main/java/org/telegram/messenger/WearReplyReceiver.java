@@ -41,6 +41,9 @@ public class WearReplyReceiver extends BroadcastReceiver {
         if (dialogId == 0 || maxId == 0 || !UserConfig.isValidAccount(currentAccount)) {
             return;
         }
+        if (!ProtectedChats.allowsExternalInteraction(currentAccount, dialogId)) {
+            return;
+        }
         AccountInstance accountInstance = AccountInstance.getInstance(currentAccount);
         if (DialogObject.isUserDialog(dialogId)) {
             TLRPC.User user = accountInstance.getMessagesController().getUser(dialogId);

@@ -1,0 +1,300 @@
+# Protected chats: passcodeHash call-site audit
+
+Three separate notions exist now:
+
+* **credential** – `SharedConfig.hasPasscode()` (a hash is stored)
+* **app-wide lock** – `SharedConfig.isAppLockEnabled()` (credential + `appLockEnabled`)
+* **protected chats** – `ProtectedChats` (per dialog)
+
+| Call site | Original purpose | New condition | Why |
+|---|---|---|---|
+| `AndroidUtilities.needShowPasscode` | decide whether the full-screen lock must show | app lock | belongs to the app lock |
+| `AppStartReceiver` (boot) | re-lock the app after reboot | app lock | app lock only; protected chats are in-memory and always locked after boot |
+| `LaunchActivity` onCreate / `onActivityResult` / `onPasscodePause` / `ExternalActionActivity` / `BubbleActivity` lock timers | auto-lock bookkeeping | app lock | app lock only. Protected chats use their own `appPaused/appResumed` calls |
+| `DialogsActivity` header lock icon | "lock the app now" | app lock | action locks the app |
+| `TelegramMediaSession` | hide car/media metadata while app is locked | app lock | app lock |
+| `MediaDataController` launcher shortcuts | do not list frequent chats while a passcode lock is on | app lock (as on master); protected chats are listed like any other | a shortcut holds a chat's name and avatar, never its messages; opening one goes through the protected-chat gate. Hiding it removed a Telegram feature without protecting any message content |
+| `NotificationsController` pre-API-24 popup reply action, popup list and `PopupNotificationActivity`, wear / inline reply action (`WearReplyReceiver`), car unread list (`HomeScreen`), bot buttons on notifications | no reply from notifications while locked | app lock; per dialog `ProtectedChats.allowsExternalInteraction` (never for a protected dialog, whatever "Hide Message Previews" says or whether the chat is open for now) | each of these sends into the chat without opening it, so it would bypass the authentication that opening requires; unrelated chats keep their paths |
+| `NotificationsController` `passcode` log variable | log only | app lock | no behavior |
+| FLAG_SECURE / screenshots: `LaunchActivity`, `BubbleActivity`, `ExternalActionActivity`, `PaymentFormActivity`, `AndroidUtilities.allowScreenCapture` | block screenshots / task-switcher content whenever a passcode exists | **credential** (reverted to the original property) | the "show app content" switch is a credential-level setting; its rows are shown whenever a credential exists |
+| `EditWidgetActivity` note | "passcode ignored for widgets" | credential | text is about the passcode in general |
+| `PrivacySettingsActivity` row | shows Passcode On/Off | app lock, or credential with protected chats | row reflects whether the passcode is in use for anything |
+| `PasscodeActivity`, `LogoutActivity` | create/change/remove the credential, offer setup | credential (unchanged) | credential semantics |
+
+Preview rule: with "hide previews" on, content of a protected chat is hidden on every surface outside the opened
+conversation (dialog rows incl. accessibility, Saved Messages sub-lists, search, hashtag search, downloads list,
+notifications, widgets, copy-code button) regardless of temporary authorization. Identity is never hidden.
+
+Interaction rule (independent of the preview setting): nothing outside the opened conversation may act on a protected
+dialog. The popup (it has a reply box), the notification and Wear reply, the car unread list (it replies), bot buttons on
+a notification, and a share into the chat (system share sheet, Direct Share shortcut, share picker: `LaunchActivity.didSelectDialogs`
+asks for the unlock first) all follow `ProtectedChats.allowsExternalInteraction`. Bubbles and launcher shortcuts only
+lead to the chat, which the gate authenticates.
+
+## Chat authentication UI and settings (device QA passes)
+
+* Presentation: Telegram's native `BottomSheet` (slide in/out, dim, outside tap, Back, swipe down, insets, keyboard).
+  `ProtectedChatAuthSheet` replaces the sheet's container with a holder that rounds the top corners; the content is
+  Telegram's own `PasscodeView` in chat lock mode, so keypad, digit animation (`AnimatingTextView`), error shake and
+  haptics, wallpaper, retry throttling and the biometric presentation (keypad hidden while the system prompt is up,
+  restored on cancel) are the app lock's code.
+* Layout: the full-screen `PasscodeView.onMeasure` derives everything from the display size. In chat mode it asks
+  `ChatLockLayout` (pure, tested) for metrics from the height the popup is offered: roomy layout with the lock icon
+  (414dp: 24dp clear under the bottom row), otherwise the icon is dropped and keypad buttons step down (56 -> 36dp).
+  Title and digits share one band. The keypad frame and the popup are summed in pixels the way the keys are placed
+  (every `dp()` term rounds up on its own, so a frame sized by the dp total cut the bottom off the "0" key at some
+  densities). Nothing is scaled; the full-screen layout code path is untouched.
+* PIN input state is `PasscodeInputBuffer` (pure, tested). No selected digit: delete removes the latest digit.
+* Settings: Passcode Lock = Change Passcode, Fingerprint, then `App Lock` and `Protected Chats` rows
+  (`NotificationsCheckCell`: switch end toggles, body opens details; `SwitchRowHitTest`). App Lock details: Auto-lock,
+  App Content in Task Switcher. Protected Chats details: Hide Message Previews, Auto-lock, Chats (count) ->
+  management list (identity only rows, remove needs the passcode). Switches animate themselves; no list rebuilds.
+
+## Profiles and shared media (device QA regression pass)
+
+Protected Chats protects a protected chat and its message content. It does not remove Telegram features, so a profile
+keeps its normal structure for every peer (own profile, users, groups, channels, bots, Saved Messages, secret chats).
+
+* Never touched by protection: Stories, Gifts (profile gifts), Common Groups, Similar Channels/Bots, Members, Storage,
+  profile actions, account rows, and every other row of `ProfileActivity`.
+* Withheld only while the chat is locked (`ProfileContentPolicy`, applied in `SharedMediaLayout`, the preloader and
+  `ProfileActivity`): the tabs derived from the messages of the protected dialog (Media, Files, Music, Voice, Links, GIFs,
+  Posts) and their counts. Counts are masked when read, so unlocking needs no reload.
+* Saved Messages: only the Saved Messages content (messages and the Saved Messages / Saved Dialogs tabs) is withheld
+  while Saved Messages is locked. The own profile is no longer cut down; its Stories and Gifts tabs stay.
+* Section: `ProfileContentPolicy.showSharedMediaSection`. The own profile always has its shared-media section (where
+  Stories and Gifts appear), except while Saved Messages is locked and nothing else (Stories, Gifts, visible media)
+  would fill it. Stories and Gifts are part of what fills it, so they cannot be what is lost. The own profile looks at its
+  rows again when its full user info arrives (`rebuildWhenUserInfoArrives`).
+* Gate: opening the profile of another protected dialog still goes through `ProtectedChatGate`, because that profile
+  hosts the protected shared media. The own profile is never gated as a whole.
+* App Lock state, the credential and the locked/unlocked state never decide whether an unrelated profile feature is shown.
+
+## Lifecycle of an open protected chat (device QA, build #82)
+
+Build #82 kicked the user out of an authorized protected chat when Android showed a camera or microphone permission
+dialog, when a channel's comments were opened and closed, and in the three forward flows. One mistake sat under all of
+them: *"the fragment was paused or covered" was treated as "the user left the chat"*. Telegram and Android put things above
+a chat all the time and the chat is where the user comes back to. `ProtectedGateLifecycle` (pure Java, driven by
+`ProtectedChatGate`) now models this explicitly. A fragment that shows a protected dialog is a node in one of these states:
+
+| State | Meaning | Left by |
+| --- | --- | --- |
+| `VISIBLE` | on screen, in use | a child is presented over it, the host pauses, it is closed |
+| `HOST_PAUSED` | the activity is paused (a system permission dialog, a split-screen focus change, picture-in-picture) but the chat is still what the user sees; not navigation, not leaving | the activity resumes; if it is stopped instead, the app-background boundary applies |
+| `COVERED` | a child fragment (forward picker or destination, channel comments, a profile, a media, search or contact screen) is over it and it is where Back returns to; still in use, still authorized unless the app was backgrounded / the screen turned off / the user locked manually meanwhile (then it stays in the stack locked and Back asks first) | Back (it becomes `RETURNING`, after the gate before reveal if it is locked) |
+| `RETURNING` | resumed while its transition (Back, swipe, predictive back) is still running; nothing is evaluated and nothing is closed mid-transition | the transition ends (`VISIBLE`), a cancelled swipe (`COVERED`) |
+| `LEFT` | genuinely left while its fragment is still in a stack; it is closed as soon as that is safe | - |
+| `DESTROYED` | popped or removed; normal Auto-lock applies from then | - |
+
+**System permission dialogs.** `Activity.requestPermissions` shows the permission controller's translucent dialog over the
+activity: `LaunchActivity.onPause` runs, `onStop` does not, and the result arrives in `onRequestPermissionsResult` just before
+`onResume`. Build #82 had two places that read `onPause` as "the app left": `ActionBarLayout.onPause` forwarded it to the top
+chat as an ordinary fragment pause (starting the Immediate countdown for that chat), and `LaunchActivity.onPasscodePause`
+called `ProtectedChats.onAppPaused`, marking every open chat as backgrounded. `onResume` then found the chat locked and the
+gate closed it. Now `ActionBarLayout.onPause/onResume` run the forwarded host lifecycle inside
+`ProtectedChatGate.hostLifecycle(true/false)`, so a fragment paused there is `HOST_PAUSED`, not covered; and the
+app-background boundary (`ProtectedChats.onAppPaused`) moved to what really is the background: `LaunchActivity.onStop`,
+`BubbleActivity.onStop` and the screen turning off. Allow, Deny and a dismissed dialog are the same lifecycle (the gate never
+sees the answer). No timer, no per-permission case: the camera, the microphone, a circle message, the attachment menu and any
+future permission are the same pause without a stop. If the activity is stopped (Home pressed over the dialog) the normal
+background boundary wins: Immediate Auto-lock applies on return, and a timed interval counts from the stop. A system activity
+that stops the app (file picker, the camera app) keeps the existing rule: its result (`onActivityResult`) revives chats that
+were open; a permission UI of a device vendor that fully covers the app is, like any app switch, a background.
+
+**Channel comments and every other child.** The comments are a `ChatActivity` of the linked discussion chat pushed over the
+channel. In build #82 the channel's pause started the Immediate countdown, it locked, and Back resumed a locked chat, which the
+gate closed with `removeSelfFromStack` while `closeLastFragment`'s transition was running (`removeFragmentFromStack` completes a
+running transition first): the glitch, then the kick. Now covering is not leaving. `ActionBarLayout.presentFragment` tells the
+gate what it presents over (`ProtectedChatGate.onFragmentPresented`); a fragment presented over a protected chat that is in
+use is its child, and so is anything opened from a child as long as it shows no other conversation than the ones that belong to
+the chat's context (the chat's own dialog, the dialog the child shows, screens that are not a conversation: pickers, media,
+search, settings). The chat stays authorized and counted as open however long the child stays, for every Auto-lock interval.
+Back, system back, the toolbar arrow, a completed swipe or predictive back, and a cancelled one (the previous fragment is
+resumed when the gesture starts and paused again when it is given up) are the same `COVERED` / `RETURNING` transitions.
+
+**Genuine departure** (normal Auto-lock applies from that moment): the chat is closed or removed; the app goes to the
+background (activity stopped, screen off); a manual lock; and a child that opens *another* conversation than the ones that
+belong to the chat's context (another chat or profile opened from the comments, a link to another chat). A chat left by that
+last kind of departure is closed at once if it is not on screen (silently, under its children), whatever the interval: an old
+instance does not wait in a stack to be revealed later, and opening it again goes through the gate (and asks nothing while the
+interval lasts). A chat whose authorization ended by the app going to the background, the screen turning off or a manual lock
+while a child covered it is different: it stays in the stack (`COVERED`, locked) and the gate before reveal asks when Back
+would show it. The forward picker's own screens (a forum's topics) belong to the forward while the picker is open.
+
+**Gate before reveal.** A chat that lost its authorization while a child covered it (the app went to the background, a manual
+lock, the screen turned off, a long background past the interval) is *not* closed when the user comes back toward it: it
+stays in the stack, locked, not on screen, and whatever is about to reveal it asks first. The one decision
+(`ProtectedGateLifecycle.blockReveal`, adapted by `ProtectedChatGate.blockReveal`) is made at the earliest point each Back
+path has, before the fragment's view is created or resumed:
+
+| Entry | Earliest point | Locked chat underneath |
+| --- | --- | --- |
+| system back, toolbar back arrow, `finishFragment`, `LaunchActivity.onBackPressed`, tablet panes, bubbles | `ActionBarLayout.closeLastFragment`, right after the delegate/transition checks and before keyboard, container swap, `performCreateView` and `onResume` | the call returns; the authentication sheet is shown; on success the same call runs once |
+| touch swipe back | `ActionBarLayout.onTouchEvent`, before `prepareForMoving` (move threshold and fling) | no gesture starts; the sheet is shown; on success the ordinary animated Back runs |
+| predictive back (Android 13/14+) | `ActionBarLayout.onBackStarted`, before `prepareForMoving` | no preview starts, so nothing of the chat is drawn; `onBackInvoked` then takes the ordinary path (`onBackPressed` -> `closeLastFragment`), which asks |
+
+Authentication uses the existing Chat Lock sheet (`ProtectedChatAuthSheet`, mode UNLOCK). Success unlocks that chat only and
+runs the original navigation once, and only if the same two fragments are still the top two of that stack (a late answer
+after the stack changed, a duplicate answer, or a second Back while the sheet is up does nothing more); cancel changes
+nothing: no transition started, nothing was shown, nothing is closed, the fragment that asked to close is not left marked as
+finishing, and Back again asks again. A chat that is still authorized takes none of this (the check is the authorization
+state, never the fact that a fragment is in a stack).
+
+**Where a fragment is still removed, and why.** Never from the call that resumes a fragment and never by completing a
+transition early (`ActionBarLayout.removeFragmentFromStack` does that). Only `ProtectedChatGate.tryClose` removes, and only
+for these: (1) the top fragment when it lost its authorization while the user was away (the app came back, a manual lock)
+together with the locked fragments directly under it, since it is on screen and cannot stay and the ones under it would need
+their own sheet to be revealed; (2) the fragments of a chat the user genuinely left (`release`: another conversation opened
+from a child), which are off screen and must not wait to be revealed; (3) a last-resort fallback for a reveal no layout hook
+gates (none is known): the chat is closed after its transition. Non-top fragments go away silently (`removeSelfFromStack`);
+the top one with `finishFragment(false)`; "not now" while the top or second fragment of a layout is in a transition or
+swipe, retried when `onBecomeFullyVisible/Hidden` reports it ended. A locked fragment that is merely covered is not removed.
+
+**Security boundaries kept.** The app background, the screen turning off, a manual lock, Auto-lock after a genuine departure and
+after the activity was stopped, a locked chat being asked for before it is created (the gate in front of `presentFragment`,
+`addFragmentToStack`, sheets and the right-sliding container, which is what notification, deep-link, share and restored-state
+entries go through), authorization that does not survive the process, and a protected chat opened as a child (comments, a
+forward destination) being gated and authorized on its own account, independently of the chat it was opened from. A stale
+fragment in a stack grants nothing: every reveal is decided by the authorization state.
+
+**Audit of what takes the top position from a chat** (read from the code; `CA` = `ChatActivity`, `AB` = `ActionBarLayout`,
+`LA` = `LaunchActivity`). The gate treats each mechanism, not each screen:
+
+| Mechanism | What it is (examples, evidence) | Chat's `onPause` | Gate |
+| --- | --- | --- | --- |
+| window, dialog, bottom sheet, in-chat view | attach menu `ChatAttachAlert` and its photo grid, albums, in-app camera view, file, location and contact layouts; circle-message `InstantCameraView` and voice recording (views in the chat); `PhonebookShareAlert`, `ShareAlert`, `BotWebViewSheet`, attach-menu bots, `EmbedBottomSheet`, `ArticleViewer` sheet, alert dialogs, popups; `PhotoViewer` (a window, `WindowManager.addView`); chat search, pinned-bar tap, hashtag search (in place, embedded chats off the stack) | no | nothing happens |
+| fragment pushed as a sheet | any `presentFragment` while a `ChatAttachAlert` or `BotWebViewSheet` is visible becomes `showAsSheet` (`AB.shouldOpenFragmentOverlay`); `showAsSheet`; `presentFragmentAsPreview` (until expanded) | no | nothing happens |
+| system permission dialog | camera (attach tile, empty-view button, circle message), microphone (voice, circle message, video), media/storage, location, contacts, QR camera and web permissions in a web app: `Activity.requestPermissions`, result before `onResume` | only by the host (`onPause`, no `onStop`) | `HOST_PAUSED`, back to `VISIBLE` on resume |
+| external activity | camera apps (`ACTION_IMAGE_CAPTURE`, `ACTION_VIDEO_CAPTURE`), system file and gallery pickers (`ACTION_GET_CONTENT`, `ACTION_PICK`), share chooser, dial, sms, contact insert, settings intents, Custom Tabs and the external browser (`Browser.openUrl`) | by the host (`onPause`, `onStop`) | background boundary; a result (`onActivityResult`, before `onResume`) keeps the chats that were open as it always did; with no result (a link opened in the browser) the normal background rule applies on return |
+| child fragment pushed | forward picker `DialogsActivity`; `ProfileActivity` (`ProfileActivity2` is not instantiated); `MediaActivity`; `LocationActivity` (viewing); `HashtagActivity`, `CalendarActivity`; the pinned list (a `ChatActivity` of the same dialog, `MODE_PINNED`); a reply thread (a second `ChatActivity` of the same dialog, `threadMessageId`); **channel comments** (a `ChatActivity` of the linked discussion chat: `chat_id = -discussionDialogId`, `setThreadMessages`, `presentFragment(chatActivity)` at CA:35757-35773, guarded by `isFullyVisible`); another chat opened by a link, a forwarded-from header or a search result; photo-picker search fragments when no alert is showing | at the end of the open transition | `COVERED`; opening another conversation from a child leaves the chat |
+| replacement or removal | a bot mentioned in a chat replaces it (`removeLast`); `PhotoViewer` "show in chat" replaces it; `TopicsFragment.prepareToSwitchAnimation` adds the topics screen *under* the chat and finishes the chat; `closeChats` (posted by most intent-driven links and notifications) finishes or removes every chat; `LaunchActivity.handleIntent` account switch and "show dialogs" remove all fragments; a second `ChatActivity` of the same dialog removes the older one (CA:27306) | pause and destroy | destroyed: normal Auto-lock from then (the fragments of one dialog count together, so topics under a chat or a duplicate does not lock it) |
+| tablet routing | non-chat fragments presented from the right or main layout go to the layers layout (own stack); the tablet-mode switch destroys and rebuilds the chats synchronously | not for layers pushes | no relation is recorded; a rebuilt chat is created again before the posted leave runs |
+
+Findings from the audit: a permission request and an external activity are different mechanisms (pause only, pause and
+stop) and used to be the same thing to the gate; `BubbleActivity` had its own copy of the same mistake
+(`onPasscodePause` -> `ProtectedChats.onAppPaused`), fixed the same way; `ChatAttachAlertPhotoLayout.onPause` closes the camera
+view when the activity pauses (Telegram's own behaviour, unrelated to the gate).
+
+## Per-chat Lock Settings
+
+**Entry.** The three-dot menu of a chat's profile has *Lock Settings* (`ProfileActivity`, `lock_settings`; placed with the
+chat's own actions, above the leave/delete items). It is offered for every dialog protection supports, protected or not:
+users, bots, groups, supergroups, channels, secret chats, Saved Messages (the own profile is the profile of that dialog) and,
+for a topic, its parent dialog. The dialog id is found the way the profile's other actions find it (secret chat id, user id,
+`-chatId`) and is the canonical identity `ProtectedChatsState` already uses; no second identity model exists. The item is
+hidden when `ProtectedChatsState.isLockSettingsOffered` says no (an unsupported dialog; the feature switched off while a
+passcode exists, the same condition under which the chat list hides *Protect*). `ProfileActivity2` is not instantiated
+anywhere in the app and was not touched.
+
+**Screen** (`ChatLockSettingsActivity`, same cells and structure as the Protected Chats page, no explanation text): *Chat Lock*
+(switch), then *Hide Message Previews* (switch) and *Auto-lock* (value row, the same picker and the same five choices as the
+Protected Chats page, `ProtectedChatsSettingsActivity.showAutoLockDialog`). The action bar shows the chat's name. The gate
+treats the screen as part of the chat (`ProtectedChatGate.getDialogId`): it is reachable only while the chat is authorized,
+it is a child of the chat while the chat is protected, and it is closed with the chat's other fragments when the chat locks.
+
+**Chat Lock.** Switching it on or off asks for the passcode with the existing Chat Lock sheet (`PROTECT` / `UNPROTECT`), as the
+chat list's long-press does and under the same rule (they always authenticate; a chat that is open and authorized is not an
+exception). With no passcode the existing "Passcode Required" dialog leads to the existing passcode setup, and enabling
+continues when it is back with a passcode. No credential is created here and there is no per-chat password. The switch
+changes only after success; cancelling changes nothing. Both entry points are `ProtectedChatsState.protect*` / `unprotect*`
+on the same set, so long-press and the profile always agree and there is no second entry. Turning it off removes this chat's
+protection only (not the passcode, the feature, the app lock or another chat).
+
+**Protecting a chat that is open.** The chat's fragments are in the stack under the Lock Settings screen. The passcode was just
+proved, so `ProtectedGateLifecycle.protectOpen` marks the chat in use and registers the fragments of the chat that sit in the
+contiguous context on top of the stack (chat, profile, settings; anything above them is their child) as covered nodes, as if
+the chat had been protected when they were presented. Going Back to the chat therefore never asks again, whatever its
+Auto-lock; the Auto-lock counts from when the user leaves it. A chat reached through another conversation (the stack has
+another chat between) is not in use and is gated like any other when revealed; a chat with no fragment in the stack counts
+from the moment of protecting (it is never left authorized by accident: `protectOpen` ends the use at once when nothing was
+registered, and the state method is package-private).
+
+**Per-chat values.** `ProtectedChatsState` keeps, per account and dialog, an optional *hide previews* and an optional
+*Auto-lock*. A value that was never set for a chat is the value of the Protected Chats page, so chats protected before this
+feature behave exactly as before and the page keeps working for every chat that was not configured individually; the first
+time a value is changed on a chat's own screen it becomes that chat's own and the page no longer changes it. The screen shows
+the effective value; there is no label, badge or switch for any of this. Resolution is in one place:
+`shouldHideContent(account, dialog)`, `getRelockSeconds(account, dialog)` (used by `isUnlocked` and `appResumed`) and
+`allowsExternalInteraction`. Callers ask `ProtectedChats.shouldHideContent` (dialog rows, search, downloads, notifications,
+their service-message and rich content, bubbles' preview, widgets, hashtag search, popup content) and never read a setting.
+Protection status stays the authority: stored values are only read for a protected dialog, a dialog that has settings but is not
+protected behaves like any chat (no masking, no lock, interaction allowed), and turning Chat Lock on restores what the chat was
+configured with. Protected chats do not allow external interaction (notification and popup replies, Wear, car, bot buttons)
+whatever their previews say: preview visibility and interaction are separate policies, and previews off does not re-enable it.
+The two value rows change no authentication: the page they sit on is reachable only while the chat is authorized and the
+Protected Chats page changes the same values without one.
+
+**Storage.** The existing `protected_chats` preferences file: `chatSettingsAccounts` (comma list of account user ids) and
+`chatsettings_<accountUserId>` = records `dialogId:hidePreview:relockSeconds` joined by `;`, `hidePreview` is `1`, `0` or empty
+(not set), `relockSeconds` one of the five choices or empty (not set); unknown or corrupt records are ignored. Nothing else
+changed: `enabled`, `hidePreview`, `relockSeconds`, `accounts`, `chats_<account>` are read and written as before, so an old
+file loads as-is (no migration step and no reset). Settings survive restart and process death; authorization still does not.
+They are removed with the dialog (`removeDialog`), follow a dialog that migrates (group to supergroup), go with an account
+(`clearAccount`), and are cleared together with every protection when the passcode is removed or the feature is turned off.
+Removing Chat Lock keeps the chat's settings.
+
+**Auto-lock in the lifecycle.** Only the interval a chat is measured with changed; the lifecycle model (`VISIBLE` ...
+`DESTROYED`) is untouched. A temporary child, a permission dialog, the comments and a forward are not leaving, whatever the
+chat's own Auto-lock is (Immediate included); a real boundary (app background, screen off, manual lock, genuine departure)
+applies the chat's own interval, and if that makes a covered chat unauthorized the gate before reveal authenticates before the
+chat appears.
+
+## Forwarding and sharing
+
+**Destination rule** (`ForwardDestinations`, one rule for every kind of destination: users, bots, groups, supergroups,
+channels, topics, secret chats): a destination that is protected and locked asks for authentication before anything is
+sent. The only exception is the user's own Saved Messages: a forward into it is write-only, so it neither asks nor unlocks
+nor opens Saved Messages, and its history stays behind its own lock. A destination that is already unlocked is not asked
+again. In-app forward pickers (`DialogsActivity`, type forward: chat forward, quote and reply pickers, photo viewer,
+media, search, music, share contact) and the in-app share sheet (`ShareAlert`) apply it where the selection is handed
+over. The system share sheet, Direct Share and the share picker (`LaunchActivity.didSelectDialogs`) apply it too, but
+without the exception: a share opens the chat it lands in.
+
+**Continuation**: the pending operation is the original selection handed over again with the arguments it had (messages
+in order, destinations with their topics, comment, send options). Nothing is consumed before the destinations are open.
+After a successful unlock it runs once; a cancelled or failed unlock drops it and it can never run later.
+Lost-forward root cause (build #80): `ChatActivity.didSelectDialogs` cleared the selection and the forwarded message
+first, then opened the destination chat; the chat gate blocked that open, the picker was closed, and after the unlock
+the gate only reopened the bare destination chat, so the forward panel was never created.
+
+**Source side: the forward is a transaction of the chat that started it** (`ProtectedChatsState.ForwardPhase`,
+driven by `ProtectedGateLifecycle`, which `ProtectedChatGate` adapts to fragments). The picker, a destination's
+authentication sheet, the destination chat the forward opens and Telegram's success interaction are all part of the
+forward; none of them is the user leaving the source chat. Phases, per source dialog:
+
+| Phase | Source chat | Starts | Ends |
+| --- | --- | --- | --- |
+| `NONE` (source visible, or no forward) | shown, or covered by a child | - | - |
+| `PICKER` (`FORWARD_PICKER_OPEN`; a destination's `FORWARD_AUTH_OPEN` sheet is only a layer over it) | covered by the picker, not left | `ActionBarLayout.presentFragment` -> `ProtectedChatGate.onFragmentPresented`, only for a forward picker over a protected dialog that is authorized and visible | picker destroyed (`CANCELLED` when the source was shown again first: Back, system/toolbar/gesture back), source destroyed, app paused, manual lock |
+| `HANDING_OVER` (`RETURNING_TO_SOURCE`) | covered | `DialogsActivity.notifyDelegate` before `didSelectDialogs` | the delegate returns (`forwardSettled`, in a `finally`) |
+| `DESTINATION` (`DESTINATION_OPENED`) | covered by the destination chat | settle: a chat is on top of the source | destination paused or destroyed, source destroyed, app paused, manual lock |
+| `COMPLETING` (`FORWARD_COMPLETION_UI`) | shown again, success/tag UI on it | settle: the picker returned to the source | bulletin/undo view hidden, any navigation away, next forward, app paused, source destroyed |
+
+Why a cancel is not special: the picker and the destination are children of the source, and a covered chat is not left (see
+the lifecycle section above); so Back from the picker, Back from the destination and a forward that returns to the source all
+find the chat as it was. The forward phases add the transaction's own bookkeeping on top: if the user does leave while a
+forward is open (the chat is released), the forward ends with it. Nothing is decided at resume time: build #82 resolved the hold when the source resumed
+(`ProtectedChatGate.onFragmentResumed` called `forwardPickerClosed`), which applied the Immediate Auto-lock, and the chat
+gate then closed the freshly resumed source with `removeSelfFromStack` while the Back animation was still running
+(`ActionBarLayout.removeFragmentFromStack` completes the running transition, then closes the chat); and it abandoned the
+hold as soon as a destination opened, so Back from the destination met a locked source.
+
+A destination that opens *another conversation* (a chat or profile) takes the user out of the source's context: the source is
+left and normal Auto-lock applies from then (it is closed under the destination, silently). A screen that shows no other
+conversation (a profile of the destination's own chat, media, search) does not. The app going to the background, a manual
+lock and the source being closed end the forward; a chat that was only covered by its forward is not revived by a return from a
+system activity. The swipe-back preview resumes the source when the swipe starts and pauses it again when the swipe is given
+up: the phase is untouched until the picker or destination is actually destroyed.
+
+The hold does not depend on the screen type: any fragment that shows a protected dialog which is authorized and visible
+right now (a chat, a profile with its shared media, the chat behind the photo viewer) can start it. A screen that is not gated
+(`MediaActivity`) shows no protected dialog, so it can neither hold nor manufacture an authorization. Source and destination
+are different fragments with different dialogs: the picker points to its source node, the destination points back to the
+source dialog, every transition is addressed to one dialog, a destination's own gate and authorization are never touched, and
+there is no global "current forward chat". The hold never authorizes another chat or Saved Messages and uses no timer.
+Destination authentication is unchanged: a selection of several chats asks for each locked protected destination in turn,
+remembers what the user unlocked for it while its own restart runs, and sends once; a cancel sends nothing; Saved Messages
+stays write-only and the tag-emoji completion is kept. `ActionBarLayout.presentFragment` is involved only to record who
+covers whom and to start the transaction; Back, destination and completion are decided by the fragment lifecycle callbacks
+every kind of back navigation goes through (`closeLastFragment`, the swipe-back animation).

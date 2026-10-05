@@ -128,6 +128,7 @@ import org.telegram.ui.LaunchActivity;
 import org.telegram.ui.MessageStatisticActivity;
 import org.telegram.ui.PhotoViewer;
 import org.telegram.ui.PremiumPreviewFragment;
+import org.telegram.ui.ProtectedChatGate;
 import org.telegram.ui.Stories.DarkThemeResourceProvider;
 
 import java.util.ArrayList;
@@ -2399,6 +2400,15 @@ public class ShareAlert extends BottomSheet implements NotificationCenter.Notifi
     }
 
     protected void sendInternal(boolean withSound) {
+        // A locked protected destination asks for authentication first, except the user's own Saved
+        // Messages (it only receives). After the unlock this same selection and comment go out, once.
+        final ArrayList<MessagesStorage.TopicKey> destinations = new ArrayList<>();
+        for (int a = 0; a < selectedDialogs.size(); a++) {
+            destinations.add(MessagesStorage.TopicKey.of(selectedDialogs.keyAt(a), 0));
+        }
+        if (ProtectedChatGate.holdForDestinations(AndroidUtilities.findActivity(getContext()), currentAccount, destinations, true, () -> sendInternal(withSound))) {
+            return;
+        }
         for (int a = 0; a < selectedDialogs.size(); a++) {
             long key = selectedDialogs.keyAt(a);
             if (AlertsCreator.checkSlowMode(getContext(), currentAccount, key, frameLayout2.getTag() != null && commentTextView.length() > 0)) {

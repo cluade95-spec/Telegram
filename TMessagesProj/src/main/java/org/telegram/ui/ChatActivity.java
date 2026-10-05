@@ -34431,12 +34431,24 @@ public class ChatActivity extends BaseFragment implements
                     }
                     getSendMessagesHelper().sendMessage(fmessages, did, false, false, notify, scheduleDate, scheduleRepeatPeriod, null, -1, price == null ? 0 : price, getSendMonoForumPeerId(), getSendMessageSuggestionParams());
                 }
+                // Into the user's own Saved Messages Telegram shows its success message with the tag
+                // emojis on this chat. A protected, open chat stays open until that interaction ends
+                // (the picker handed its selection over as returning to its source, see
+                // DialogsActivity.notifyDelegate); Saved Messages itself is only written to.
+                final boolean intoSavedMessages = dids.size() == 1 && dids.get(0).dialogId == getUserConfig().getClientUserId();
                 fragment.finishFragment();
                 createUndoView();
+                if (intoSavedMessages && undoView == null) {
+                    ProtectedChatGate.forwardCompletionEnded(ChatActivity.this);
+                }
                 if (undoView != null) {
                     if (dids.size() == 1) {
-                        if (!BulletinFactory.of(ChatActivity.this).showForwardedBulletinWithTag(dids.get(0).dialogId, fmessages.size())) {
+                        final Runnable completionEnded = intoSavedMessages ? () -> ProtectedChatGate.forwardCompletionEnded(ChatActivity.this) : null;
+                        if (!BulletinFactory.of(ChatActivity.this).showForwardedBulletinWithTag(dids.get(0).dialogId, fmessages.size(), completionEnded)) {
                             undoView.showWithAction(dids.get(0).dialogId, UndoView.ACTION_FWD_MESSAGES, fmessages.size());
+                            if (completionEnded != null) {
+                                undoView.setOnHideListener(completionEnded);
+                            }
                         }
                     } else {
                         undoView.showWithAction(0, UndoView.ACTION_FWD_MESSAGES, fmessages.size(), dids.size(), null, null);

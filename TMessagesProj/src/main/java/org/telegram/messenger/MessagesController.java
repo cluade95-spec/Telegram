@@ -6998,6 +6998,9 @@ public class MessagesController extends BaseController implements NotificationCe
         if (oldChat == chat) {
             return;
         }
+        if (chat.migrated_to != null) {
+            ProtectedChats.onDialogMigrated(currentAccount, -chat.id, -chat.migrated_to.channel_id);
+        }
         if (oldChat != null && !TextUtils.isEmpty(oldChat.username)) {
             objectsByUsernames.remove(oldChat.username.toLowerCase());
         }
@@ -10057,6 +10060,9 @@ public class MessagesController extends BaseController implements NotificationCe
             }
             getMessagesStorage().deleteDialog(did, onlyHistory);
             return;
+        }
+        if (onlyHistory == 0) {
+            ProtectedChats.onDialogDeleted(currentAccount, did);
         }
         for (int i = 0; i < sendAsPeers.size(); i++) {
             SendAsPeersInfo sendAsInfo = sendAsPeers.valueAt(i);

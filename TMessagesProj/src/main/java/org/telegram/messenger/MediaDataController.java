@@ -5001,7 +5001,10 @@ public class MediaDataController extends BaseController {
             maxShortcuts = 5;
         }
         ArrayList<TLRPC.TL_topPeer> hintsFinal = new ArrayList<>();
-        if (SharedConfig.passcodeHash.length() <= 0) {
+        // Launcher shortcuts list who you talk to most. They stay off while the app lock is on (as
+        // before). They hold only a chat's name and avatar, never its messages, so protected chats
+        // are listed like any other; opening one still goes through the protected-chat gate.
+        if (!SharedConfig.isAppLockEnabled()) {
             for (int a = 0; a < hints.size(); a++) {
                 hintsFinal.add(hints.get(a));
                 if (hintsFinal.size() == maxShortcuts - 2) {

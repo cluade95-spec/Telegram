@@ -67,7 +67,7 @@ public class BubbleActivity extends BasePermissionsActivity implements INavigati
         requestWindowFeature(Window.FEATURE_NO_TITLE);
         setTheme(R.style.Theme_TMessages);
         getWindow().setBackgroundDrawable(new ActivityWindowEmptyBackgroundDrawable());
-        if (!SharedConfig.passcodeHash.isEmpty() && !SharedConfig.allowScreenCapture) {
+        if (SharedConfig.hasPasscode() && !SharedConfig.allowScreenCapture) {
             try {
                 getWindow().setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE);
                 AndroidUtilities.logFlagSecure();
@@ -78,7 +78,7 @@ public class BubbleActivity extends BasePermissionsActivity implements INavigati
 
         super.onCreate(savedInstanceState);
 
-        if (!SharedConfig.passcodeHash.isEmpty() && SharedConfig.appLocked) {
+        if (SharedConfig.isAppLockEnabled() && SharedConfig.appLocked) {
             SharedConfig.lastPauseTime = (int) (SystemClock.elapsedRealtime() / 1000);
         }
 
@@ -224,6 +224,14 @@ public class BubbleActivity extends BasePermissionsActivity implements INavigati
     }
 
     @Override
+    protected void onStop() {
+        super.onStop();
+        // No longer visible: the background boundary. onPause alone is not (a system permission
+        // dialog pauses the activity and leaves it on screen).
+        org.telegram.messenger.ProtectedChats.onAppPaused();
+    }
+
+    @Override
     protected void onDestroy() {
         super.onDestroy();
         if (currentAccount != -1) {
@@ -280,7 +288,7 @@ public class BubbleActivity extends BasePermissionsActivity implements INavigati
             AndroidUtilities.cancelRunOnUIThread(lockRunnable);
             lockRunnable = null;
         }
-        if (!SharedConfig.passcodeHash.isEmpty()) {
+        if (SharedConfig.isAppLockEnabled()) {
             SharedConfig.lastPauseTime = (int) (SystemClock.elapsedRealtime() / 1000);
             lockRunnable = new Runnable() {
                 @Override
@@ -312,6 +320,8 @@ public class BubbleActivity extends BasePermissionsActivity implements INavigati
     }
 
     private void onPasscodeResume() {
+        org.telegram.messenger.ProtectedChats.onAppResumed();
+        ProtectedChatGate.closeLockedFragments(java.util.Collections.singletonList(actionBarLayout));
         if (lockRunnable != null) {
             AndroidUtilities.cancelRunOnUIThread(lockRunnable);
             lockRunnable = null;

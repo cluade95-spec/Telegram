@@ -1362,7 +1362,7 @@ public class PrivacySettingsActivity extends BaseFragment implements Notificatio
                         textCell2.setTextAndValueAndIcon(getString(R.string.Passkey), value, true, R.drawable.msg2_permissions, true);
                     } else if (position == passcodeRow) {
                         int icon;
-                        if (SharedConfig.passcodeHash.length() != 0) {
+                        if (SharedConfig.isAppLockEnabled() || SharedConfig.hasPasscode() && org.telegram.messenger.ProtectedChats.hasAnyProtectedChat()) {
                             value = getString(R.string.PasswordOn);
                             icon = R.drawable.msg2_secret;
                         } else {

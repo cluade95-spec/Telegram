@@ -1318,6 +1318,11 @@ public final class BulletinFactory {
     }
 
     public boolean showForwardedBulletinWithTag(long did, int messagesCount) {
+        return showForwardedBulletinWithTag(did, messagesCount, null);
+    }
+
+    /** @param onHide runs when the bulletin, with its tag emojis, is gone (dismissed, timed out or a tag was chosen) */
+    public boolean showForwardedBulletinWithTag(long did, int messagesCount, Runnable onHide) {
         if (!UserConfig.getInstance(UserConfig.selectedAccount).isPremium() || fragment == null) {
             return false;
         }
@@ -1339,6 +1344,9 @@ public final class BulletinFactory {
         Bulletin bulletin = create(layout, 3500);
         layout.setBulletin(bulletin);
         bulletin.hideAfterBottomSheet(false);
+        if (onHide != null) {
+            bulletin.setOnHideListener(onHide);
+        }
         bulletin.show(true);
         return true;
     }

@@ -27,6 +27,7 @@ import org.telegram.messenger.FileLog;
 import org.telegram.messenger.LocaleController;
 import org.telegram.messenger.MediaController;
 import org.telegram.messenger.MessageObject;
+import org.telegram.messenger.ProtectedChats;
 import org.telegram.messenger.MessagesController;
 import org.telegram.messenger.NotificationCenter;
 import org.telegram.messenger.R;
@@ -464,14 +465,14 @@ public class SearchDownloadsContainer extends FrameLayout implements Notificatio
     private void updateRows(ArrayList<MessageObject> currentLoadingFilesTmp, ArrayList<MessageObject> recentLoadingFilesTmp) {
         currentLoadingFiles.clear();
         for (MessageObject object : currentLoadingFilesTmp) {
-            if (!object.isRoundVideo() && !object.isVoice()) {
+            if (!object.isRoundVideo() && !object.isVoice() && !ProtectedChats.shouldHideContent(currentAccount, object.getDialogId())) {
                 currentLoadingFiles.add(object);
             }
         }
 
         recentLoadingFiles.clear();
         for (MessageObject object : recentLoadingFilesTmp) {
-            if (!object.isRoundVideo() && !object.isVoice()) {
+            if (!object.isRoundVideo() && !object.isVoice() && !ProtectedChats.shouldHideContent(currentAccount, object.getDialogId())) {
                 recentLoadingFiles.add(object);
             }
         }

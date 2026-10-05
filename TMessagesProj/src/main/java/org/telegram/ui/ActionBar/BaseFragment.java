@@ -57,6 +57,7 @@ import org.telegram.messenger.NotificationsController;
 import org.telegram.messenger.SecretChatHelper;
 import org.telegram.messenger.SendMessagesHelper;
 import org.telegram.messenger.UserConfig;
+import org.telegram.messenger.ProtectedGateLifecycle;
 import org.telegram.messenger.utils.LeakDetector;
 import org.telegram.tgnet.ConnectionsManager;
 import org.telegram.ui.ArticleViewer;
@@ -64,6 +65,7 @@ import org.telegram.ui.Components.Bulletin;
 import org.telegram.ui.Components.BulletinFactory;
 import org.telegram.ui.Components.LayoutHelper;
 import org.telegram.ui.LaunchActivity;
+import org.telegram.ui.ProtectedChatGate;
 import org.telegram.ui.Stories.StoryViewer;
 import org.telegram.ui.bots.BotWebViewAttachedSheet;
 
@@ -72,6 +74,8 @@ import java.util.ArrayList;
 public abstract class BaseFragment {
 
     public boolean isFinished;
+    /** What ProtectedChatGate knows about this fragment: its protected dialog, whether it counts as visible, its forward. */
+    public final ProtectedGateLifecycle.Node protectedGate = new ProtectedGateLifecycle.Node();
     protected boolean finishing;
     public Dialog visibleDialog;
     protected int currentAccount = UserConfig.selectedAccount;
@@ -492,6 +496,7 @@ public abstract class BaseFragment {
 
     @CallSuper
     public void onFragmentDestroy() {
+        ProtectedChatGate.onFragmentDestroyed(this);
         getConnectionsManager().cancelRequestsForGuid(classGuid);
         getMessagesStorage().cancelTasksForGuid(classGuid);
         isFinished = true;
@@ -528,6 +533,7 @@ public abstract class BaseFragment {
     @CallSuper
     public void onResume() {
         isPaused = false;
+        ProtectedChatGate.onFragmentResumed(this);
         if (actionBar != null) {
             actionBar.onResume();
         }
@@ -539,6 +545,7 @@ public abstract class BaseFragment {
 
     @CallSuper
     public void onPause() {
+        ProtectedChatGate.onFragmentPaused(this);
         if (actionBar != null) {
             actionBar.onPause();
         }
@@ -744,6 +751,7 @@ public abstract class BaseFragment {
 
     public void onBecomeFullyVisible() {
         isFullyVisible = true;
+        ProtectedChatGate.onFragmentSettled(this);
         AccessibilityManager mgr = (AccessibilityManager) ApplicationLoader.applicationContext.getSystemService(Context.ACCESSIBILITY_SERVICE);
         if (mgr.isEnabled()) {
             ActionBar actionBar = getActionBar();
@@ -789,6 +797,7 @@ public abstract class BaseFragment {
 
     public void onBecomeFullyHidden() {
         isFullyVisible = false;
+        ProtectedChatGate.onFragmentSettled(this);
         updateSheetsVisibility();
     }
 
@@ -977,6 +986,9 @@ public abstract class BaseFragment {
 
     public INavigationLayout[] showAsSheet(BaseFragment fragment, BottomSheetParams params) {
         if (getParentActivity() == null) {
+            return null;
+        }
+        if (ProtectedChatGate.block(fragment, getParentActivity(), () -> showAsSheet(fragment, params))) {
             return null;
         }
         BottomSheet[] bottomSheet = new BottomSheet[1];

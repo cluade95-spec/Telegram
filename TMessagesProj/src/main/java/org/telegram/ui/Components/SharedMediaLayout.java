@@ -90,6 +90,8 @@ import org.telegram.messenger.MessageObject;
 import org.telegram.messenger.MessagesController;
 import org.telegram.messenger.MessagesStorage;
 import org.telegram.messenger.NotificationCenter;
+import org.telegram.messenger.ProfileContentPolicy;
+import org.telegram.messenger.ProtectedChats;
 import org.telegram.messenger.R;
 import org.telegram.messenger.SavedMessagesController;
 import org.telegram.messenger.SendMessagesHelper;
@@ -789,13 +791,33 @@ public class SharedMediaLayout extends FrameLayout implements NotificationCenter
                 if (hasMedia[i] > 0)
                     return true;
             }
-            if (hasSavedMessages) {
+            if (hasSavedMessages()) {
                 return true;
             }
-            if (parentFragment != null && dialogId == parentFragment.getUserConfig().getClientUserId() && topicId == 0 && parentFragment.getMessagesController().getSavedMessagesController().hasDialogs()) {
+            if (parentFragment != null && dialogId == parentFragment.getUserConfig().getClientUserId() && topicId == 0 && !isSavedMessagesLocked() && parentFragment.getMessagesController().getSavedMessagesController().hasDialogs()) {
                 return true;
             }
             return false;
+        }
+
+        // Messages of a locked protected dialog are withheld from every profile (ProfileContentPolicy).
+        // The raw state is kept, so unlocking shows them again without a reload.
+        private boolean isDialogLocked() {
+            return parentFragment != null && dialogId != 0 && ProtectedChats.isLockedProtected(parentFragment.getCurrentAccount(), dialogId);
+        }
+
+        private boolean isSavedMessagesLocked() {
+            return parentFragment != null && ProtectedChats.isLockedProtected(parentFragment.getCurrentAccount(), parentFragment.getUserConfig().getClientUserId());
+        }
+
+        /** Whether any message content of this dialog's profile is withheld now. */
+        public boolean isContentWithheld() {
+            return ProfileContentPolicy.isContentWithheld(isDialogLocked(), isSavedMessagesLocked());
+        }
+
+        /** The Saved Messages tab of the profile: the messages kept from this peer, unless Saved Messages is locked. */
+        public boolean hasSavedMessages() {
+            return ProfileContentPolicy.showSavedMessagesTab(hasSavedMessages, isSavedMessagesLocked());
         }
 
         private final NotificationCenter.ObserversGroup observersGroup;
@@ -920,7 +942,7 @@ public class SharedMediaLayout extends FrameLayout implements NotificationCenter
         }
 
         public int[] getLastMediaCount() {
-            return lastMediaCount;
+            return ProfileContentPolicy.visiblePreloaderCounts(lastMediaCount, isDialogLocked());
         }
 
         public SharedMediaData[] getSharedMediaData() {
@@ -1581,6 +1603,13 @@ public class SharedMediaLayout extends FrameLayout implements NotificationCenter
 
     public SharedMediaLayout(Context context, long did, SharedMediaPreloader preloader, int commonGroupsCount, ArrayList<Integer> sortedUsers, TLRPC.ChatFull chatInfo, TLRPC.UserFull userInfo, int initialTab, int initialStoryAlbumId, BaseFragment parent, Delegate delegate, int viewType, Theme.ResourcesProvider resourcesProvider, BlurredBackgroundDrawableViewFactory iBlur3FactoryLiquidGlass) {
         super(context);
+
+        // A tab of messages that are withheld (their dialog is locked) is not an initial tab.
+        if (initialTab >= 0 && parent != null && !ProfileContentPolicy.tabAvailable(initialTab,
+                did != 0 && ProtectedChats.isLockedProtected(parent.getCurrentAccount(), did),
+                ProtectedChats.isLockedProtected(parent.getCurrentAccount(), parent.getUserConfig().getClientUserId()))) {
+            initialTab = -1;
+        }
 
         iBlur3SourceColor = new BlurredBackgroundSourceColor();
         iBlur3SourceColor.setColor(getThemedColor(Theme.key_windowBackgroundWhite));
@@ -5066,7 +5095,7 @@ public class SharedMediaLayout extends FrameLayout implements NotificationCenter
     }
 
     private void loadFastScrollData(boolean force) {
-        if (topicId != 0 || isSearchingStories()) {
+        if (topicId != 0 || isSearchingStories() || isDialogLocked()) {
             return;
         }
         for (int k = 0; k < supportedFastScrollTypes.length; k++) {
@@ -6844,6 +6873,16 @@ public class SharedMediaLayout extends FrameLayout implements NotificationCenter
     private long giftsLastHash;
     private boolean wasReordering;
     private int firstTab = -1;
+    /** The messages of this dialog are withheld: it is protected and locked. */
+    private boolean isDialogLocked() {
+        return profileActivity != null && dialog_id != 0 && ProtectedChats.isLockedProtected(profileActivity.getCurrentAccount(), dialog_id);
+    }
+
+    /** The Saved Messages lists are withheld: Saved Messages is protected and locked. */
+    private boolean isSavedMessagesLocked() {
+        return profileActivity != null && ProtectedChats.isLockedProtected(profileActivity.getCurrentAccount(), profileActivity.getUserConfig().getClientUserId());
+    }
+
     public void updateTabs(boolean animated) {
         if (scrollSlidingTextTabStrip == null) {
             return;
@@ -6851,9 +6890,12 @@ public class SharedMediaLayout extends FrameLayout implements NotificationCenter
         if (!delegate.isFragmentOpened()) {
             animated = false;
         }
+        // Messages of a locked protected dialog are withheld (ProfileContentPolicy); no other tab depends on it.
+        final boolean savedMessagesLocked = isSavedMessagesLocked();
+        final int[] hasMedia = ProfileContentPolicy.visibleLayoutCounts(this.hasMedia, isDialogLocked());
         boolean hasRecommendations = false;
         boolean hasSavedDialogs = false;
-        boolean hasSavedMessages = savedMessagesContainer != null && sharedMediaPreloader != null && sharedMediaPreloader.hasSavedMessages;
+        boolean hasSavedMessages = savedMessagesContainer != null && sharedMediaPreloader != null && sharedMediaPreloader.hasSavedMessages();
         final TLRPC.User user = dialog_id <= 0 || profileActivity == null ? null : profileActivity.getMessagesController().getUser(dialog_id);
         boolean hasEditBotPreviews = user != null && user.bot && user.bot_has_main_app && user.bot_can_edit;
         boolean hasBotPreviews = user != null && user.bot && !user.bot_can_edit && (userInfo != null && userInfo.bot_info != null && userInfo.bot_info.has_preview_medias) && !hasEditBotPreviews;
@@ -6916,7 +6958,7 @@ public class SharedMediaLayout extends FrameLayout implements NotificationCenter
             if (hasRecommendations != scrollSlidingTextTabStrip.hasTab(TAB_RECOMMENDED_CHANNELS)) {
                 changed++;
             }
-            hasSavedDialogs = includeSavedDialogs() && !profileActivity.getMessagesController().getSavedMessagesController().unsupported && profileActivity.getMessagesController().getSavedMessagesController().hasDialogs();
+            hasSavedDialogs = ProfileContentPolicy.showSavedDialogsTab(includeSavedDialogs() && !profileActivity.getMessagesController().getSavedMessagesController().unsupported && profileActivity.getMessagesController().getSavedMessagesController().hasDialogs(), savedMessagesLocked);
             if (hasSavedDialogs != scrollSlidingTextTabStrip.hasTab(TAB_SAVED_DIALOGS)) {
                 changed++;
             }

@@ -46,6 +46,7 @@ import org.telegram.messenger.MediaController;
 import org.telegram.messenger.MessageObject;
 import org.telegram.messenger.MessagesController;
 import org.telegram.messenger.MessagesStorage;
+import org.telegram.messenger.ProtectedChats;
 import org.telegram.messenger.NotificationCenter;
 import org.telegram.messenger.R;
 import org.telegram.messenger.UserConfig;
@@ -738,6 +739,9 @@ public class FilteredSearchView extends FrameLayout implements NotificationCente
                     int n = messageObjects.size();
                     for (int i = 0; i < n; i++) {
                         MessageObject messageObject = messageObjects.get(i);
+                        if (ProtectedChats.shouldHideContent(currentAccount, messageObject.getDialogId())) {
+                            continue;
+                        }
                         ArrayList<MessageObject> messageObjectsByDate = sectionArrays.get(messageObject.monthKey);
                         if (messageObjectsByDate == null) {
                             messageObjectsByDate = new ArrayList<>();

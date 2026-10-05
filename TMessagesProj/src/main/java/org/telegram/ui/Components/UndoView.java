@@ -381,6 +381,13 @@ public class UndoView extends FrameLayout {
         return currentInfoObject;
     }
 
+    private Runnable onHideListener;
+
+    /** Runs once, when the view that is showing now has been hidden (timed out, tapped away or replaced). */
+    public void setOnHideListener(Runnable listener) {
+        onHideListener = listener;
+    }
+
     public void hide(boolean apply, int animated) {
         if (getVisibility() != VISIBLE || !isShown) {
             return;
@@ -388,6 +395,11 @@ public class UndoView extends FrameLayout {
         currentInfoObject = null;
         currentInfoObject2 = null;
         isShown = false;
+        if (onHideListener != null) {
+            final Runnable listener = onHideListener;
+            onHideListener = null;
+            listener.run();
+        }
         if (currentActionRunnable != null) {
             if (apply) {
                 currentActionRunnable.run();
