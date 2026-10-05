@@ -61,6 +61,18 @@ public class LocalHistory {
         return local;
     }
 
+    private volatile String title;
+
+    /** The chat's name: the one the user chose, else the default. Cached; loaded with the summary. */
+    public String getTitle() {
+        String t = title;
+        if (t == null || t.isEmpty()) {
+            ensureSummary();
+            return org.telegram.messenger.LocaleController.getString(org.telegram.messenger.R.string.LocalHistoryTitle);
+        }
+        return t;
+    }
+
     public static synchronized DispatchQueue getQueue() {
         if (queue == null) {
             queue = new DispatchQueue("localHistoryQueue");
@@ -91,6 +103,7 @@ public class LocalHistory {
         getQueue().postRunnable(() -> {
             Summary next = null;
             if (isEnabled() || databaseExists()) {
+                title = getRepository().getMeta(META_TITLE);
                 next = computeSummary();
             }
             summary = next;

@@ -237,6 +237,7 @@ import org.telegram.ui.Components.FolderDrawable;
 import org.telegram.ui.Components.ForegroundColorSpanThemable;
 import org.telegram.ui.Components.Forum.ForumUtilities;
 import org.telegram.ui.Components.FragmentContextView;
+import org.telegram.messenger.localhistory.LocalDialogIds;
 import org.telegram.messenger.localhistory.LocalHistory;
 import org.telegram.ui.Components.ItemOptions;
 import org.telegram.ui.Components.JoinGroupAlert;
@@ -8329,9 +8330,33 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
         }
         final LocalHistory localHistory = LocalHistory.getInstance(currentAccount);
         AlertDialog.Builder builder = new AlertDialog.Builder(getParentActivity());
-        builder.setItems(new CharSequence[]{LocaleController.getString(R.string.MarkAsRead), LocaleController.getString(R.string.ClearHistory)}, (dialog, which) -> {
-            if (which == 0) {
+        final long localId = LocalDialogIds.LOCAL_HISTORY;
+        final boolean locked = ProtectedChats.shouldHideContent(currentAccount, localId);
+        final boolean isProtected = ProtectedChats.isProtected(currentAccount, localId);
+        final ArrayList<CharSequence> items = new ArrayList<>();
+        final ArrayList<Integer> actions = new ArrayList<>();
+        if (!locked) {
+            items.add(LocaleController.getString(R.string.MarkAsRead));
+            actions.add(0);
+            items.add(LocaleController.getString(R.string.ClearHistory));
+            actions.add(1);
+        }
+        if (ProtectedChats.isSupportedDialog(localId)) {
+            items.add(LocaleController.getString(isProtected ? R.string.ChatPasscodeUnprotect : R.string.ChatPasscodeProtect));
+            actions.add(2);
+        }
+        builder.setItems(items.toArray(new CharSequence[0]), (dialog, which) -> {
+            final int action = actions.get(which);
+            if (action == 0) {
                 localHistory.markAllRead();
+            } else if (action == 2) {
+                final ArrayList<Long> ids = new ArrayList<>();
+                ids.add(localId);
+                if (isProtected) {
+                    authenticateChats(ids, ProtectedChatAuthSheet.Mode.UNPROTECT);
+                } else {
+                    protectChats(ids);
+                }
             } else {
                 AlertDialog.Builder confirm = new AlertDialog.Builder(getParentActivity());
                 confirm.setTitle(LocaleController.getString(R.string.LocalHistoryTitle));
@@ -10108,7 +10133,13 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
         if (getParentActivity() == null) {
             return;
         }
-        final ArrayList<Long> ids = new ArrayList<>(selectedDialogs);
+        protectChats(new ArrayList<>(selectedDialogs));
+    }
+
+    private void protectChats(ArrayList<Long> ids) {
+        if (getParentActivity() == null) {
+            return;
+        }
         if (!SharedConfig.hasPasscode()) {
             // The existing passcode setup remains the only place a credential is created.
             AlertDialog dialog = new AlertDialog.Builder(getParentActivity(), getResourceProvider())

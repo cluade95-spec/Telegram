@@ -17,6 +17,7 @@ import android.widget.TextView;
 import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.LocaleController;
 import org.telegram.messenger.R;
+import org.telegram.messenger.UserConfig;
 import org.telegram.messenger.SharedConfig;
 import org.telegram.messenger.localhistory.LocalHistory;
 import org.telegram.ui.ActionBar.Theme;
@@ -91,6 +92,12 @@ public class LocalHistoryRowCell extends FrameLayout {
         time.setTextColor(Theme.getColor(Theme.key_chats_date));
         if (summary == null) {
             preview.setText("");
+            time.setText("");
+            badge.setVisibility(View.GONE);
+            return;
+        }
+        if (org.telegram.messenger.ProtectedChats.shouldHideContent(UserConfig.selectedAccount, org.telegram.messenger.localhistory.LocalDialogIds.LOCAL_HISTORY)) {
+            preview.setText(LocaleController.getString(R.string.ChatPasscodeLocked));
             time.setText("");
             badge.setVisibility(View.GONE);
             return;

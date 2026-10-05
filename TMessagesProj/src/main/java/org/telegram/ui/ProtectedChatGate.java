@@ -48,6 +48,9 @@ public final class ProtectedChatGate {
         if (fragment instanceof ChatActivity) {
             return dialogIdFromArgs(fragment.getArguments(), false);
         }
+        if (fragment instanceof org.telegram.messenger.localhistory.LocalHistoryScreen) {
+            return org.telegram.messenger.localhistory.LocalDialogIds.LOCAL_HISTORY;
+        }
         if (fragment instanceof ChatLockSettingsActivity) {
             // the chat's own lock settings are as much part of the chat as its profile
             return ((ChatLockSettingsActivity) fragment).getLockDialogId();
@@ -154,6 +157,9 @@ public final class ProtectedChatGate {
     /** The dialog a fragment shows as a conversation (a chat or a profile), or 0 for any other screen. */
     private static long conversationDialogId(BaseFragment fragment) {
         if (fragment instanceof ChatActivity || fragment instanceof ProfileActivity || fragment instanceof ProfileActivity2) {
+            return getDialogId(fragment);
+        }
+        if (fragment instanceof org.telegram.messenger.localhistory.LocalHistoryScreen && ((org.telegram.messenger.localhistory.LocalHistoryScreen) fragment).isLocalHistoryConversation()) {
             return getDialogId(fragment);
         }
         return 0;
@@ -334,6 +340,9 @@ public final class ProtectedChatGate {
     }
 
     public static CharSequence getTitle(int account, long dialogId) {
+        if (org.telegram.messenger.localhistory.LocalDialogIds.isLocal(dialogId)) {
+            return org.telegram.messenger.localhistory.LocalHistory.getInstance(account).getTitle();
+        }
         MessagesController controller = MessagesController.getInstance(account);
         if (DialogObject.isEncryptedDialog(dialogId)) {
             TLRPC.EncryptedChat encryptedChat = controller.getEncryptedChat(DialogObject.getEncryptedChatId(dialogId));

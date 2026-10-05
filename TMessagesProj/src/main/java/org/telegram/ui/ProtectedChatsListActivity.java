@@ -13,6 +13,8 @@ import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 
 import org.telegram.messenger.DialogObject;
+import org.telegram.messenger.localhistory.LocalDialogIds;
+import org.telegram.messenger.localhistory.LocalHistory;
 import org.telegram.messenger.LocaleController;
 import org.telegram.messenger.MessagesController;
 import org.telegram.messenger.NotificationCenter;
@@ -121,6 +123,9 @@ public class ProtectedChatsListActivity extends BaseFragment implements Notifica
 
     private CharSequence getName(long dialogId) {
         final MessagesController controller = getMessagesController();
+        if (LocalDialogIds.isLocal(dialogId)) {
+            return LocalHistory.getInstance(currentAccount).getTitle();
+        }
         if (dialogId == getUserConfig().getClientUserId()) {
             return LocaleController.getString(R.string.SavedMessages);
         } else if (DialogObject.isEncryptedDialog(dialogId)) {
@@ -173,6 +178,9 @@ public class ProtectedChatsListActivity extends BaseFragment implements Notifica
     }
 
     private boolean isAvailable(long dialogId) {
+        if (LocalDialogIds.isLocal(dialogId)) {
+            return true;
+        }
         if (dialogId == getUserConfig().getClientUserId()) {
             return true;
         }
@@ -235,7 +243,9 @@ public class ProtectedChatsListActivity extends BaseFragment implements Notifica
                     final MessagesController controller = getMessagesController();
                     final long dialogId = item.dialogId;
                     final ProfileSearchCell cell = (ProfileSearchCell) holder.itemView;
-                    if (dialogId == getUserConfig().getClientUserId()) {
+                    if (LocalDialogIds.isLocal(dialogId)) {
+                        cell.setData(null, null, LocalHistory.getInstance(currentAccount).getTitle(), null, false, false);
+                    } else if (dialogId == getUserConfig().getClientUserId()) {
                         cell.setData(controller.getUser(dialogId), null, LocaleController.getString(R.string.SavedMessages), null, false, true);
                     } else if (DialogObject.isEncryptedDialog(dialogId)) {
                         final TLRPC.EncryptedChat ec = controller.getEncryptedChat(DialogObject.getEncryptedChatId(dialogId));

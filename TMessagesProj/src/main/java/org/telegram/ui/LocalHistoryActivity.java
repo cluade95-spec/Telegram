@@ -56,7 +56,12 @@ import java.util.List;
  * Read-only feed of what other people edited or removed in the owner's private chats (plan B12, B15).
  * Not a ChatActivity: it never has a peer, never sends a request and never opens a dialog with the reserved id.
  */
-public class LocalHistoryActivity extends BaseFragment implements NotificationCenter.NotificationCenterDelegate {
+public class LocalHistoryActivity extends BaseFragment implements NotificationCenter.NotificationCenterDelegate, org.telegram.messenger.localhistory.LocalHistoryScreen {
+
+    @Override
+    public boolean isLocalHistoryConversation() {
+        return true;
+    }
 
     private static final int PAGE = 50;
     private static final int menu_clear = 1;

@@ -103,7 +103,7 @@ public class ProtectedChats {
     }
 
     public static boolean isSupportedDialog(long dialogId) {
-        return dialogId != 0 && !DialogObject.isFolderDialogId(dialogId);
+        return ProtectedDialogIds.isSupported(dialogId);
     }
 
     /**
