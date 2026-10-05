@@ -657,18 +657,22 @@ public abstract class BaseFragment {
     }
 
     public boolean presentFragment(BaseFragment fragment) {
+        org.telegram.messenger.usage.UsageSurfaceResolver.inheritSettingsOrigin(fragment, this);
         return allowPresentFragment() && parentLayout != null && parentLayout.presentFragment(fragment);
     }
 
     public boolean presentFragment(BaseFragment fragment, boolean removeLast) {
+        org.telegram.messenger.usage.UsageSurfaceResolver.inheritSettingsOrigin(fragment, this);
         return allowPresentFragment() && parentLayout != null && parentLayout.presentFragment(fragment, removeLast);
     }
 
     public boolean presentFragment(BaseFragment fragment, boolean removeLast, boolean forceWithoutAnimation) {
+        org.telegram.messenger.usage.UsageSurfaceResolver.inheritSettingsOrigin(fragment, this);
         return allowPresentFragment() && parentLayout != null && parentLayout.presentFragment(fragment, removeLast, forceWithoutAnimation, true, false, null);
     }
 
     public boolean presentFragment(INavigationLayout.NavigationParams params) {
+        org.telegram.messenger.usage.UsageSurfaceResolver.inheritSettingsOrigin(params.fragment, this);
         return allowPresentFragment() && parentLayout != null && parentLayout.presentFragment(params);
     }
 
@@ -985,6 +989,7 @@ public abstract class BaseFragment {
     }
 
     public INavigationLayout[] showAsSheet(BaseFragment fragment, BottomSheetParams params) {
+        org.telegram.messenger.usage.UsageSurfaceResolver.inheritSettingsOrigin(fragment, this);
         if (getParentActivity() == null) {
             return null;
         }

@@ -11811,6 +11811,14 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
         return delegate == null && searchString == null;
     }
 
+    public boolean isUsageSearchShown() {
+        return searchIsShowed;
+    }
+
+    public boolean isUsageSelectionOnly() {
+        return onlySelect;
+    }
+
     public boolean isArchive() {
         return folderId == 1;
     }

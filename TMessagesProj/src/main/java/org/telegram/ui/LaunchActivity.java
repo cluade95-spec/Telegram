@@ -6617,6 +6617,14 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
         return currentLayout;
     }
 
+    public boolean isUsageTabletFullSize() {
+        return tabletFullSize;
+    }
+
+    public boolean isUsagePasscodeVisible() {
+        return passcodeDialog != null && passcodeDialog.isShowing();
+    }
+
     public INavigationLayout getLayersActionBarLayout() {
         return layersActionBarLayout;
     }

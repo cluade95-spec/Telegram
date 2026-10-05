@@ -1986,6 +1986,7 @@ public class ActionBarLayout extends FrameLayout implements INavigationLayout, F
             return false;
         }
         ProtectedChatGate.onFragmentCreated(fragment);
+        org.telegram.messenger.usage.UsageSurfaceResolver.inheritSettingsOrigin(fragment, getLastFragment());
         final EdgeToEdgeSupportMode edgeToEdgeSupportMode = fragment.getEdgeToEdgeSupportMode();
         final boolean isSupportEdgeToEdge = edgeToEdgeSupportMode != EdgeToEdgeSupportMode.NONE;
         final boolean drawNavigationBar = fragment.drawEdgeNavigationBar();
@@ -2376,6 +2377,7 @@ public class ActionBarLayout extends FrameLayout implements INavigationLayout, F
             return false;
         }
         ProtectedChatGate.onFragmentCreated(fragment);
+        org.telegram.messenger.usage.UsageSurfaceResolver.inheritSettingsOrigin(fragment, getLastFragment());
         fragment.setParentLayout(this);
         if (position == -1 || position == INavigationLayout.FORCE_NOT_ATTACH_VIEW) {
             if (!fragmentsStack.isEmpty()) {

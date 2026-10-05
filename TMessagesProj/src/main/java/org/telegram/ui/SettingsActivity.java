@@ -754,6 +754,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
     }
 
     private void presentSettingFragment(BaseFragment fragment) {
+        org.telegram.messenger.usage.UsageSurfaceResolver.inheritSettingsOrigin(fragment, this);
         if (AndroidUtilities.isTablet() && LaunchActivity.instance != null && LaunchActivity.instance.getRightActionBarLayout() != null) {
             final INavigationLayout layout = LaunchActivity.instance.getRightActionBarLayout();
             if (!layout.getFragmentStack().isEmpty()) {
