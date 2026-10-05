@@ -149,10 +149,24 @@ public class LocalHistory {
         });
     }
 
+    /** Removes one entry together with its preserved media; feature queue only. */
+    public void deleteEntry(long entryId) {
+        getMediaManager().deleteFilesOf(entryId);
+        getLedger().deleteEntry(entryId);
+        refreshSummary();
+    }
+
     /** Deletes every entry and resets unread; the title and the on/off setting stay. */
     public void clearHistory() {
         getQueue().postRunnable(() -> {
             LocalHistoryRepository repo = getRepository();
+            getMediaManager();
+            for (LocalHistoryRepository.Media pending : repo.mediaByState(LocalHistoryMediaState.PENDING_COPY)) {
+                LocalHistoryMediaHolds.get().release(pending.sourcePath);
+            }
+            if (copier != null) {
+                copier.deleteAll();
+            }
             getLedger().clear();
             repo.setMeta(META_LAST_READ_AT, null);
             refreshSummary();
@@ -181,6 +195,28 @@ public class LocalHistory {
         return ledger;
     }
 
+    private LocalHistoryMediaCopier copier;
+    private LocalHistoryMediaManager mediaManager;
+
+    public synchronized LocalHistoryMediaManager getMediaManager() {
+        if (mediaManager == null) {
+            long userId = UserConfig.getInstance(currentAccount).getClientUserId();
+            copier = new LocalHistoryMediaCopier(new File(directoryFor(userId), "media"));
+            mediaManager = new LocalHistoryMediaManager(getRepository(), copier, LocalHistoryMediaHolds.get());
+            final LocalHistoryMediaManager manager = mediaManager;
+            getQueue().postRunnable(manager::recover);
+        }
+        return mediaManager;
+    }
+
+    /** Copies pending media on the feature queue; the screen refreshes when it is done. */
+    public void processMedia() {
+        getQueue().postRunnable(() -> {
+            getMediaManager().processPending();
+            refreshSummary();
+        });
+    }
+
     public synchronized LocalHistoryRepository getRepository() {
         if (database == null) {
             database = new LocalHistoryDatabase(directoryFor(UserConfig.getInstance(currentAccount).getClientUserId()));
@@ -192,9 +228,12 @@ public class LocalHistory {
     public synchronized void deleteAll() {
         if (database != null) {
             database.destroy();
-        } else {
-            deleteDirectory(directoryFor(UserConfig.getInstance(currentAccount).getClientUserId()));
         }
+        deleteDirectory(directoryFor(UserConfig.getInstance(currentAccount).getClientUserId())); // database files and media
+        database = null;
+        ledger = null;
+        mediaManager = null;
+        copier = null;
         summary = null;
         AndroidUtilities.runOnUIThread(() -> NotificationCenter.getInstance(currentAccount).postNotificationName(NotificationCenter.localHistoryChanged));
     }
@@ -205,6 +244,8 @@ public class LocalHistory {
         }
         database = null;
         ledger = null;
+        mediaManager = null;
+        copier = null;
         summary = null;
         enabledLoaded = false;
     }

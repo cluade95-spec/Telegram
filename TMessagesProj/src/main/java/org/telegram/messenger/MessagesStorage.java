@@ -18102,6 +18102,13 @@ public class MessagesStorage extends BaseController {
         return pts[0];
     }
 
+    /** Storage thread only. The local files Telegram would delete together with this message (Local History holds them first). */
+    public ArrayList<File> getFilesOfMessage(TLRPC.Message message) {
+        ArrayList<File> files = new ArrayList<>();
+        addFilesToDelete(message, files, new ArrayList<>(), new ArrayList<>(), false);
+        return files;
+    }
+
     /** Storage thread only. Reads the stored rows of user-chat messages about to be removed remotely (Local History). */
     public ArrayList<TLRPC.Message> getMessagesForArchiveSync(long dialogIdOrZero, ArrayList<Integer> mids) {
         ArrayList<TLRPC.Message> result = new ArrayList<>();

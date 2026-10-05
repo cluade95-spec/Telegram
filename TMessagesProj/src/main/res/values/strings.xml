@@ -11344,6 +11344,8 @@
     <string name="LocalHistoryPreviewEdited">%1$s edited a message</string>
     <string name="LocalHistoryBatch">%1$d messages removed from the chat with %2$s</string>
     <string name="LocalHistoryMediaNotSaved">%1$s · not saved</string>
+    <string name="LocalHistoryMediaNeverDownloaded">%1$s · never downloaded</string>
+    <string name="LocalHistoryMediaTooLarge">%1$s · too large to save</string>
     <string name="LocalHistoryDeleteEntry">Delete from Local History</string>
     <string name="LocalHistoryUnknownSender">Someone</string>
 </resources>

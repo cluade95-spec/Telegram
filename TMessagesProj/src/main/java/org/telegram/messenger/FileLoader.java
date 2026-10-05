@@ -11,6 +11,7 @@ package org.telegram.messenger;
 import android.text.TextUtils;
 import android.util.SparseArray;
 
+import org.telegram.messenger.localhistory.LocalHistoryMediaHolds;
 import org.telegram.tgnet.ConnectionsManager;
 import org.telegram.tgnet.TLObject;
 import org.telegram.tgnet.TLRPC;
@@ -1723,6 +1724,9 @@ public class FileLoader extends BaseController {
         fileLoaderQueue.postRunnable(() -> {
             for (int a = 0; a < files.size(); a++) {
                 File file = files.get(a);
+                if (LocalHistoryMediaHolds.isHeld(file)) { // kept until Local History has copied it
+                    continue;
+                }
                 File encrypted = new File(file.getAbsolutePath() + ".enc");
                 if (encrypted.exists()) {
                     try {

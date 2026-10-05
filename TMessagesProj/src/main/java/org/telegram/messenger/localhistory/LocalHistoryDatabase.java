@@ -317,6 +317,146 @@ public class LocalHistoryDatabase implements LocalHistoryRepository {
         }
     }
 
+    // media
+
+    private static final String MEDIA_COLS = "id, entry_id, revision_idx, state, kind, source_path, local_path, size, created_at";
+
+    @Override
+    public synchronized long insertMedia(Media m) {
+        if (!open()) {
+            return 0;
+        }
+        SQLitePreparedStatement s = null;
+        SQLiteCursor c = null;
+        try {
+            s = db.executeFast("INSERT INTO media(entry_id, revision_idx, state, kind, source_path, local_path, size, created_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?)");
+            s.requery();
+            s.bindLong(1, m.entryId);
+            s.bindInteger(2, m.revisionIdx);
+            s.bindInteger(3, m.state);
+            s.bindInteger(4, m.kind);
+            bindNullable(s, 5, m.sourcePath);
+            bindNullable(s, 6, m.localPath);
+            s.bindLong(7, m.size);
+            s.bindInteger(8, m.createdAt);
+            s.step();
+            c = db.queryFinalized("SELECT last_insert_rowid()");
+            m.id = c.next() ? c.longValue(0) : 0;
+            return m.id;
+        } catch (Throwable e) {
+            FileLog.e(e);
+            return 0;
+        } finally {
+            if (s != null) {
+                s.dispose();
+            }
+            if (c != null) {
+                c.dispose();
+            }
+        }
+    }
+
+    private static void bindNullable(SQLitePreparedStatement s, int index, String value) throws Exception {
+        if (value == null) {
+            s.bindNull(index);
+        } else {
+            s.bindString(index, value);
+        }
+    }
+
+    @Override
+    public synchronized void updateMedia(Media m) {
+        if (!open()) {
+            return;
+        }
+        SQLitePreparedStatement s = null;
+        try {
+            s = db.executeFast("UPDATE media SET state = ?, source_path = ?, local_path = ?, size = ? WHERE id = ?");
+            s.requery();
+            s.bindInteger(1, m.state);
+            bindNullable(s, 2, m.sourcePath);
+            bindNullable(s, 3, m.localPath);
+            s.bindLong(4, m.size);
+            s.bindLong(5, m.id);
+            s.step();
+        } catch (Throwable e) {
+            FileLog.e(e);
+        } finally {
+            if (s != null) {
+                s.dispose();
+            }
+        }
+    }
+
+    private static Media readMedia(SQLiteCursor c) throws Exception {
+        Media m = new Media();
+        m.id = c.longValue(0);
+        m.entryId = c.longValue(1);
+        m.revisionIdx = c.intValue(2);
+        m.state = c.intValue(3);
+        m.kind = c.intValue(4);
+        m.sourcePath = c.isNull(5) ? null : c.stringValue(5);
+        m.localPath = c.isNull(6) ? null : c.stringValue(6);
+        m.size = c.isNull(7) ? 0 : c.longValue(7);
+        m.createdAt = c.isNull(8) ? 0 : c.intValue(8);
+        return m;
+    }
+
+    private List<Media> queryMedia(String sql, Object... args) {
+        List<Media> out = new ArrayList<>();
+        if (!open()) {
+            return out;
+        }
+        SQLiteCursor c = null;
+        try {
+            c = db.queryFinalized(sql, args);
+            while (c.next()) {
+                out.add(readMedia(c));
+            }
+        } catch (Throwable e) {
+            FileLog.e(e);
+        } finally {
+            if (c != null) {
+                c.dispose();
+            }
+        }
+        return out;
+    }
+
+    @Override
+    public synchronized List<Media> mediaForEntry(long entryId) {
+        return queryMedia("SELECT " + MEDIA_COLS + " FROM media WHERE entry_id = ? ORDER BY revision_idx ASC, id ASC", entryId);
+    }
+
+    @Override
+    public synchronized List<Media> mediaByState(int state) {
+        return queryMedia("SELECT " + MEDIA_COLS + " FROM media WHERE state = ? ORDER BY id ASC", state);
+    }
+
+    @Override
+    public synchronized long preservedBytes() {
+        if (!open()) {
+            return 0;
+        }
+        SQLiteCursor c = null;
+        try {
+            c = db.queryFinalized("SELECT COALESCE(SUM(size), 0) FROM media WHERE state = ?", LocalHistoryMediaState.PRESERVED);
+            return c.next() ? c.longValue(0) : 0;
+        } catch (Throwable e) {
+            FileLog.e(e);
+            return 0;
+        } finally {
+            if (c != null) {
+                c.dispose();
+            }
+        }
+    }
+
+    @Override
+    public synchronized List<Media> oldestPreserved(int limit) {
+        return queryMedia("SELECT " + MEDIA_COLS + " FROM media WHERE state = ? ORDER BY created_at ASC, id ASC LIMIT ?", LocalHistoryMediaState.PRESERVED, limit);
+    }
+
     // reads
 
     private static final String ENTRY_COLS = "id, source_dialog_id, source_mid, source_date, first_seen_at, last_event_at, edit_count, deleted_at, batch_id, source_name_snapshot, search_text";

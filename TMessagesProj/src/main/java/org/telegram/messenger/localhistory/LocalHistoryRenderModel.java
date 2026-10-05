@@ -6,6 +6,7 @@ import org.telegram.messenger.R;
 import org.telegram.tgnet.SerializedData;
 import org.telegram.tgnet.TLRPC;
 
+import java.io.File;
 import java.util.HashMap;
 
 /**
@@ -36,12 +37,27 @@ public final class LocalHistoryRenderModel {
         return message;
     }
 
-    /** Applies the G5 rules in place and returns the same message. */
-    public static TLRPC.Message sanitize(TLRPC.Message m, long entryId, long sourceUserId) {
-        String label = mediaLabel(m.media);
-        m.media = new TLRPC.TL_messageMediaEmpty();
-        if (label != null) {
-            String note = LocaleController.formatString(R.string.LocalHistoryMediaNotSaved, label);
+    /**
+     * Applies the G5 rules in place and returns the same message.
+     *
+     * @param mediaFile a local file that holds the media of this revision (preserved copy or Telegram's own cache), or null
+     * @param mediaState the state of the stored media row when there is no file, used for the label
+     */
+    public static TLRPC.Message sanitize(TLRPC.Message m, long entryId, long sourceUserId, File mediaFile, int mediaState) {
+        TLRPC.MessageMedia original = m.media;
+        String label = mediaLabel(original);
+        m.attachPath = "";
+        TLRPC.MessageMedia local = mediaFile != null ? localMedia(original, mediaFile) : null;
+        if (local != null) {
+            m.media = local;
+            m.attachPath = mediaFile.getAbsolutePath();
+        } else {
+            m.media = new TLRPC.TL_messageMediaEmpty();
+        }
+        if (local == null && label != null) {
+            int res = mediaState == LocalHistoryMediaState.NOT_DOWNLOADED ? R.string.LocalHistoryMediaNeverDownloaded
+                    : mediaState == LocalHistoryMediaState.TOO_LARGE ? R.string.LocalHistoryMediaTooLarge : R.string.LocalHistoryMediaNotSaved;
+            String note = LocaleController.formatString(res, label);
             m.message = (m.message == null || m.message.isEmpty()) ? note : m.message + "\n" + note;
         } else if (m.message == null) {
             m.message = "";
@@ -66,7 +82,6 @@ public final class LocalHistoryRenderModel {
         m.ttl = 0;
         m.ttl_period = 0;
         m.destroyTime = 0;
-        m.attachPath = "";
         m.id = (int) Math.min(entryId, Integer.MAX_VALUE);
         m.dialog_id = LocalDialogIds.LOCAL_HISTORY;
         TLRPC.TL_peerUser peer = new TLRPC.TL_peerUser();
@@ -79,7 +94,64 @@ public final class LocalHistoryRenderModel {
     }
 
     public static MessageObject toMessageObject(int account, TLRPC.Message m, long entryId, HashMap<Long, TLRPC.User> users) {
-        return new MessageObject(account, m, users, null, true, false, entryId);
+        boolean hasLocalMedia = m.attachPath != null && !m.attachPath.isEmpty();
+        return new MessageObject(account, m, users, null, true, hasLocalMedia, entryId);
+    }
+
+    /**
+     * A copy of the media that points at a local file only: no remote location, no file reference, no remote
+     * thumbnails, so FileLoader never has anything to request. Returns null for media that cannot be shown locally.
+     */
+    private static TLRPC.MessageMedia localMedia(TLRPC.MessageMedia original, File file) {
+        try {
+            if (original == null) {
+                return null;
+            }
+            if (original.photo != null) {
+                TLRPC.PhotoSize best = null;
+                for (TLRPC.PhotoSize size : original.photo.sizes) {
+                    if (size != null && size.w > 0 && size.h > 0 && (best == null || size.w * size.h > best.w * best.h)) {
+                        best = size;
+                    }
+                }
+                if (best == null) {
+                    return null;
+                }
+                TLRPC.TL_photoSize size = new TLRPC.TL_photoSize();
+                size.type = "x";
+                size.w = best.w;
+                size.h = best.h;
+                size.size = (int) Math.min(file.length(), Integer.MAX_VALUE);
+                size.location = new TLRPC.TL_fileLocationToBeDeprecated();
+                TLRPC.TL_photo photo = new TLRPC.TL_photo();
+                photo.id = original.photo.id;
+                photo.date = original.photo.date;
+                photo.file_reference = new byte[0];
+                photo.sizes.add(size);
+                TLRPC.TL_messageMediaPhoto media = new TLRPC.TL_messageMediaPhoto();
+                media.photo = photo;
+                media.flags |= 1;
+                return media;
+            }
+            if (original.document != null) {
+                TLRPC.Document document = original.document;
+                document.file_reference = new byte[0];
+                document.access_hash = 0;
+                document.dc_id = 0;
+                document.localPath = file.getAbsolutePath();
+                for (int i = document.thumbs.size() - 1; i >= 0; i--) {
+                    TLRPC.PhotoSize thumb = document.thumbs.get(i);
+                    if (!(thumb instanceof TLRPC.TL_photoStrippedSize) && !(thumb instanceof TLRPC.TL_photoCachedSize)) {
+                        document.thumbs.remove(i);
+                    }
+                }
+                document.video_thumbs.clear();
+                return original;
+            }
+        } catch (Throwable e) {
+            org.telegram.messenger.FileLog.e(e);
+        }
+        return null;
     }
 
     private static String mediaLabel(TLRPC.MessageMedia media) {

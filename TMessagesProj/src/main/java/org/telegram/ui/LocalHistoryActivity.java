@@ -18,6 +18,7 @@ import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 
 import org.telegram.messenger.AndroidUtilities;
+import org.telegram.messenger.FileLog;
 import org.telegram.messenger.ImageReceiver;
 import org.telegram.messenger.LocaleController;
 import org.telegram.messenger.MessageObject;
@@ -26,6 +27,7 @@ import org.telegram.messenger.R;
 import org.telegram.messenger.browser.Browser;
 import org.telegram.messenger.localhistory.LocalHistory;
 import org.telegram.messenger.localhistory.LocalHistoryLedger;
+import org.telegram.messenger.localhistory.LocalHistoryMediaState;
 import org.telegram.messenger.localhistory.LocalHistoryRenderModel;
 import org.telegram.messenger.localhistory.LocalHistoryRepository;
 import org.telegram.tgnet.TLRPC;
@@ -41,6 +43,7 @@ import org.telegram.ui.Components.LayoutHelper;
 import org.telegram.ui.Components.RecyclerListView;
 import org.telegram.ui.Components.SizeNotifierFrameLayout;
 
+import java.io.File;
 import java.util.ArrayList;
 import java.util.Calendar;
 import java.util.Collections;
@@ -313,7 +316,24 @@ public class LocalHistoryActivity extends BaseFragment implements NotificationCe
             }
         }
         TLRPC.Message raw = LocalHistoryRenderModel.deserialize(latest.data, latest.text, entry.sourceDate);
-        TLRPC.Message safe = LocalHistoryRenderModel.sanitize(raw, entry.id, userId);
+        File mediaFile = null;
+        int mediaState = LocalHistoryMediaState.NOT_DOWNLOADED;
+        for (LocalHistoryRepository.Media media : repo.mediaForEntry(entry.id)) {
+            if (media.revisionIdx == latest.idx) {
+                mediaState = media.state;
+                if (media.state == LocalHistoryMediaState.PRESERVED && media.localPath != null && new File(media.localPath).isFile()) {
+                    mediaFile = new File(media.localPath);
+                }
+            }
+        }
+        if (mediaFile == null && (MessageObject.getPhoto(raw) != null || MessageObject.getDocument(raw) != null)) {
+            // not preserved (yet): Telegram's own cache may still have it, which is a local file as well
+            File cached = getFileLoader().getPathToMessage(raw);
+            if (cached != null && cached.isFile()) {
+                mediaFile = cached;
+            }
+        }
+        TLRPC.Message safe = LocalHistoryRenderModel.sanitize(raw, entry.id, userId, mediaFile, mediaState);
         Row row = new Row(ROW_MESSAGE, entry.id * 4);
         row.message = LocalHistoryRenderModel.toMessageObject(currentAccount, safe, entry.id, users);
         row.sourceUserId = userId;
@@ -369,8 +389,7 @@ public class LocalHistoryActivity extends BaseFragment implements NotificationCe
         builder.setPositiveButton(LocaleController.getString(R.string.Delete), (d, w) -> {
             final LocalHistory localHistory = LocalHistory.getInstance(currentAccount);
             LocalHistory.getQueue().postRunnable(() -> {
-                localHistory.getLedger().deleteEntry(entryId);
-                localHistory.refreshSummary();
+                localHistory.deleteEntry(entryId);
             });
         });
         builder.setNegativeButton(LocaleController.getString(R.string.Cancel), null);
@@ -405,6 +424,37 @@ public class LocalHistoryActivity extends BaseFragment implements NotificationCe
         avatar.draw(canvas);
         canvas.restore();
     }
+
+    private final PhotoViewer.PhotoViewerProvider photoProvider = new PhotoViewer.EmptyPhotoViewerProvider() {
+        @Override
+        public PhotoViewer.PlaceProviderObject getPlaceForPhoto(MessageObject messageObject, TLRPC.FileLocation fileLocation, int index, boolean needPreview, boolean closing) {
+            if (messageObject == null || listView == null) {
+                return null;
+            }
+            for (int a = 0, count = listView.getChildCount(); a < count; a++) {
+                View view = listView.getChildAt(a);
+                if (view instanceof ChatMessageCell) {
+                    ChatMessageCell cell = (ChatMessageCell) view;
+                    MessageObject message = cell.getMessageObject();
+                    if (message != null && message.getId() == messageObject.getId()) {
+                        ImageReceiver imageReceiver = cell.getPhotoImage();
+                        int[] coords = new int[2];
+                        view.getLocationInWindow(coords);
+                        PhotoViewer.PlaceProviderObject object = new PhotoViewer.PlaceProviderObject();
+                        object.viewX = coords[0];
+                        object.viewY = coords[1];
+                        object.parentView = listView;
+                        object.imageReceiver = imageReceiver;
+                        object.thumb = imageReceiver.getBitmapSafe();
+                        object.radius = imageReceiver.getRoundRadius(true);
+                        object.isEvent = true;
+                        return object;
+                    }
+                }
+            }
+            return null;
+        }
+    };
 
     // adapter
 
@@ -459,6 +509,24 @@ public class LocalHistoryActivity extends BaseFragment implements NotificationCe
                     public void didPressUrl(ChatMessageCell c, android.text.style.CharacterStyle url, boolean longPress) {
                         if (!longPress && url instanceof URLSpan && getParentActivity() != null) {
                             Browser.openUrl(getParentActivity(), ((URLSpan) url).getURL());
+                        }
+                    }
+
+                    @Override
+                    public void didPressImage(ChatMessageCell c, float x, float y, boolean fullPreview) {
+                        MessageObject message = c.getMessageObject();
+                        if (message == null || message.messageOwner == null || TextUtils.isEmpty(message.messageOwner.attachPath)) {
+                            return;
+                        }
+                        if (message.isVideo() || message.type == MessageObject.TYPE_PHOTO || message.isGif()) {
+                            PhotoViewer.getInstance().setParentActivity(LocalHistoryActivity.this);
+                            PhotoViewer.getInstance().openPhoto(message, null, 0, 0, 0, photoProvider);
+                        } else if (getParentActivity() != null) {
+                            try {
+                                AndroidUtilities.openForView(message, getParentActivity(), null, false);
+                            } catch (Exception e) {
+                                FileLog.e(e);
+                            }
                         }
                     }
 

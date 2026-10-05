@@ -80,6 +80,86 @@ class InMemoryRepository implements LocalHistoryRepository {
         return nextBatch++;
     }
 
+    final List<Media> medias = new ArrayList<>();
+    private long nextMediaId = 1;
+
+    @Override
+    public long insertMedia(Media m) {
+        m.id = nextMediaId++;
+        medias.add(copy(m));
+        return m.id;
+    }
+
+    @Override
+    public void updateMedia(Media m) {
+        for (int i = 0; i < medias.size(); i++) {
+            if (medias.get(i).id == m.id) {
+                medias.set(i, copy(m));
+                return;
+            }
+        }
+        throw new IllegalStateException("no media " + m.id);
+    }
+
+    @Override
+    public List<Media> mediaForEntry(long entryId) {
+        List<Media> out = new ArrayList<>();
+        for (Media m : medias) {
+            if (m.entryId == entryId) {
+                out.add(copy(m));
+            }
+        }
+        return out;
+    }
+
+    @Override
+    public List<Media> mediaByState(int state) {
+        List<Media> out = new ArrayList<>();
+        for (Media m : medias) {
+            if (m.state == state) {
+                out.add(copy(m));
+            }
+        }
+        return out;
+    }
+
+    @Override
+    public long preservedBytes() {
+        long n = 0;
+        for (Media m : medias) {
+            if (m.state == LocalHistoryMediaState.PRESERVED) {
+                n += m.size;
+            }
+        }
+        return n;
+    }
+
+    @Override
+    public List<Media> oldestPreserved(int limit) {
+        List<Media> sorted = new ArrayList<>();
+        for (Media m : medias) {
+            if (m.state == LocalHistoryMediaState.PRESERVED) {
+                sorted.add(copy(m));
+            }
+        }
+        sorted.sort(Comparator.<Media>comparingInt(m -> m.createdAt).thenComparingLong(m -> m.id));
+        return sorted.size() > limit ? new ArrayList<>(sorted.subList(0, limit)) : sorted;
+    }
+
+    private static Media copy(Media m) {
+        Media c = new Media();
+        c.id = m.id;
+        c.entryId = m.entryId;
+        c.revisionIdx = m.revisionIdx;
+        c.state = m.state;
+        c.kind = m.kind;
+        c.sourcePath = m.sourcePath;
+        c.localPath = m.localPath;
+        c.size = m.size;
+        c.createdAt = m.createdAt;
+        return c;
+    }
+
     @Override
     public List<Entry> pageFeed(int afterAt, long afterId, int limit) {
         List<Entry> out = new ArrayList<>();
@@ -176,12 +256,14 @@ class InMemoryRepository implements LocalHistoryRepository {
     public void deleteEntry(long id) {
         entries.removeIf(e -> e.id == id);
         revisions.removeIf(r -> r.entryId == id);
+        medias.removeIf(m -> m.entryId == id);
     }
 
     @Override
     public void clear() {
         entries.clear();
         revisions.clear();
+        medias.clear();
     }
 
     private static Entry copy(Entry e) {

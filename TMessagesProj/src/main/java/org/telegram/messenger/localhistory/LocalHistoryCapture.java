@@ -10,6 +10,7 @@ import org.telegram.tgnet.ConnectionsManager;
 import org.telegram.tgnet.SerializedData;
 import org.telegram.tgnet.TLRPC;
 
+import java.io.File;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -68,8 +69,16 @@ public class LocalHistoryCapture {
             if (b == null || a == null) {
                 return;
             }
-            if (LocalHistory.getInstance(currentAccount).getLedger().recordEdit(b, a, now) != 0) {
-                LocalHistory.getInstance(currentAccount).refreshSummary();
+            LocalHistory localHistory = LocalHistory.getInstance(currentAccount);
+            long entryId = localHistory.getLedger().recordEdit(b, a, now);
+            if (entryId != 0) {
+                if (!before.media.equals(after.media)) {
+                    // the old media is about to be deleted by Telegram: hold it now, copy it later
+                    int oldIdx = localHistory.getRepository().revisionCount(entryId) - 2;
+                    registerMedia(entryId, Math.max(oldIdx, 0), oldMessage, now);
+                    localHistory.processMedia();
+                }
+                localHistory.refreshSummary();
             }
             FileLog.d("local history: edit captured");
         } catch (Throwable e) {
@@ -95,6 +104,7 @@ public class LocalHistoryCapture {
             }
             int now = ConnectionsManager.getInstance(currentAccount).getCurrentTime();
             List<LocalHistoryLedger.Snapshot> removed = new ArrayList<>();
+            ArrayList<TLRPC.Message> archived = new ArrayList<>();
             for (TLRPC.Message message : rows) {
                 long dialogId = message.dialog_id != 0 ? message.dialog_id : MessageObject.getDialogId(message);
                 if (!eligible(dialogId, message, now, true)) {
@@ -103,18 +113,61 @@ public class LocalHistoryCapture {
                 LocalHistoryLedger.Snapshot s = snapshot(dialogId, message, contentOf(message), nameOf(dialogId));
                 if (s != null) {
                     removed.add(s);
+                    archived.add(message);
                 }
             }
             if (!removed.isEmpty()) {
-                int n = LocalHistory.getInstance(currentAccount).getLedger().recordDeletions(removed, now);
+                LocalHistory localHistory = LocalHistory.getInstance(currentAccount);
+                int n = localHistory.getLedger().recordDeletions(removed, now);
                 if (n > 0) {
-                    LocalHistory.getInstance(currentAccount).refreshSummary();
+                    boolean anyMedia = false;
+                    for (TLRPC.Message message : archived) {
+                        long dialogId = message.dialog_id != 0 ? message.dialog_id : MessageObject.getDialogId(message);
+                        LocalHistoryRepository.Entry entry = localHistory.getRepository().findEntry(dialogId, message.id);
+                        if (entry != null && entry.deletedAt == now) {
+                            int latest = localHistory.getRepository().revisionCount(entry.id) - 1;
+                            boolean known = false;
+                            for (LocalHistoryRepository.Media media : localHistory.getRepository().mediaForEntry(entry.id)) {
+                                known |= media.revisionIdx == latest;
+                            }
+                            if (!known) {
+                                anyMedia |= registerMedia(entry.id, Math.max(latest, 0), message, now);
+                            }
+                        }
+                    }
+                    if (anyMedia) {
+                        localHistory.processMedia();
+                    }
+                    localHistory.refreshSummary();
                 }
                 FileLog.d("local history: " + n + " removals captured");
             }
         } catch (Throwable e) {
             FileLog.e(e);
         }
+    }
+
+    /** Holds and records the main media file of {@code message}; returns true when there was media to record. */
+    private boolean registerMedia(long entryId, int revisionIdx, TLRPC.Message message, int now) {
+        TLRPC.Photo photo = MessageObject.getPhoto(message);
+        TLRPC.Document document = MessageObject.getDocument(message);
+        if (photo == null && document == null) {
+            return false;
+        }
+        ArrayList<File> candidates = MessagesStorage.getInstance(currentAccount).getFilesOfMessage(message);
+        File main = null;
+        if (photo != null) {
+            for (File f : candidates) {
+                if (f.isFile() && (main == null || f.length() > main.length())) {
+                    main = f;
+                }
+            }
+        } else if (!candidates.isEmpty()) {
+            main = candidates.get(0);
+        }
+        int kind = photo != null ? LocalHistoryMediaState.KIND_PHOTO : LocalHistoryMediaState.KIND_DOCUMENT;
+        LocalHistory.getInstance(currentAccount).getMediaManager().register(entryId, revisionIdx, kind, main == null ? null : main.getAbsolutePath(), now);
+        return true;
     }
 
     // translation

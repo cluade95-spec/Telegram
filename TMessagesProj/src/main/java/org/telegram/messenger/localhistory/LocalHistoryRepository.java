@@ -42,6 +42,18 @@ public interface LocalHistoryRepository {
         public String text;
     }
 
+    final class Media {
+        public long id;
+        public long entryId;
+        public int revisionIdx;
+        public int state;
+        public int kind;
+        public String sourcePath;
+        public String localPath;
+        public long size;
+        public int createdAt;
+    }
+
     /** Runs {@code body} atomically: all of it is stored or none of it. */
     void inTransaction(Runnable body);
 
@@ -59,6 +71,21 @@ public interface LocalHistoryRepository {
     void insertRevision(Revision revision);
 
     long nextBatchId();
+
+    // media bookkeeping
+
+    long insertMedia(Media media);
+
+    void updateMedia(Media media);
+
+    List<Media> mediaForEntry(long entryId);
+
+    List<Media> mediaByState(int state);
+
+    long preservedBytes();
+
+    /** Preserved media, oldest first. */
+    List<Media> oldestPreserved(int limit);
 
     // reads
 
