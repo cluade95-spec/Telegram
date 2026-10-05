@@ -48,6 +48,7 @@ import androidx.core.graphics.drawable.IconCompat;
 
 import com.android.billingclient.api.ProductDetails;
 
+import org.telegram.messenger.localhistory.LocalDialogIds;
 import org.telegram.SQLite.SQLiteCursor;
 import org.telegram.SQLite.SQLiteDatabase;
 import org.telegram.SQLite.SQLiteException;
@@ -7713,6 +7714,9 @@ public class MediaDataController extends BaseController {
     }
 
     public void saveDraft(long dialogId, long threadId, CharSequence message, ArrayList<TLRPC.MessageEntity> entities, TLRPC.Message replyToMessage, ChatActivity.ReplyQuote quote, TLRPC.SuggestedPost suggestedPost, long effectId, boolean noWebpage, boolean clean, TL_iv.RichMessage richMessage) {
+        if (LocalDialogIds.isLocal(dialogId)) { // G3
+            return;
+        }
         TLRPC.DraftMessage draftMessage;
         if (getMessagesController().isForum(dialogId) && threadId == 0) {
             replyToMessage = null;
@@ -7956,6 +7960,9 @@ public class MediaDataController extends BaseController {
     }
 
     public void saveDraft(long dialogId, long threadId, TLRPC.DraftMessage draft, TLRPC.Message replyToMessage, boolean fromServer) {
+        if (LocalDialogIds.isLocal(dialogId)) { // G3
+            return;
+        }
         if (getMessagesController().isForum(dialogId) && threadId == 0 && TextUtils.isEmpty(draft.message)) {
             if (draft.reply_to instanceof TLRPC.TL_inputReplyToMessage) {
                 ((TLRPC.TL_inputReplyToMessage) draft.reply_to).reply_to_msg_id = 0;

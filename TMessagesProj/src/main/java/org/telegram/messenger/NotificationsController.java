@@ -66,6 +66,7 @@ import androidx.core.graphics.drawable.IconCompat;
 
 import com.google.common.collect.Lists;
 
+import org.telegram.messenger.localhistory.LocalDialogIds;
 import org.telegram.messenger.support.LongSparseIntArray;
 import org.telegram.messenger.utils.tlutils.TLKeyboardHelper;
 import org.telegram.messenger.utils.tlutils.TlUtils;
@@ -438,6 +439,9 @@ public class NotificationsController extends BaseController implements Notificat
     }
 
     public void setOpenedDialogId(long dialog_id, long topicId) {
+        if (LocalDialogIds.isLocal(dialog_id)) { // G3
+            return;
+        }
         notificationsQueue.postRunnable(() -> {
             openedDialogId = dialog_id;
             openedTopicId = topicId;

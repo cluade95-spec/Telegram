@@ -51,6 +51,7 @@ import androidx.core.app.NotificationManagerCompat;
 import androidx.core.graphics.ColorUtils;
 import androidx.core.util.Consumer;
 
+import org.telegram.messenger.localhistory.LocalDialogIds;
 import org.telegram.SQLite.SQLiteCursor;
 import org.telegram.SQLite.SQLiteDatabase;
 import org.telegram.SQLite.SQLiteException;
@@ -5890,6 +5891,10 @@ public class MessagesController extends BaseController implements NotificationCe
     }
 
     public TLRPC.InputUser getInputUser(long userId) {
+        if (LocalDialogIds.isLocal(userId)) {
+            localIdLeaked("getInputUser");
+            return new TLRPC.TL_inputUserEmpty();
+        }
         return getInputUser(getUser(userId));
     }
 
@@ -5930,10 +5935,18 @@ public class MessagesController extends BaseController implements NotificationCe
     }
 
     public TLRPC.InputChannel getInputChannel(long chatId) {
+        if (LocalDialogIds.isLocal(chatId)) {
+            localIdLeaked("getInputChannel");
+            return new TLRPC.TL_inputChannelEmpty();
+        }
         return getInputChannel(getChat(chatId));
     }
 
     public TLRPC.InputPeer getInputPeer(TLRPC.Peer peer) {
+        if (peer != null && (LocalDialogIds.isLocal(peer.user_id) || LocalDialogIds.isLocal(peer.chat_id) || LocalDialogIds.isLocal(peer.channel_id))) {
+            localIdLeaked("getInputPeer(Peer)");
+            return new TLRPC.TL_inputPeerEmpty();
+        }
         TLRPC.InputPeer inputPeer;
         if (peer instanceof TLRPC.TL_peerChat) {
             inputPeer = new TLRPC.TL_inputPeerChat();
@@ -5970,7 +5983,19 @@ public class MessagesController extends BaseController implements NotificationCe
         return inputPeer;
     }
 
+    /** G1: the Local History id must never become a request; log it and fail loudly in debug builds. */
+    private static void localIdLeaked(String where) {
+        FileLog.e("local history id reached " + where);
+        if (BuildVars.DEBUG_VERSION) {
+            throw new IllegalStateException("local history dialog id passed to " + where);
+        }
+    }
+
     public TLRPC.InputPeer getInputPeer(long id) {
+        if (LocalDialogIds.isLocal(id)) {
+            localIdLeaked("getInputPeer");
+            return new TLRPC.TL_inputPeerEmpty();
+        }
         TLRPC.InputPeer inputPeer;
         if (id == getUserConfig().getClientUserId()) {
             inputPeer = new TLRPC.TL_inputPeerSelf();
@@ -9320,6 +9345,9 @@ public class MessagesController extends BaseController implements NotificationCe
     }
 
     public void deleteMessages(ArrayList<Integer> messages, ArrayList<Long> randoms, TLRPC.EncryptedChat encryptedChat, long dialogId, boolean forAll, int mode, boolean cacheOnly, long taskId, TLObject taskRequest, int topicId, boolean movedToScheduled, int movedToScheduledMessageId) {
+        if (LocalDialogIds.isLocal(dialogId)) { // G3
+            return;
+        }
         final boolean scheduled = mode == ChatActivity.MODE_SCHEDULED;
         final boolean quickReplies = mode == ChatActivity.MODE_QUICK_REPLIES;
         final boolean welcomeMessages = mode == ChatActivity.MODE_WELCOME_MESSAGES;
@@ -10002,6 +10030,9 @@ public class MessagesController extends BaseController implements NotificationCe
     }
 
     public void deleteDialog(final long did, int onlyHistory, boolean revoke) {
+        if (LocalDialogIds.isLocal(did)) { // G3
+            return;
+        }
         deleteDialog(did, 1, onlyHistory, 0, revoke, null, 0);
     }
 
@@ -11389,6 +11420,9 @@ public class MessagesController extends BaseController implements NotificationCe
     }
 
     public boolean sendTyping(long dialogId, long threadMsgId, int action, String emojicon, int classGuid) {
+        if (LocalDialogIds.isLocal(dialogId)) { // G3
+            return false;
+        }
         if (action < 0 || action >= sendingTypings.length || dialogId == 0) {
             return false;
         }
@@ -14679,6 +14713,9 @@ public class MessagesController extends BaseController implements NotificationCe
     }
 
     public void markDialogAsRead(long dialogId, int maxPositiveId, int maxNegativeId, int maxDate, boolean popup, long threadId, int countDiff, boolean readNow, int scheduledCount) {
+        if (LocalDialogIds.isLocal(dialogId)) { // G3
+            return;
+        }
         boolean createReadTask;
 
         if (threadId != 0) {

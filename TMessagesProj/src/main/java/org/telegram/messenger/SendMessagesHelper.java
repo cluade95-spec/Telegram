@@ -52,6 +52,7 @@ import androidx.collection.LongSparseArray;
 import androidx.core.view.inputmethod.InputContentInfoCompat;
 
 import org.json.JSONObject;
+import org.telegram.messenger.localhistory.LocalDialogIds;
 import org.telegram.messenger.usage.UsageTracker;
 import org.telegram.messenger.audioinfo.AudioInfo;
 import org.telegram.messenger.support.SparseLongArray;
@@ -4259,6 +4260,10 @@ public class SendMessagesHelper extends BaseController implements NotificationCe
     }
 
     public void sendMessage(SendMessageParams sendMessageParams) {
+        if (LocalDialogIds.isLocal(sendMessageParams.peer)) { // G2
+            FileLog.e("local history id reached sendMessage");
+            return;
+        }
         final SendMessageChatArguments sendMessageChatArguments = sendMessageParams.sendMessageChatArguments != null ?
                 sendMessageParams.sendMessageChatArguments : SendMessageChatArguments.EMPTY;
         String message = sendMessageParams.message;
