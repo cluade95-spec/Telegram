@@ -29,6 +29,7 @@ import android.util.SparseIntArray;
 import androidx.annotation.UiThread;
 import androidx.collection.LongSparseArray;
 
+import org.telegram.messenger.localhistory.LocalHistoryCapture;
 import org.telegram.PhoneFormat.PhoneFormat;
 import org.telegram.SQLite.SQLiteCursor;
 import org.telegram.SQLite.SQLiteDatabase;
@@ -16076,6 +16077,11 @@ public class MessagesStorage extends BaseController {
 
     // put messages in data base while load history
     public void putMessages(TLRPC.messages_Messages messages, long dialogId, int load_type, int max_id, boolean createDialog, int mode, long threadMessageId) {
+        putMessages(messages, dialogId, load_type, max_id, createDialog, mode, threadMessageId, false);
+    }
+
+    /** {@code fromEditUpdate} is true only for edit updates arriving from the server (Local History capture). */
+    public void putMessages(TLRPC.messages_Messages messages, long dialogId, int load_type, int max_id, boolean createDialog, int mode, long threadMessageId, boolean fromEditUpdate) {
         storageQueue.postRunnable(() -> {
             SQLitePreparedStatement state_messages = null;
             SQLitePreparedStatement state_messages_topics = null;
@@ -16279,6 +16285,9 @@ public class MessagesStorage extends BaseController {
                                     TLRPC.Message oldMessage = TLRPC.Message.TLdeserialize(data, data.readInt32(false), false);
                                     oldMessage.readAttachPath(data, getUserConfig().clientUserId);
                                     data.reuse();
+                                    if (fromEditUpdate && mode == 0) {
+                                        LocalHistoryCapture.getInstance(currentAccount).onEditStored(oldMessage, message);
+                                    }
                                     if (reactionUpdates != null) {
                                         reactionUpdates.add(new SavedReactionsUpdate(selfId, oldMessage, message));
                                     }
@@ -18091,6 +18100,43 @@ public class MessagesStorage extends BaseController {
             checkSQLException(e);
         }
         return pts[0];
+    }
+
+    /** Storage thread only. Reads the stored rows of user-chat messages about to be removed remotely (Local History). */
+    public ArrayList<TLRPC.Message> getMessagesForArchiveSync(long dialogIdOrZero, ArrayList<Integer> mids) {
+        ArrayList<TLRPC.Message> result = new ArrayList<>();
+        if (mids == null || mids.isEmpty()) {
+            return result;
+        }
+        SQLiteCursor cursor = null;
+        try {
+            String ids = TextUtils.join(",", mids);
+            if (dialogIdOrZero != 0) {
+                cursor = database.queryFinalized(String.format(Locale.US, "SELECT uid, data FROM messages_v2 WHERE mid IN(%s) AND uid = %d AND is_channel = 0", ids, dialogIdOrZero));
+            } else {
+                cursor = database.queryFinalized(String.format(Locale.US, "SELECT uid, data FROM messages_v2 WHERE mid IN(%s) AND is_channel = 0 AND uid > 0", ids));
+            }
+            while (cursor.next()) {
+                NativeByteBuffer data = cursor.byteBufferValue(1);
+                if (data == null) {
+                    continue;
+                }
+                TLRPC.Message message = TLRPC.Message.TLdeserialize(data, data.readInt32(false), false);
+                if (message != null) {
+                    message.readAttachPath(data, getUserConfig().clientUserId);
+                    message.dialog_id = cursor.longValue(0);
+                    result.add(message);
+                }
+                data.reuse();
+            }
+        } catch (Exception e) {
+            checkSQLException(e);
+        } finally {
+            if (cursor != null) {
+                cursor.dispose();
+            }
+        }
+        return result;
     }
 
     public TLRPC.User getUserSync(long userId) {
