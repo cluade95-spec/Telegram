@@ -30,6 +30,7 @@ import org.telegram.messenger.localhistory.LocalHistoryLedger;
 import org.telegram.messenger.localhistory.LocalHistoryMediaState;
 import org.telegram.messenger.localhistory.LocalHistoryRenderModel;
 import org.telegram.messenger.localhistory.LocalHistoryRepository;
+import org.telegram.messenger.localhistory.LocalHistorySearch;
 import org.telegram.tgnet.TLRPC;
 import org.telegram.ui.ActionBar.ActionBar;
 import org.telegram.ui.ActionBar.ActionBarMenu;
@@ -40,6 +41,7 @@ import org.telegram.ui.ActionBar.BaseFragment;
 import org.telegram.ui.ActionBar.Theme;
 import org.telegram.ui.Cells.ChatMessageCell;
 import org.telegram.ui.Components.LayoutHelper;
+import org.telegram.ui.Components.LocalHistoryRevisionsSheet;
 import org.telegram.ui.Components.RecyclerListView;
 import org.telegram.ui.Components.SizeNotifierFrameLayout;
 
@@ -65,6 +67,9 @@ public class LocalHistoryActivity extends BaseFragment implements NotificationCe
 
     private static final int PAGE = 50;
     private static final int menu_clear = 1;
+    private static final int menu_search = 11;
+    private static final int menu_info = 12;
+    private static final int SEARCH_LIMIT = 200;
 
     private static final int ROW_MESSAGE = 0;
     private static final int ROW_PILL = 1;
@@ -99,6 +104,8 @@ public class LocalHistoryActivity extends BaseFragment implements NotificationCe
     private boolean firstLoadDone;
     private int loadToken;
     private LocalHistory.Summary headerSummary;
+    private String searchQuery = "";
+    private ActionBarMenuItem searchItem;
 
     @Override
     public boolean onFragmentCreate() {
@@ -135,11 +142,32 @@ public class LocalHistoryActivity extends BaseFragment implements NotificationCe
                     finishFragment();
                 } else if (id == menu_clear) {
                     confirmClear();
+                } else if (id == menu_info) {
+                    presentFragment(new LocalHistoryProfileActivity());
                 }
             }
         });
+        actionBar.setOnClickListener(v -> presentFragment(new LocalHistoryProfileActivity()));
         ActionBarMenu menu = actionBar.createMenu();
+        searchItem = menu.addItem(menu_search, R.drawable.outline_header_search).setIsSearchField(true).setActionBarMenuItemSearchListener(new ActionBarMenuItem.ActionBarMenuItemSearchListener() {
+            @Override
+            public void onSearchCollapse() {
+                searchQuery = "";
+                reload();
+            }
+
+            @Override
+            public void onTextChanged(android.widget.EditText editText) {
+                String next = LocalHistorySearch.normalize(editText.getText().toString());
+                if (!next.equals(searchQuery)) {
+                    searchQuery = next;
+                    reload();
+                }
+            }
+        });
+        searchItem.setSearchFieldHint(LocaleController.getString(R.string.Search));
         ActionBarMenuItem other = menu.addItem(10, R.drawable.ic_ab_other);
+        other.addSubItem(menu_info, R.drawable.msg_info, LocaleController.getString(R.string.Info));
         other.addSubItem(menu_clear, R.drawable.msg_delete, LocaleController.getString(R.string.ClearHistory));
 
         contentView = new SizeNotifierFrameLayout(context);
@@ -201,7 +229,31 @@ public class LocalHistoryActivity extends BaseFragment implements NotificationCe
     private void reload() {
         loaded.clear();
         endReached = false;
+        if (!searchQuery.isEmpty()) {
+            runSearch();
+            return;
+        }
         loadMore();
+    }
+
+    /** The feed narrows to the entries that match; the archive is never searched anywhere but here (plan B20). */
+    private void runSearch() {
+        loading = false;
+        final int token = ++loadToken;
+        final String query = searchQuery;
+        final LocalHistory localHistory = LocalHistory.getInstance(currentAccount);
+        LocalHistory.getQueue().postRunnable(() -> {
+            List<LocalHistoryRepository.Entry> found = localHistory.search(query, SEARCH_LIMIT);
+            AndroidUtilities.runOnUIThread(() -> {
+                if (token != loadToken || fragmentView == null) {
+                    return;
+                }
+                loaded.clear();
+                loaded.addAll(found);
+                endReached = true;
+                rebuild(false);
+            });
+        });
     }
 
     private void loadMore() {
@@ -250,6 +302,7 @@ public class LocalHistoryActivity extends BaseFragment implements NotificationCe
                 headerSummary = summary;
                 firstLoadDone = true;
                 adapter.notifyDataSetChanged();
+                emptyView.setText(LocaleController.getString(searchQuery.isEmpty() ? R.string.LocalHistoryEmpty : R.string.LocalHistorySearchEmpty));
                 emptyView.setVisibility(rows.isEmpty() ? View.VISIBLE : View.GONE);
                 updateSubtitle();
                 if (keepBottom && atBottom) {
@@ -362,6 +415,7 @@ public class LocalHistoryActivity extends BaseFragment implements NotificationCe
     }
 
     private void updateSubtitle() {
+        actionBar.setTitle(LocalHistory.getInstance(currentAccount).getTitle());
         LocalHistory.Summary s = headerSummary;
         if (s != null) {
             actionBar.setSubtitle(LocaleController.formatString(R.string.LocalHistorySubtitle, s.deleted, s.edited));
@@ -382,6 +436,45 @@ public class LocalHistoryActivity extends BaseFragment implements NotificationCe
         builder.setPositiveButton(LocaleController.getString(R.string.ClearHistory), (d, w) -> LocalHistory.getInstance(currentAccount).clearHistory());
         builder.setNegativeButton(LocaleController.getString(R.string.Cancel), null);
         showDialog(builder.create());
+    }
+
+    private void showEntryOptions(final long entryId) {
+        if (getParentActivity() == null) {
+            return;
+        }
+        LocalHistoryRepository.Entry found = null;
+        for (LocalHistoryRepository.Entry e : loaded) {
+            if (e.id == entryId) {
+                found = e;
+                break;
+            }
+        }
+        final LocalHistoryRepository.Entry entry = found;
+        if (entry == null || (entry.editCount == 0 && !entry.isDeleted())) {
+            confirmDeleteEntry(entryId);
+            return;
+        }
+        AlertDialog.Builder builder = new AlertDialog.Builder(getParentActivity());
+        builder.setItems(new CharSequence[]{LocaleController.getString(R.string.LocalHistoryVersions), LocaleController.getString(R.string.LocalHistoryDeleteEntry)}, (d, which) -> {
+            if (which == 0) {
+                showVersions(entry);
+            } else {
+                confirmDeleteEntry(entryId);
+            }
+        });
+        showDialog(builder.create());
+    }
+
+    private void showVersions(final LocalHistoryRepository.Entry entry) {
+        final LocalHistory localHistory = LocalHistory.getInstance(currentAccount);
+        LocalHistory.getQueue().postRunnable(() -> {
+            final List<LocalHistoryRepository.Revision> revisions = localHistory.getRepository().revisions(entry.id);
+            AndroidUtilities.runOnUIThread(() -> {
+                if (getParentActivity() != null && fragmentView != null) {
+                    showDialog(new LocalHistoryRevisionsSheet(getParentActivity(), revisions, entry.deletedAt));
+                }
+            });
+        });
     }
 
     private void confirmDeleteEntry(long entryId) {
@@ -506,7 +599,7 @@ public class LocalHistoryActivity extends BaseFragment implements NotificationCe
                     public void didLongPress(ChatMessageCell c, float x, float y) {
                         MessageObject message = c.getMessageObject();
                         if (message != null) {
-                            confirmDeleteEntry(message.eventId);
+                            showEntryOptions(message.eventId);
                         }
                     }
 

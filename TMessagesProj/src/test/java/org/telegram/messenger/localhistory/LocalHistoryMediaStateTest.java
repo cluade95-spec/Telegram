@@ -196,4 +196,21 @@ public class LocalHistoryMediaStateTest {
         manager.deleteFilesOf(1);
         assertFalse(files.exists(local));
     }
+
+    @Test
+    public void evictAllFreesEveryPreservedFileAndKeepsTheRows() {
+        for (int i = 1; i <= 3; i++) {
+            files.sizes.put("/cache/" + i, 40L);
+            manager.register(i, 0, LocalHistoryMediaState.KIND_PHOTO, "/cache/" + i, 10);
+        }
+        manager.processPending();
+        assertEquals(120, repo.preservedBytes());
+        assertEquals(3, manager.evictAll());
+        assertEquals(0, repo.preservedBytes());
+        for (int i = 1; i <= 3; i++) {
+            assertEquals(LocalHistoryMediaState.EVICTED, only(i).state);
+            assertNull(only(i).localPath);
+        }
+        assertEquals(0, manager.evictAll());
+    }
 }

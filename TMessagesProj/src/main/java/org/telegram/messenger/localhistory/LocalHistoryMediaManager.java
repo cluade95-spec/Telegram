@@ -129,6 +129,19 @@ public class LocalHistoryMediaManager {
         repo.updateMedia(media);
     }
 
+    /** Frees every preserved copy and keeps the rows, so entries show that their media is gone ("Delete saved media"). */
+    public int evictAll() {
+        int count = 0;
+        List<LocalHistoryRepository.Media> preserved;
+        while (!(preserved = repo.oldestPreserved(100)).isEmpty()) {
+            for (LocalHistoryRepository.Media media : preserved) {
+                evict(media);
+                count++;
+            }
+        }
+        return count;
+    }
+
     /** Deletes the preserved files of one entry; call before removing the entry itself. */
     public void deleteFilesOf(long entryId) {
         for (LocalHistoryRepository.Media media : repo.mediaForEntry(entryId)) {

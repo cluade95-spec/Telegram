@@ -29,7 +29,7 @@ import org.telegram.ui.Components.LayoutHelper;
  */
 public class LocalHistoryRowCell extends FrameLayout {
 
-    private final ImageView avatar;
+    private final org.telegram.ui.Components.LocalHistoryAvatarView avatar;
     private final TextView title;
     private final TextView preview;
     private final TextView time;
@@ -40,11 +40,7 @@ public class LocalHistoryRowCell extends FrameLayout {
         super(context);
         setWillNotDraw(false);
 
-        avatar = new ImageView(context);
-        avatar.setScaleType(ImageView.ScaleType.CENTER);
-        avatar.setImageResource(R.drawable.msg_recent);
-        avatar.setColorFilter(new PorterDuffColorFilter(0xffffffff, PorterDuff.Mode.SRC_IN));
-        avatar.setBackground(Theme.createCircleDrawable(dp(56), Theme.getColor(Theme.key_avatar_backgroundBlue)));
+        avatar = new org.telegram.ui.Components.LocalHistoryAvatarView(context, 56);
         addView(avatar, LayoutHelper.createFrame(56, 56, (LocaleController.isRTL ? Gravity.RIGHT : Gravity.LEFT) | Gravity.TOP, 10, 7, 10, 0));
 
         title = new TextView(context);
@@ -87,6 +83,8 @@ public class LocalHistoryRowCell extends FrameLayout {
         setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundWhite));
         String name = summary != null && summary.title != null && !summary.title.isEmpty() ? summary.title : LocaleController.getString(R.string.LocalHistoryTitle);
         title.setText(name);
+        boolean photoHidden = org.telegram.messenger.ProtectedChats.shouldHideContent(UserConfig.selectedAccount, org.telegram.messenger.localhistory.LocalDialogIds.LOCAL_HISTORY);
+        avatar.setPhoto(photoHidden ? null : LocalHistory.getInstance(UserConfig.selectedAccount).getPhoto(), 56);
         title.setTextColor(Theme.getColor(Theme.key_chats_name));
         preview.setTextColor(Theme.getColor(Theme.key_chats_message));
         time.setTextColor(Theme.getColor(Theme.key_chats_date));

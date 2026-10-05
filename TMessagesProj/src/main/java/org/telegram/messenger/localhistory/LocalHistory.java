@@ -22,6 +22,7 @@ public class LocalHistory {
 
     private static final String META_LAST_READ_AT = "last_read_at";
     private static final String META_TITLE = "title";
+    private static final String META_PHOTO = "photo_path";
     private static DispatchQueue queue;
 
     /** What the chat-list row shows; computed on the feature queue, read from anywhere. */
@@ -62,6 +63,73 @@ public class LocalHistory {
     }
 
     private volatile String title;
+    private volatile android.graphics.Bitmap photo;
+
+    /** The chat's photo as saved by the user, or null for the default icon. Loaded with the summary. */
+    public android.graphics.Bitmap getPhoto() {
+        return photo;
+    }
+
+    /** True once the user gave the chat a name of their own. */
+    public boolean hasCustomTitle() {
+        return title != null && !title.isEmpty();
+    }
+
+    /** Stores the name locally; blank restores the default. Nothing is sent anywhere. */
+    public void setTitle(String value) {
+        final String clean = value == null || value.trim().isEmpty() ? null : value.trim();
+        title = clean;
+        getQueue().postRunnable(() -> {
+            getRepository().setMeta(META_TITLE, clean);
+            refreshSummary();
+        });
+    }
+
+    /** Stores a square JPEG for the chat in the feature directory; null removes it. Nothing is uploaded. */
+    public void setPhoto(android.graphics.Bitmap bitmap) {
+        getQueue().postRunnable(() -> {
+            File file = new File(directoryFor(UserConfig.getInstance(currentAccount).getClientUserId()), "avatar.jpg");
+            if (bitmap == null) {
+                file.delete();
+                getRepository().setMeta(META_PHOTO, null);
+            } else {
+                try (java.io.FileOutputStream out = new java.io.FileOutputStream(file)) {
+                    android.graphics.Bitmap square = android.graphics.Bitmap.createScaledBitmap(bitmap, 320, 320, true);
+                    square.compress(android.graphics.Bitmap.CompressFormat.JPEG, 88, out);
+                    getRepository().setMeta(META_PHOTO, file.getName());
+                } catch (Exception e) {
+                    org.telegram.messenger.FileLog.e(e);
+                }
+            }
+            refreshSummary();
+        });
+    }
+
+    private android.graphics.Bitmap loadPhoto() {
+        String name = getRepository().getMeta(META_PHOTO);
+        if (name == null) {
+            return null;
+        }
+        return android.graphics.BitmapFactory.decodeFile(new File(directoryFor(UserConfig.getInstance(currentAccount).getClientUserId()), name).getAbsolutePath());
+    }
+
+    /** Archive search for the in-chat search field; feature queue only. */
+    public List<LocalHistoryRepository.Entry> search(String query, int limit) {
+        return LocalHistorySearch.search(getRepository(), query, limit);
+    }
+
+    /** Bytes of preserved media; feature queue only. */
+    public long savedMediaBytes() {
+        return getRepository().preservedBytes();
+    }
+
+    /** Frees all preserved media and keeps the entries. */
+    public void deleteSavedMedia() {
+        getQueue().postRunnable(() -> {
+            getMediaManager().evictAll();
+            refreshSummary();
+        });
+    }
 
     /** The chat's name: the one the user chose, else the default. Cached; loaded with the summary. */
     public String getTitle() {
@@ -104,6 +172,7 @@ public class LocalHistory {
             Summary next = null;
             if (isEnabled() || databaseExists()) {
                 title = getRepository().getMeta(META_TITLE);
+                photo = loadPhoto();
                 next = computeSummary();
             }
             summary = next;
@@ -248,6 +317,8 @@ public class LocalHistory {
         mediaManager = null;
         copier = null;
         summary = null;
+        title = null;
+        photo = null;
         AndroidUtilities.runOnUIThread(() -> NotificationCenter.getInstance(currentAccount).postNotificationName(NotificationCenter.localHistoryChanged));
     }
 
@@ -260,6 +331,8 @@ public class LocalHistory {
         mediaManager = null;
         copier = null;
         summary = null;
+        title = null;
+        photo = null;
         enabledLoaded = false;
     }
 

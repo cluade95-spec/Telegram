@@ -11348,4 +11348,19 @@
     <string name="LocalHistoryMediaTooLarge">%1$s · too large to save</string>
     <string name="LocalHistoryDeleteEntry">Delete from Local History</string>
     <string name="LocalHistoryUnknownSender">Someone</string>
+    <string name="LocalHistorySearchEmpty">No matches</string>
+    <string name="LocalHistoryVersions">Version history</string>
+    <string name="LocalHistoryVersionOriginal">Original</string>
+    <string name="LocalHistoryVersionEdit">Edit %1$d</string>
+    <string name="LocalHistoryVersionRemoved">Removed from the chat</string>
+    <string name="LocalHistoryVersionEarlierNotSeen">Earlier versions were not seen.</string>
+    <string name="LocalHistoryEditTitle">Edit Local History</string>
+    <string name="LocalHistoryNameHint">Name</string>
+    <string name="LocalHistorySetPhoto">Set photo</string>
+    <string name="LocalHistoryRemovePhoto">Remove photo</string>
+    <string name="LocalHistorySavedMedia">Saved media</string>
+    <string name="LocalHistorySavedMediaSize">Saved media on this device: %1$s</string>
+    <string name="LocalHistoryDeleteMedia">Delete saved media</string>
+    <string name="LocalHistoryDeleteMediaConfirm">Delete all saved photos, videos and files from Local History? The messages stay.</string>
+    <string name="LocalHistoryAbout">Local History keeps a copy of messages that other people edit or remove in your private chats. It is saved only on this device, is not backed up and is never sent anywhere. Removals you make on your other devices also appear here, because they cannot be told apart. The name and photo are local too.</string>
 </resources>
