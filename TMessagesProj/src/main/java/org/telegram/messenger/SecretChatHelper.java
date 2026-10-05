@@ -743,6 +743,9 @@ public class SecretChatHelper extends BaseController {
                         }
                     }
                     if (error == null) {
+                        if (isSecretVisibleMessage(newMsgObj)) {
+                            org.telegram.messenger.usage.UsageTracker.onMessageSent(getUserConfig().getClientUserId(), newMsgObj.dialog_id, newMsgObj.random_id, true, ((TLRPC.messages_SentEncryptedMessage) response).date * 1000L);
+                        }
                         String attachPath = newMsgObj.attachPath;
                         TLRPC.messages_SentEncryptedMessage res = (TLRPC.messages_SentEncryptedMessage) response;
                         if (isSecretVisibleMessage(newMsgObj)) {

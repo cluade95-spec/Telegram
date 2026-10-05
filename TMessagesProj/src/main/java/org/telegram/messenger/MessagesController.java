@@ -16758,6 +16758,7 @@ public class MessagesController extends BaseController implements NotificationCe
                                     if (message instanceof TLRPC.TL_messageEmpty) {
                                         continue;
                                     }
+                                    org.telegram.messenger.usage.UsageSendObserver.scheduledDelivery(getUserConfig().getClientUserId(), message);
                                     message.unread = !(channelFinal != null && channelFinal.left || (message.out ? outboxValue : inboxValue) >= message.id || message.action instanceof TLRPC.TL_messageActionChannelCreate);
 
                                     boolean isDialogCreated = createdDialogIds.contains(dialogId);
@@ -17039,6 +17040,7 @@ public class MessagesController extends BaseController implements NotificationCe
                                         message.out = true;
                                     }
 
+                                    org.telegram.messenger.usage.UsageSendObserver.scheduledDelivery(clientUserId, message);
                                     boolean isDialogCreated = createdDialogIds.contains(message.dialog_id);
                                     MessageObject obj = new MessageObject(currentAccount, message, usersDict, chatsDict, isDialogCreated, isDialogCreated);
 
@@ -18642,6 +18644,7 @@ public class MessagesController extends BaseController implements NotificationCe
                     }
                     arr.add(obj);
                 } else {
+                    org.telegram.messenger.usage.UsageSendObserver.scheduledDelivery(clientUserId, message);
                     if (messagesArr == null) {
                         messagesArr = new ArrayList<>();
                     }

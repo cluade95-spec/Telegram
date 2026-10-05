@@ -6,6 +6,10 @@ import java.util.Objects;
 
 /** Event-driven accounting. All calls are serialized by the owner, normally the UI thread. */
 public final class UsageAccountant {
+    public interface CreditListener {
+        void credited(SurfaceKey owner, long elapsedStart, long wallStart, long duration, ZoneId zone);
+    }
+    private final CreditListener listener;
     private final UsageClock clock;
     private final UsageLedger ledger = new UsageLedger();
     private long cursorElapsed;
@@ -19,6 +23,11 @@ public final class UsageAccountant {
     private SurfaceKey call;
 
     public UsageAccountant(UsageClock clock) {
+        this(clock, null);
+    }
+
+    public UsageAccountant(UsageClock clock, CreditListener listener) {
+        this.listener = listener;
         this.clock = Objects.requireNonNull(clock);
         cursorElapsed = clock.elapsed();
         cursorWall = clock.wallMillis();
@@ -42,6 +51,7 @@ public final class UsageAccountant {
                 }
             }
             ledger.add(owner, cursorWall, credit, cursorZone);
+            if (credit > 0 && listener != null) listener.credited(owner, cursorElapsed, cursorWall, credit, cursorZone);
         }
         cursorElapsed = Math.max(cursorElapsed, now);
         cursorWall = clock.wallMillis();

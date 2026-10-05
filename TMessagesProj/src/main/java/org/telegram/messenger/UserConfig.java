@@ -459,6 +459,7 @@ public class UserConfig extends BaseController {
     }
 
     public void clearConfig() {
+        org.telegram.messenger.usage.UsageTracker.onAccountRemoved(getClientUserId());
         ProtectedChats.onAccountRemoved(getClientUserId());
         getPreferences().edit().clear().apply();
         SyncedLyricsController.getInstance(currentAccount).clear();

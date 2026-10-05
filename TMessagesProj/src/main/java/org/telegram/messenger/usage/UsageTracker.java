@@ -21,13 +21,17 @@ import org.telegram.ui.Components.ForegroundDetector;
 import java.lang.ref.WeakReference;
 import java.time.ZoneId;
 import java.util.Map;
+import java.util.ArrayList;
+import org.telegram.messenger.MessagesController;
+import org.telegram.tgnet.TLRPC;
 
 /** One application-lifetime observer; accounting and Telegram state reads stay on the UI thread. */
 public final class UsageTracker implements NotificationCenter.NotificationCenterDelegate, ForegroundDetector.Listener,
         Application.ActivityLifecycleCallbacks {
     private static UsageTracker instance;
     private final EventClock clock = new EventClock();
-    private final UsageAccountant accountant = new UsageAccountant(clock);
+    private final UsageMetrics metrics = new UsageMetrics();
+    private final UsageAccountant accountant = new UsageAccountant(clock, metrics);
     private final UsageInputBuffer inputs = new UsageInputBuffer(this::deliverInput);
     private WeakReference<Activity> host = new WeakReference<>(null);
     private boolean resolvePosted;
@@ -36,6 +40,9 @@ public final class UsageTracker implements NotificationCenter.NotificationCenter
     private long connectedCallAccount;
     private long lastEvent;
     private SurfaceKey resolved;
+    private boolean wasForeground;
+    private boolean wasPassive;
+    private int lastMigrationDay;
     private final Runnable resolveRunnable = () -> { resolvePosted = false; resolveNow(); };
     private final VoIPService.StateListener callListener = new VoIPService.StateListener() {
         @Override public void onStateChanged(int state) {
@@ -47,6 +54,7 @@ public final class UsageTracker implements NotificationCenter.NotificationCenter
             connectedCallAccount = account;
             accountant.onCall(account == 0 ? null : new SurfaceKey(account, UsageSurface.CALL, 0));
             resolveNow();
+            flushNow();
         }
     };
 
@@ -73,6 +81,8 @@ public final class UsageTracker implements NotificationCenter.NotificationCenter
         }
         accountant.onScreen(ApplicationLoader.isScreenOn);
         accountant.onForeground(ForegroundDetector.getInstance().isForeground());
+        wasForeground = ForegroundDetector.getInstance().isForeground();
+        if (wasForeground) metrics.opened(selectedUser(), clock.wallMillis(), clock.zone());
         observeCallService();
     }
 
@@ -102,6 +112,7 @@ public final class UsageTracker implements NotificationCenter.NotificationCenter
         accountant.onInput();
         lastEvent = elapsed;
         clock.event = -1;
+        if (accountant.pendingMillis() >= 300_000) onNavigationChanged();
     }
 
     private void prepareEvent() {
@@ -124,7 +135,11 @@ public final class UsageTracker implements NotificationCenter.NotificationCenter
             resolved = key;
             accountant.onSurface(key.accountUserId == 0 ? null : key);
         }
-        accountant.onPassive(passive());
+        boolean engaged = passive();
+        accountant.onPassive(engaged);
+        boolean changed = wasPassive != engaged;
+        wasPassive = engaged;
+        if (changed || accountant.pendingMillis() >= 300_000) flushNow();
     }
 
     private boolean passive() {
@@ -147,6 +162,73 @@ public final class UsageTracker implements NotificationCenter.NotificationCenter
         connectedCallAccount = 0;
         accountant.onCall(null);
         if (service != null) service.registerStateListener(callListener);
+        flushNow();
+    }
+
+    private static long selectedUser() { return UserConfig.getInstance(UserConfig.selectedAccount).getClientUserId(); }
+
+    private void flushNow() { flushNow(0); }
+
+    private void flushNow(long removedAccount) {
+        prepareEvent();
+        ArrayList<UsageStore.Migration> migrations = new ArrayList<>();
+        int migrationDay=UsageMetrics.day(java.time.LocalDate.now());
+        if (migrationDay!=lastMigrationDay) for (int slot=0; slot<UserConfig.MAX_ACCOUNT_COUNT; slot++) {
+            long uid=UserConfig.getInstance(slot).getClientUserId();
+            if (uid==0) continue;
+            for (TLRPC.Chat chat:MessagesController.getInstance(slot).getChats().values()) {
+                if (chat.migrated_to!=null) migrations.add(new UsageStore.Migration(uid,-chat.id,-chat.migrated_to.channel_id));
+            }
+        }
+        lastMigrationDay=migrationDay;
+        UsageStore.getInstance().flush(accountant.drain(), metrics.drain(), migrations, removedAccount);
+    }
+
+    public static void flush() {
+        if (instance == null) init();
+        instance.resolveNow();
+        instance.flushNow();
+    }
+
+    public static void reset(java.util.function.Consumer<Boolean> done) {
+        if (instance == null) init();
+        instance.prepareEvent();
+        instance.accountant.drain();
+        instance.metrics.reset();
+        UsageStore.getInstance().reset(done);
+    }
+
+    public static void onAccountRemoved(long uid) {
+        AndroidUtilities.runOnUIThread(() -> {
+            if (instance != null) {
+                instance.prepareEvent();
+                if (instance.connectedCallAccount==uid) {
+                    instance.accountant.onCall(null);
+                    instance.connectedCallAccount=0;
+                }
+                if (instance.resolved!=null && instance.resolved.accountUserId==uid) {
+                    instance.accountant.onSurface(null);
+                    instance.resolved=null;
+                }
+                instance.flushNow(uid);
+                instance.metrics.endSession();
+            } else UsageStore.getInstance().onAccountRemoved(uid);
+            onNavigationChanged();
+        });
+    }
+
+    /** Captured identity is independent of account-slot reuse; storage deduplicates atomically. */
+    public static void onMessageSent(long uid, long dialog, long message, boolean secret, long deliveredWall) {
+        if (!UsageSendIdentity.eligible(uid,message,true,true,false,secret)) return;
+        long observedWall=System.currentTimeMillis();
+        ZoneId zone=ZoneId.systemDefault();
+        AndroidUtilities.runOnUIThread(() -> {
+            if (instance==null) init();
+            instance.prepareEvent();
+            instance.accountant.checkpoint();
+            UsageStore.getInstance().confirmed(uid,dialog,message,secret,Math.min(observedWall,deliveredWall),zone);
+            instance.flushNow();
+        });
     }
 
     public static Map<UsageLedger.BucketKey, Long> drain() {
@@ -159,11 +241,14 @@ public final class UsageTracker implements NotificationCenter.NotificationCenter
         if (id == NotificationCenter.screenStateChanged) {
             prepareEvent();
             accountant.onScreen(ApplicationLoader.isScreenOn);
+            if (!ApplicationLoader.isScreenOn) flushNow();
         } else if (id == NotificationCenter.didStartedCall || id == NotificationCenter.didEndCall || id == NotificationCenter.voipServiceCreated) {
             observeCallService();
         } else if (id == NotificationCenter.activeAccountChanged) {
             prepareEvent();
             accountant.onSurface(null);
+            flushNow();
+            if (connectedCallAccount==0) metrics.endSession();
             resolved = null;
         }
         onNavigationChanged();
@@ -173,6 +258,8 @@ public final class UsageTracker implements NotificationCenter.NotificationCenter
         configurationTransition = false;
         prepareEvent();
         accountant.onForeground(true);
+        if (!wasForeground) metrics.opened(selectedUser(), clock.wallMillis(), clock.zone());
+        wasForeground=true;
         onNavigationChanged();
     }
     @Override public void onBecameBackground() {
@@ -183,6 +270,9 @@ public final class UsageTracker implements NotificationCenter.NotificationCenter
         }
         prepareEvent();
         accountant.onForeground(false);
+        wasForeground=false;
+        metrics.endSession();
+        flushNow();
     }
     @Override public void onActivityResumed(Activity activity) { host = new WeakReference<>(activity); onNavigationChanged(); }
     @Override public void onActivityDestroyed(Activity activity) { if (host.get() == activity) host.clear(); }

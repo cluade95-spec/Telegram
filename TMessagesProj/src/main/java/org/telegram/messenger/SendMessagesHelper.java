@@ -2591,6 +2591,7 @@ public class SendMessagesHelper extends BaseController implements NotificationCe
                     final Runnable send = () -> {
                         getConnectionsManager().sendRequest(req, (response, error) -> {
                             if (error == null) {
+                                org.telegram.messenger.usage.UsageSendObserver.reply(getUserConfig().getClientUserId(), peer, response);
                                 SparseLongArray newMessagesByIds = new SparseLongArray();
                                 TLRPC.Updates updates = (TLRPC.Updates) response;
                                 for (int a1 = 0; a1 < updates.updates.size(); a1++) {
@@ -7622,6 +7623,7 @@ public class SendMessagesHelper extends BaseController implements NotificationCe
             AndroidUtilities.runOnUIThread(() -> {
                 boolean isSentError = false;
                 if (error == null) {
+                    org.telegram.messenger.usage.UsageSendObserver.reply(getUserConfig().getClientUserId(), msgObjs.get(0).getDialogId(), response);
                     SparseArray<TLRPC.Message> newMessages = new SparseArray<>();
                     LongSparseArray<Integer> newIds = new LongSparseArray<>();
                     final TLRPC.Updates updates = (TLRPC.Updates) response;
@@ -8108,6 +8110,7 @@ public class SendMessagesHelper extends BaseController implements NotificationCe
                     boolean currentSchedule = scheduled;
                     boolean isSentError = false;
                     if (error == null) {
+                        org.telegram.messenger.usage.UsageSendObserver.reply(getUserConfig().getClientUserId(), newMsgObj.dialog_id, response);
                         final int oldId = newMsgObj.id;
                         final ArrayList<TLRPC.Message> sentMessages = new ArrayList<>();
                         final String attachPath = newMsgObj.attachPath;
