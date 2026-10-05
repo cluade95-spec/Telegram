@@ -14694,6 +14694,7 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
                     new SearchResult(121, getString(R.string.TerminateAllSessions), "terminateAllSessionsRow", getString(R.string.Devices), R.drawable.msg2_devices, () -> f.presentFragment(new SessionsActivity(0))).withLink("tg://settings/devices/terminate-sessions"),
                     new SearchResult(122, getString(R.string.LinkDesktopDevice), getString(R.string.Devices), R.drawable.msg2_devices, () -> f.presentFragment(new SessionsActivity(0).setHighlightLinkDesktopDevice())).withLink("tg://settings/devices/link-desktop"),
 
+                    new SearchResult(1000, getString(R.string.UsageActivityTitle), R.drawable.msg_stats, () -> f.presentFragment(new UsageReportActivity())),
                     new SearchResult(200, getString(R.string.DataSettings), R.drawable.msg2_data, () -> f.presentFragment(new DataSettingsActivity())).withLink("tg://settings/privacy/data-settings"),
                     new SearchResult(201, getString(R.string.DataUsage), "usageSectionRow", getString(R.string.DataSettings), R.drawable.msg2_data, () -> f.presentFragment(new DataSettingsActivity())),
                     new SearchResult(202, getString(R.string.StorageUsage), getString(R.string.DataSettings), R.drawable.msg2_data, () -> f.presentFragment(new CacheControlActivity())).withLink("tg://settings/data/storage"),

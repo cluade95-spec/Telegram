@@ -167,12 +167,26 @@ public final class UsageTracker implements NotificationCenter.NotificationCenter
         }
     }
 
-    /** Flushes in-memory time to the store, then reports (dashboard open, reset). */
+    /** Flushes in-memory time to the store (dashboard open, reset). */
     public static void flushNow() {
+        flushThen(null);
+    }
+
+    /** Flushes, then runs the action on the UI thread; the store queue keeps the write ahead of anything posted by it. */
+    public static void flushThen(Runnable then) {
         UsageTracker t = instance;
-        if (t != null) {
-            t.onUi(t::flush);
+        if (t == null) {
+            if (then != null) {
+                then.run();
+            }
+            return;
         }
+        t.onUi(() -> {
+            t.flush();
+            if (then != null) {
+                then.run();
+            }
+        });
     }
 
     // internals

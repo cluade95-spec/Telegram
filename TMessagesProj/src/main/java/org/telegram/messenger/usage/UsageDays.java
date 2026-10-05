@@ -56,4 +56,21 @@ public final class UsageDays {
     public static int dayOfWeekMonday0(int day) {
         return (int) Math.floorMod(toEpochDay(day) + 3, 7L);
     }
+
+    public static int daysInMonth(int day) {
+        int y = day / 10000;
+        int m = (day / 100) % 100;
+        int first = y * 10000 + m * 100 + 1;
+        int nextFirst = m == 12 ? (y + 1) * 10000 + 101 : y * 10000 + (m + 1) * 100 + 1;
+        return (int) (toEpochDay(nextFirst) - toEpochDay(first));
+    }
+
+    public static int firstOfMonth(int day) {
+        return day / 100 * 100 + 1;
+    }
+
+    /** Whole days from a to b (b - a), both yyyymmdd. */
+    public static int daysBetween(int a, int b) {
+        return (int) (toEpochDay(b) - toEpochDay(a));
+    }
 }
