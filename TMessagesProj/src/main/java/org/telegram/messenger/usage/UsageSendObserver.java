@@ -7,11 +7,15 @@ import org.telegram.tgnet.tl.TL_update;
 
 /** Read-only adapters for verified actual-delivery replies and scheduled-delivery updates. */
 public final class UsageSendObserver {
+    interface Delivery { void confirmed(long account,long dialog,long id,int date); }
+    private static final Delivery DELIVERY=(account,dialog,id,date)->UsageTracker.onMessageSent(account,dialog,id,false);
     private UsageSendObserver() { }
-    public static void reply(long account, long dialog, TLObject response) {
-        if (response instanceof TLRPC.TL_updateShortSentMessage) {
+    public static void reply(long account, long dialog, TLObject response, boolean scheduling) { reply(account,dialog,response,scheduling,DELIVERY); }
+    static void reply(long account, long dialog, TLObject response, Delivery delivery) { reply(account,dialog,response,false,delivery); }
+    static void reply(long account, long dialog, TLObject response, boolean scheduling, Delivery delivery) {
+        if (response instanceof TLRPC.TL_updateShortSentMessage && !scheduling) {
             TLRPC.TL_updateShortSentMessage sent=(TLRPC.TL_updateShortSentMessage)response;
-            confirm(account,dialog,sent.id,sent.date,sent.out);
+            confirm(account,dialog,sent.id,sent.date,sent.out,delivery);
         } else if (response instanceof TLRPC.Updates) {
             for (TLRPC.Update update:((TLRPC.Updates)response).updates) {
                 TLRPC.Message message=null;
@@ -19,19 +23,20 @@ public final class UsageSendObserver {
                 else if (update instanceof TL_update.TL_updateNewChannelMessage) message=((TL_update.TL_updateNewChannelMessage)update).message;
                 // NewScheduledMessage, quick-reply templates, and errors are never delivery confirmations.
                 if (message!=null && !(message instanceof TLRPC.TL_messageService))
-                    confirm(account,MessageObject.getDialogId(message),message.id,message.date,outgoing(account,message));
+                    confirm(account,MessageObject.getDialogId(message),message.id,message.date,outgoing(account,message),delivery);
             }
         }
     }
     private static boolean outgoing(long account, TLRPC.Message message) {
         return message.out || message.from_id!=null && message.from_id.user_id==account;
     }
-    public static void scheduledDelivery(long account, TLRPC.Message message) {
+    public static void scheduledDelivery(long account, TLRPC.Message message) { scheduledDelivery(account,message,DELIVERY); }
+    static void scheduledDelivery(long account, TLRPC.Message message, Delivery delivery) {
         if (message.from_scheduled && !(message instanceof TLRPC.TL_messageService))
-            confirm(account,MessageObject.getDialogId(message),message.id,message.date,outgoing(account,message));
+            confirm(account,MessageObject.getDialogId(message),message.id,message.date,outgoing(account,message),delivery);
     }
-    private static void confirm(long account,long dialog,long id,int date,boolean outgoing) {
+    private static void confirm(long account,long dialog,long id,int date,boolean outgoing,Delivery delivery) {
         if (UsageSendIdentity.eligible(account,id,outgoing,true,false,false))
-            UsageTracker.onMessageSent(account,dialog,id,false,date*1000L);
+            delivery.confirmed(account,dialog,id,date);
     }
 }

@@ -7,6 +7,8 @@ python3 tests/activity/run_jvm.py
 python3 tests/activity/test_storage_sql.py
 python3 tests/activity/check_resources.py
 python3 tests/activity/negative_controls.py
+python3 tests/activity/audit_source.py
+python3 tests/activity/check_java_syntax.py
 ```
 
 The JVM runner compiles current pure production sources and every Activity JVM test, plus the
@@ -27,3 +29,14 @@ The mutation runner changes only temporary copies: removing the idle cap and dou
 must fail the existing accountant suite. Report math covers locale week starts, calendar months,
 partial-hour Today comparison, exact chart/category sums, migration, isolation, rounded percentages,
 secondary metrics and the 50-chat display limit.
+
+`UsageSendObserverTest` in the Android test module exercises scheduling acknowledgment exclusion,
+actual ordinary/scheduled confirmations, and incoming/local-id exclusion against real TL types.
+It is **UNEXECUTED** without Android compilation/device support. The source audit checks existing
+Protected Chats call ordering, local-only source contracts and scope; it is not runtime validation.
+`python3 tests/activity/benchmark_storage.py` is an optional host size/query sample. Its retained
+bucket sample models 300 hourly rows/day for 90 days and 40 daily dialog rows/day thereafter.
+It reports separately the extra space for persistent opaque confirmation digests.
+
+The JDK syntax parser covers changed Java files without resolving Android types. Passing this check
+does not mean Android code has compiled; Android type checking remains **UNEXECUTED**.

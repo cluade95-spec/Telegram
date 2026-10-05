@@ -38,6 +38,9 @@ public class UsageStoreTest {
         UsageStore.Report report=query(store); assertEquals(1,report.rows.size()); assertEquals(1,report.rows.get(0).seconds);
         store.confirmed(11,123,999,false,System.currentTimeMillis(),ZoneId.systemDefault());
         report=query(store); assertEquals(1,report.daily.get(new UsageMetrics.Key(today,11)).messages);
+        store.confirmed(11,123,888,false,System.currentTimeMillis()-86_400_000L,ZoneId.systemDefault());
+        int yesterday=UsageMetrics.day(LocalDate.now().minusDays(1));
+        assertEquals(1,query(store).daily.get(new UsageMetrics.Key(yesterday,11)).messages);
         close(store); store=new UsageStore(file);
         store.confirmed(11,123,999,false,System.currentTimeMillis(),ZoneId.systemDefault());
         assertEquals(1,query(store).daily.get(new UsageMetrics.Key(today,11)).messages);

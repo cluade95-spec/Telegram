@@ -45,6 +45,18 @@ public class UsageMetricsTest {
         m.credited(new SurfaceKey(22,UsageSurface.CALL,0),60_000,midnight+60_000,90_000,zone);
         assertEquals(90_000,row(m.drain(),20261006,22).longestMillis);
     }
+    @Test public void loggingOutAnotherAccountDoesNotEndTheCurrentSession() {
+        UsageMetrics m=new UsageMetrics();
+        m.credited(chat,0,wall,30_000,zone); m.drain();
+        m.onAccountRemoved(22);
+        m.credited(chat,30_000,wall+30_000,30_000,zone);
+        UsageMetrics.Daily d=row(m.drain(),20261005,11);
+        assertEquals(0,d.sessions); assertEquals(60_000,d.longestMillis);
+        m.onAccountRemoved(11);
+        m.credited(chat,60_000,wall+60_000,30_000,zone);
+        d=row(m.drain(),20261005,11);
+        assertEquals(1,d.sessions); assertEquals(30_000,d.longestMillis);
+    }
     @Test public void resetDiscardsPendingAndEndsSession() {
         UsageMetrics m=new UsageMetrics(); m.credited(chat,0,wall,1000,zone); m.reset();
         assertTrue(m.drain().isEmpty());

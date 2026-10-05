@@ -26,10 +26,10 @@ public final class UsageMetrics implements UsageAccountant.CreditListener {
     public static int day(long wall, ZoneId zone) { return day(Instant.ofEpochMilli(wall).atZone(zone).toLocalDate()); }
     private Daily row(int day, long account) { return pending.computeIfAbsent(new Key(day, account), k -> new Daily()); }
     public void opened(long account, long wall, ZoneId zone) { if (account != 0) row(day(wall, zone), account).opens++; }
-    public void sent(long account, long count, long wall, ZoneId zone) { if (account != 0 && count > 0) row(day(wall, zone), account).messages += count; }
     public void endSession() { lastEnd = -1; sessionAccount = 0; sessionDays.clear(); }
+    public void onAccountRemoved(long account) { if (sessionAccount==account) endSession(); }
     @Override public void credited(SurfaceKey owner, long start, long wall, long duration, ZoneId zone) {
-        boolean newSession = lastEnd < 0 || owner.accountUserId != sessionAccount || start - lastEnd > 300_000;
+        boolean newSession = lastEnd < 0 || owner.accountUserId != sessionAccount || start - lastEnd > UsagePolicy.FLUSH_MS;
         if (newSession) {
             endSession();
             sessionAccount = owner.accountUserId;

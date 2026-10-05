@@ -196,6 +196,8 @@ CREATE TABLE bucket(
   seconds INTEGER NOT NULL,
   PRIMARY KEY(day, hour, account, surface, dialog)) WITHOUT ROWID;
 CREATE INDEX bucket_dialog ON bucket(account, dialog, day);
+CREATE TABLE sent(account INTEGER NOT NULL, token TEXT NOT NULL,
+  PRIMARY KEY(account, token)) WITHOUT ROWID; -- salted SHA-256 idempotency digest, no raw message/dialog id
 CREATE TABLE daily(
   day INTEGER NOT NULL, account INTEGER NOT NULL,
   opens INTEGER NOT NULL DEFAULT 0, sessions INTEGER NOT NULL DEFAULT 0,
@@ -218,7 +220,10 @@ CREATE TABLE daily(
 | heavy (8 h, ~40 chats, every hour) | ~300 | 0.55 MB | ~2.5 MB | ~7 MB |
 
   Assumes ~60 bytes per row including the primary key. Without rollup heavy use would reach about 6.6 MB a year and 33 MB in
-  five years; rollup keeps it a few MB.
+  five years; rollup keeps bucket data a few MB. These estimates exclude the opaque sent-confirmation digests needed for
+  durable deduplication (§16); those remain until reset and grow with confirmed sends. A host five-year heavy bucket sample
+  used about 6.7 MB; adding 100 confirmed sends/day increased the total to about 21.6 MB. Android size/performance QA remains
+  unexecuted; the original estimate is not a total database-size guarantee.
 
 ## 13. Write / flush strategy
 
@@ -249,6 +254,7 @@ Hard constraints for implementation:
 1. **Segmented control** Today / Week / Month (Telegram's existing tab-style control used in statistics screens).
 2. **Summary**: total active time (large), comparison line "32 min less than yesterday" / "than last week" / "than last month",
    using the same elapsed fraction of the previous period for Today ("by this time yesterday") to avoid unfair comparisons.
+   Prior complete hours are exact; the prior current hour is prorated and the UI labels this comparison as estimated.
 3. **Chart**: Today: hours 0-23 stacked by category; Week: 7 days stacked; Month: days stacked.
 4. **Categories**: rows with category color dot, name, time, percent bar (non-overlapping, sums to the total).
 5. **Most Used**: top 10 chats (avatar, name, time; tap opens the chat). "Show more" up to 50.
@@ -286,7 +292,12 @@ Activity excludes `TL_updateNewScheduledMessage` and every scheduling acknowledg
 actual outgoing `from_scheduled` delivery updates (`TL_updateNewMessage` / `TL_updateNewChannelMessage`, including verified
 new-message difference catch-up), or an actual-send reply. Deduplicate confirmations atomically with the daily metric in
 `usage.db`, using an opaque digest of account/dialog/server message identity (secret sends use their random id); no message
-content is stored and replay cannot increment the metric twice. Failed sends do not count. No protocol/network behavior changes.
+content is stored and replay cannot increment the metric twice in retained Activity data. Book the metric on the local date
+of verified confirmation (including delivery catch-up); do not compare device wall time with server message dates, which may
+differ after a clock change. Reset clears measurements and idempotency data and starts a new measurement generation.
+Capture the account user ID before submitting the send request; late confirmations after logout retain aggregate metrics
+for that original account and reapply dialog anonymization. A short reply to a scheduling request is not accepted as proof
+of actual delivery. Failed sends do not count. No protocol/network behavior changes.
 
 Charts: `StatisticActivity.ChartViewData` + `StatisticActivity.createChartData(json, VIEW_TYPE_STACKBAR, false)` +
 `UItem.asChart(...)`; series colors from existing `statisticChartLine_*` theme keys mapped per category.

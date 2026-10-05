@@ -122,8 +122,7 @@ public final class UsageStore {
                 execute(UsageStorageSql.UPSERT_DAILY,k.day,k.account,d.opens,d.sessions,d.longestMillis/1000,d.messages);
             }
             String salt=meta("dedup_salt");
-            long earliest=Long.parseLong(meta("created_at"))/1000*1000;
-            for (Confirmation c:confirmations) if (c.wall>=earliest) {
+            for (Confirmation c:confirmations) {
                 String token=UsageSendIdentity.digest(salt,c.account,c.dialog,c.message,c.secret);
                 if (db.executeInt(UsageStorageSql.HAS_SENT,c.account,token)==null) {
                     execute(UsageStorageSql.INSERT_SENT,c.account,token);

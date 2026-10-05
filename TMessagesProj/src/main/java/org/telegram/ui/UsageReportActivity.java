@@ -127,6 +127,7 @@ public class UsageReportActivity extends UniversalFragment implements Notificati
     private void reload() {
         if(destroyed || resetting) return;
         int generation=++request;
+        identities.clear();
         loading=true; failed=false; report=null; chart=null; update();
         UsageTracker.flush();
         reportTime=ZonedDateTime.now();

@@ -2588,10 +2588,11 @@ public class SendMessagesHelper extends BaseController implements NotificationCe
                     final ArrayList<MessageObject> newMsgArr = new ArrayList<>(objArr);
                     final LongSparseArray<TLRPC.Message> messagesByRandomIdsFinal = messagesByRandomIds;
                     final boolean scheduledOnline = scheduleDate == 0x7FFFFFFE;
+                    final long usageAccountUserId = getUserConfig().getClientUserId();
                     final Runnable send = () -> {
                         getConnectionsManager().sendRequest(req, (response, error) -> {
                             if (error == null) {
-                                org.telegram.messenger.usage.UsageSendObserver.reply(getUserConfig().getClientUserId(), peer, response);
+                                org.telegram.messenger.usage.UsageSendObserver.reply(usageAccountUserId, peer, response, scheduleDate != 0);
                                 SparseLongArray newMessagesByIds = new SparseLongArray();
                                 TLRPC.Updates updates = (TLRPC.Updates) response;
                                 for (int a1 = 0; a1 < updates.updates.size(); a1++) {
@@ -7542,6 +7543,7 @@ public class SendMessagesHelper extends BaseController implements NotificationCe
             return;
         }
 
+        final long usageAccountUserId = getUserConfig().getClientUserId();
         getConnectionsManager().sendRequest(request, (response, error) -> {
             if (error != null && FileRefController.isFileRefError(error.text)) {
                 final int fileRefIndex = FileRefController.getFileRefErrorIndex(error.text);
@@ -7623,7 +7625,7 @@ public class SendMessagesHelper extends BaseController implements NotificationCe
             AndroidUtilities.runOnUIThread(() -> {
                 boolean isSentError = false;
                 if (error == null) {
-                    org.telegram.messenger.usage.UsageSendObserver.reply(getUserConfig().getClientUserId(), msgObjs.get(0).getDialogId(), response);
+                    org.telegram.messenger.usage.UsageSendObserver.reply(usageAccountUserId, msgObjs.get(0).getDialogId(), response, scheduled);
                     SparseArray<TLRPC.Message> newMessages = new SparseArray<>();
                     LongSparseArray<Integer> newIds = new LongSparseArray<>();
                     final TLRPC.Updates updates = (TLRPC.Updates) response;
@@ -7934,6 +7936,7 @@ public class SendMessagesHelper extends BaseController implements NotificationCe
             return;
         }
 
+        final long usageAccountUserId = getUserConfig().getClientUserId();
         newMsgObj.reqId = getConnectionsManager().sendRequest(req, (response, error) -> {
             if (error != null && (req instanceof TLRPC.TL_messages_sendMedia || req instanceof TL_ephemeral.TL_sendMessage || req instanceof TLRPC.TL_messages_editMessage || req instanceof TLRPC.TL_messages_addPollAnswer) && FileRefController.isFileRefError(error.text)) {
                 if (FileRefController.isFileRefErrorCover(error.text)) {
@@ -8110,7 +8113,7 @@ public class SendMessagesHelper extends BaseController implements NotificationCe
                     boolean currentSchedule = scheduled;
                     boolean isSentError = false;
                     if (error == null) {
-                        org.telegram.messenger.usage.UsageSendObserver.reply(getUserConfig().getClientUserId(), newMsgObj.dialog_id, response);
+                        org.telegram.messenger.usage.UsageSendObserver.reply(usageAccountUserId, newMsgObj.dialog_id, response, scheduled);
                         final int oldId = newMsgObj.id;
                         final ArrayList<TLRPC.Message> sentMessages = new ArrayList<>();
                         final String attachPath = newMsgObj.attachPath;

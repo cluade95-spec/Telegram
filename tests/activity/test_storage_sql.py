@@ -39,6 +39,15 @@ class StorageSqlTest(unittest.TestCase):
    self.db.execute(SQL['ANONYMIZE'],(11,)); self.db.execute(SQL['DELETE_IDENTITIES'],(11,))
   self.assertEqual(35,self.total())
   self.assertEqual([(11,0,15),(22,123,20)],self.db.execute('SELECT account,dialog,seconds FROM bucket ORDER BY account').fetchall())
+ def test_late_delivery_after_logout_preserves_anonymity_and_other_account(self):
+  self.credit(account=11,seconds=10); self.credit(account=22,seconds=20)
+  self.db.execute(SQL['ANONYMIZE'],(11,)); self.db.execute(SQL['DELETE_IDENTITIES'],(11,)); self.db.commit()
+  self.confirm(11,'late-success',20261005)
+  self.credit(account=11,seconds=2) # unsettled old-owner credit in the late boundary
+  self.db.execute(SQL['ANONYMIZE'],(11,)); self.db.execute(SQL['DELETE_IDENTITIES'],(11,)); self.db.commit()
+  self.confirm(11,'late-success',20261005)
+  self.assertEqual([(11,0,12),(22,123,20)],self.db.execute('SELECT account,dialog,seconds FROM bucket ORDER BY account').fetchall())
+  self.assertEqual((1,),self.db.execute('SELECT messages_sent FROM daily WHERE account=11').fetchone())
  def test_migration_merge_does_not_drop_or_duplicate(self):
   self.credit(dialog=-1,surface=5,seconds=10); self.credit(dialog=-2,surface=5,seconds=20)
   for _ in range(2):
@@ -51,6 +60,12 @@ class StorageSqlTest(unittest.TestCase):
   self.confirm(11,'opaque',20261005); self.db.commit(); self.db.close(); self.db=sqlite3.connect(self.path)
   self.confirm(11,'opaque',20261006); self.confirm(22,'opaque',20261005); self.confirm(11,'other',20261005)
   self.assertEqual([(11,2),(22,1)],self.db.execute('SELECT account,messages_sent FROM daily ORDER BY account').fetchall())
+ def test_clock_moving_back_does_not_suppress_verified_confirmations(self):
+  self.db.execute("INSERT INTO meta VALUES('created_at',?)",(9999999999999,))
+  self.confirm(11,'new-confirmation',20261005)
+  self.confirm(11,'new-confirmation',20261004) # same identity replay after a clock jump
+  self.confirm(11,'second-confirmation',20261004)
+  self.assertEqual([(20261004,1),(20261005,1)],self.db.execute('SELECT day,messages_sent FROM daily ORDER BY day').fetchall())
  def test_failed_transaction_then_retry_is_atomic(self):
   self.db.execute('BEGIN IMMEDIATE'); self.credit(seconds=40); self.confirm(11,'opaque',20261005)
   self.db.rollback()

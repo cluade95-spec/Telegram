@@ -16672,6 +16672,7 @@ public class MessagesController extends BaseController implements NotificationCe
         if (BuildVars.LOGS_ENABLED) {
             FileLog.d("start getChannelDifference with pts = " + channelPts + " channelId = " + channelId);
         }
+        final long usageAccountUserId = getUserConfig().getClientUserId();
         getConnectionsManager().sendRequest(req, (response, error) -> {
             if (response != null) {
                 TLRPC.updates_ChannelDifference res = (TLRPC.updates_ChannelDifference) response;
@@ -16758,7 +16759,7 @@ public class MessagesController extends BaseController implements NotificationCe
                                     if (message instanceof TLRPC.TL_messageEmpty) {
                                         continue;
                                     }
-                                    org.telegram.messenger.usage.UsageSendObserver.scheduledDelivery(getUserConfig().getClientUserId(), message);
+                                    org.telegram.messenger.usage.UsageSendObserver.scheduledDelivery(usageAccountUserId, message);
                                     message.unread = !(channelFinal != null && channelFinal.left || (message.out ? outboxValue : inboxValue) >= message.id || message.action instanceof TLRPC.TL_messageActionChannelCreate);
 
                                     boolean isDialogCreated = createdDialogIds.contains(dialogId);
@@ -16908,6 +16909,7 @@ public class MessagesController extends BaseController implements NotificationCe
             FileLog.d("getDifference: isUpdating = true");
         }
         getConnectionsManager().setIsUpdating(true);
+        final long usageAccountUserId = getUserConfig().getClientUserId();
         getConnectionsManager().sendRequest(req, (response, error) -> {
             if (error == null) {
                 TLRPC.updates_Difference res = (TLRPC.updates_Difference) response;
@@ -17040,7 +17042,7 @@ public class MessagesController extends BaseController implements NotificationCe
                                         message.out = true;
                                     }
 
-                                    org.telegram.messenger.usage.UsageSendObserver.scheduledDelivery(clientUserId, message);
+                                    org.telegram.messenger.usage.UsageSendObserver.scheduledDelivery(usageAccountUserId, message);
                                     boolean isDialogCreated = createdDialogIds.contains(message.dialog_id);
                                     MessageObject obj = new MessageObject(currentAccount, message, usersDict, chatsDict, isDialogCreated, isDialogCreated);
 

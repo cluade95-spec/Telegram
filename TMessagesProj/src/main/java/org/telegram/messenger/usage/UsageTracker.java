@@ -37,18 +37,21 @@ public final class UsageTracker implements NotificationCenter.NotificationCenter
     private boolean resolvePosted;
     private boolean configurationTransition;
     private VoIPService callService;
+    private long callServiceAccount;
     private long connectedCallAccount;
     private long lastEvent;
     private SurfaceKey resolved;
     private boolean wasForeground;
     private boolean wasPassive;
     private int lastMigrationDay;
+    private boolean sendFlushPosted;
+    private final Runnable sendFlush=()->{ sendFlushPosted=false; flushNow(); };
     private final Runnable resolveRunnable = () -> { resolvePosted = false; resolveNow(); };
     private final VoIPService.StateListener callListener = new VoIPService.StateListener() {
         @Override public void onStateChanged(int state) {
             if (callService == null) return;
             long account = state == VoIPService.STATE_ESTABLISHED
-                    ? UserConfig.getInstance(callService.getAccount()).getClientUserId() : 0;
+                    ? callServiceAccount : 0;
             if (connectedCallAccount == account) return;
             prepareEvent();
             connectedCallAccount = account;
@@ -112,7 +115,7 @@ public final class UsageTracker implements NotificationCenter.NotificationCenter
         accountant.onInput();
         lastEvent = elapsed;
         clock.event = -1;
-        if (accountant.pendingMillis() >= 300_000) onNavigationChanged();
+        if (accountant.pendingMillis() >= UsagePolicy.FLUSH_MS) onNavigationChanged();
     }
 
     private void prepareEvent() {
@@ -139,7 +142,7 @@ public final class UsageTracker implements NotificationCenter.NotificationCenter
         accountant.onPassive(engaged);
         boolean changed = wasPassive != engaged;
         wasPassive = engaged;
-        if (changed || accountant.pendingMillis() >= 300_000) flushNow();
+        if (changed || accountant.pendingMillis() >= UsagePolicy.FLUSH_MS) flushNow();
     }
 
     private boolean passive() {
@@ -159,6 +162,7 @@ public final class UsageTracker implements NotificationCenter.NotificationCenter
         prepareEvent();
         if (callService != null) callService.unregisterStateListener(callListener);
         callService = service;
+        callServiceAccount = service == null ? 0 : UserConfig.getInstance(service.getAccount()).getClientUserId();
         connectedCallAccount = 0;
         accountant.onCall(null);
         if (service != null) service.registerStateListener(callListener);
@@ -202,6 +206,7 @@ public final class UsageTracker implements NotificationCenter.NotificationCenter
         AndroidUtilities.runOnUIThread(() -> {
             if (instance != null) {
                 instance.prepareEvent();
+                if (instance.callServiceAccount==uid) instance.callServiceAccount=0;
                 if (instance.connectedCallAccount==uid) {
                     instance.accountant.onCall(null);
                     instance.connectedCallAccount=0;
@@ -211,14 +216,14 @@ public final class UsageTracker implements NotificationCenter.NotificationCenter
                     instance.resolved=null;
                 }
                 instance.flushNow(uid);
-                instance.metrics.endSession();
+                instance.metrics.onAccountRemoved(uid);
             } else UsageStore.getInstance().onAccountRemoved(uid);
             onNavigationChanged();
         });
     }
 
     /** Captured identity is independent of account-slot reuse; storage deduplicates atomically. */
-    public static void onMessageSent(long uid, long dialog, long message, boolean secret, long deliveredWall) {
+    public static void onMessageSent(long uid, long dialog, long message, boolean secret) {
         if (!UsageSendIdentity.eligible(uid,message,true,true,false,secret)) return;
         long observedWall=System.currentTimeMillis();
         ZoneId zone=ZoneId.systemDefault();
@@ -226,8 +231,19 @@ public final class UsageTracker implements NotificationCenter.NotificationCenter
             if (instance==null) init();
             instance.prepareEvent();
             instance.accountant.checkpoint();
-            UsageStore.getInstance().confirmed(uid,dialog,message,secret,Math.min(observedWall,deliveredWall),zone);
-            instance.flushNow();
+            UsageStore.getInstance().confirmed(uid,dialog,message,secret,observedWall,zone);
+            boolean activeAccount=false;
+            for (int slot=0; slot<UserConfig.MAX_ACCOUNT_COUNT; slot++)
+                if (UserConfig.getInstance(slot).getClientUserId()==uid) { activeAccount=true; break; }
+            if (!activeAccount) {
+                // Late success after logout retains aggregate attribution, never restores dialog identities.
+                instance.flushNow(uid);
+                return;
+            }
+            if (!instance.sendFlushPosted) {
+                instance.sendFlushPosted=true;
+                AndroidUtilities.runOnUIThread(instance.sendFlush);
+            }
         });
     }
 
